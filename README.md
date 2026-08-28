@@ -1,5 +1,12 @@
 # onvif-rs
 
+**English** | [中文](README.zh-CN.md)
+
+[![CI](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
+![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen.svg)
+
 ONVIF **Device (server)** library for Rust — expose a camera or media source to ONVIF consumers (NVRs, video management systems) over SOAP + WS-Discovery.
 
 > **Naming note**: this project is unrelated to [lumeohq/onvif-rs](https://github.com/lumeohq/onvif-rs) (a WSDL-generated ONVIF *client*). The crates.io name `onvif-rs` is held by an abandoned 2018 placeholder; consume this library via git dependency (a crates.io release, if it ever happens, would need a different package name).
@@ -55,6 +62,10 @@ See the `mibee-eye-raspi-rs` `main.rs` for a complete production wiring example 
 ## Byte stability guarantee
 
 Consumers like the MiBee NVR match SOAP responses by local element names on the raw byte stream. The serialization in this crate is load-bearing: **do not change response element names, namespace prefixes, or attribute order** without re-running consumer interop tests. The crate's 133 tests include golden response strings that pin this.
+
+## Development
+
+This project follows strict **TDD** — see [CONTRIBUTING.md](CONTRIBUTING.md). CI enforces `rustfmt`, `clippy -D warnings`, and the full test suite (133 tests incl. golden response strings); `main` is protected (PR-only merges, CI required).
 
 ## Status
 
