@@ -1,0 +1,24 @@
+[package]
+name = "onvif-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "ONVIF Device (server) library for Rust — SOAP Device/Media/Imaging/PTZ services, WS-Discovery responder, WS-Security auth"
+license = "MIT"
+repository = "https://github.com/mickeyzzc/onvif-rs"
+keywords = ["onvif", "soap", "camera", "ws-discovery", "video-surveillance"]
+categories = ["network-programming", "multimedia"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+hex = "0.4"
+quick-xml = { version = "0.36", features = ["serialize"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+sha1 = "0.10"
+socket2 = "0.5"
+tokio = { version = "1", features = ["sync", "rt", "macros", "net", "time", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
