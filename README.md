@@ -67,7 +67,7 @@ A runnable self-check demo lives in [`examples/`](examples/):
 cargo run --example device_demo [-- --port 8080] [-- --serve]
 ```
 
-It starts the real SOAP server + WS-Discovery responder, then drives them like a foreign ONVIF client: anonymous `GetSystemDateAndTime`, `GetDeviceInformation` rejected 401 without credentials and accepted with a WS-Security UsernameToken digest (computed by an independent SHA-1 in the demo), `GetCapabilities`, `GetProfiles`/`GetStreamUri`, and a WS-Discovery Probe over UDP. Exits 0 when every check passes — a no-hardware smoke test of the whole stack. `--serve` keeps the servers up for manual poking (curl / ONVIF Device Manager / an NVR).
+It starts the real SOAP server + WS-Discovery responder, then drives them like a foreign ONVIF client: anonymous `GetSystemDateAndTime`, `GetDeviceInformation` rejected 401 without credentials and accepted with a WS-Security UsernameToken digest (computed by an independent SHA-1 in the demo), `GetCapabilities`, `GetProfiles`/`GetStreamUri`/`GetSnapshotUri`, and a WS-Discovery Probe over UDP. Exits 0 when every check passes — a no-hardware smoke test of the whole stack. `--serve` keeps the servers up for manual poking (curl / ONVIF Device Manager / an NVR).
 
 ## Byte stability guarantee
 
