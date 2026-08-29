@@ -67,7 +67,7 @@ async fn main() {
 cargo run --example device_demo [-- --port 8080] [-- --serve]
 ```
 
-它启动真实的 SOAP 服务端 + WS-Discovery 应答器，再像外来 ONVIF 客户端一样驱动它们：匿名 `GetSystemDateAndTime`、无凭据的 `GetDeviceInformation` 被拒 401 而带 WS-Security UsernameToken 摘要（由演示内独立实现的 SHA-1 计算）则通过、`GetCapabilities`、`GetProfiles`/`GetStreamUri`、UDP WS-Discovery Probe。全部通过后以 0 退出 —— 免硬件的整机冒烟测试。`--serve` 让服务保持运行，便于手工探测（curl / ONVIF Device Manager / NVR）。
+它启动真实的 SOAP 服务端 + WS-Discovery 应答器，再像外来 ONVIF 客户端一样驱动它们：匿名 `GetSystemDateAndTime`、无凭据的 `GetDeviceInformation` 被拒 401 而带 WS-Security UsernameToken 摘要（由演示内独立实现的 SHA-1 计算）则通过、`GetCapabilities`、`GetProfiles`/`GetStreamUri`/`GetSnapshotUri`、UDP WS-Discovery Probe。全部通过后以 0 退出 —— 免硬件的整机冒烟测试。`--serve` 让服务保持运行，便于手工探测（curl / ONVIF Device Manager / NVR）。
 
 ## 字节稳定性保证
 

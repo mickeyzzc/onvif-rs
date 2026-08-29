@@ -33,7 +33,9 @@ use tokio::net::{TcpStream, UdpSocket};
 use onvif_rs::config::DeviceConfig;
 use onvif_rs::device::{DeviceHandler, DeviceServiceHandlers};
 use onvif_rs::discovery::DiscoveryServer;
-use onvif_rs::media::{GetProfilesHandler, GetStreamUriHandler, OnvifMediaConfig};
+use onvif_rs::media::{
+    GetProfilesHandler, GetSnapshotUriHandler, GetStreamUriHandler, OnvifMediaConfig,
+};
 use onvif_rs::server::{OnvifConfig, OnvifServer};
 
 const USERNAME: &str = "admin";
@@ -231,6 +233,10 @@ async fn main() -> Result<()> {
         rtsp_port: 8554,
         device_ip: device_ip.clone(),
         stream_path: "/stream".to_string(),
+        // Advertise a snapshot endpoint. The demo doesn't serve the JPEG
+        // itself; hosts with a real snapshot server point this at their port.
+        snapshot_port: 8080,
+        snapshot_path: "/snapshot.jpg".to_string(),
     });
     soap.register_handler(
         "GetProfiles",
@@ -239,6 +245,10 @@ async fn main() -> Result<()> {
     soap.register_handler(
         "GetStreamUri",
         Box::new(GetStreamUriHandler::new(Arc::clone(&media))),
+    );
+    soap.register_handler(
+        "GetSnapshotUri",
+        Box::new(GetSnapshotUriHandler::new(Arc::clone(&media))),
     );
 
     match DiscoveryServer::new(device_ip.clone(), port).start().await {
@@ -311,6 +321,17 @@ async fn main() -> Result<()> {
         bail!("GetStreamUri got {uri:?} want {expected:?}");
     }
     println!("[client] GetStreamUri -> {uri}");
+
+    let (code, body) = soap_call(port, "GetSnapshotUri", true).await?;
+    if code != 200 {
+        bail!("GetSnapshotUri failed: HTTP {code}: {body}");
+    }
+    let snap = xml_field(&body, "Uri");
+    let expected_snap = "http://127.0.0.1:8080/snapshot.jpg".to_string();
+    if snap != expected_snap {
+        bail!("GetSnapshotUri got {snap:?} want {expected_snap:?}");
+    }
+    println!("[client] GetSnapshotUri -> {snap}");
 
     match discovery_probe(port).await {
         Ok(matches) => {

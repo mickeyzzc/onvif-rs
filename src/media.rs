@@ -41,6 +41,14 @@ pub struct OnvifMediaConfig {
     /// (e.g. notebook-cam's `/live/{camera_id}`) set this so the advertised
     /// URI actually resolves.
     pub stream_path: String,
+    /// HTTP port of the host's JPEG snapshot endpoint, advertised by
+    /// GetSnapshotUri (parameterless form, mirroring onvif-go's
+    /// `SnapshotURIParameterless`). `0` disables the feature — GetSnapshotUri
+    /// then faults with "snapshot not supported", the twin's
+    /// `ErrSnapshotNotSupported` behavior.
+    pub snapshot_port: u16,
+    /// HTTP path of the snapshot endpoint (default `/snapshot.jpg`).
+    pub snapshot_path: String,
 }
 
 impl OnvifMediaConfig {
@@ -62,6 +70,8 @@ impl OnvifMediaConfig {
             rtsp_port,
             device_ip,
             stream_path: "/stream".to_string(),
+            snapshot_port: 0,
+            snapshot_path: "/snapshot.jpg".to_string(),
         }
     }
 }
@@ -241,6 +251,67 @@ impl OnvifActionHandler for GetStreamUriHandler {
 }
 
 // ---------------------------------------------------------------------------
+// GetSnapshotUriHandler
+// ---------------------------------------------------------------------------
+
+/// Handler for the ONVIF GetSnapshotUri SOAP action.
+///
+/// Advertises the host's HTTP JPEG snapshot endpoint (parameterless form,
+/// mirroring onvif-go's `SnapshotURIParameterless`). Configure
+/// [`OnvifMediaConfig::snapshot_port`] with the port of the HTTP server that
+/// actually serves the JPEG; `0` (default) keeps the feature off and faults
+/// with "snapshot not supported" — the twin's `ErrSnapshotNotSupported`.
+pub struct GetSnapshotUriHandler {
+    config: Arc<OnvifMediaConfig>,
+}
+
+impl GetSnapshotUriHandler {
+    pub fn new(config: Arc<OnvifMediaConfig>) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait]
+impl OnvifActionHandler for GetSnapshotUriHandler {
+    async fn handle(&self, _body: &str, request_info: &RequestInfo) -> Result<String, OnvifError> {
+        if self.config.snapshot_port == 0 {
+            return Err(OnvifError::ActionNotSupported(
+                "snapshot not supported (OnvifMediaConfig::snapshot_port is unset)".to_string(),
+            ));
+        }
+        let ip = resolve_server_ip(&request_info.server_ip, &self.config.device_ip);
+        let uri = format!(
+            "http://{}:{}{}",
+            ip, self.config.snapshot_port, self.config.snapshot_path
+        );
+
+        let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+        writer
+            .write_event(Event::Start(BytesStart::new("GetSnapshotUriResponse")))
+            .unwrap();
+
+        writer
+            .write_event(Event::Start(BytesStart::new("MediaUri")))
+            .unwrap();
+        write_text_element(&mut writer, "Uri", &uri);
+        write_text_element(&mut writer, "InvalidAfterConnect", "false");
+        write_text_element(&mut writer, "InvalidAfterReboot", "true");
+        write_text_element(&mut writer, "Timeout", "PT5S");
+        writer
+            .write_event(Event::End(BytesEnd::new("MediaUri")))
+            .unwrap();
+
+        writer
+            .write_event(Event::End(BytesEnd::new("GetSnapshotUriResponse")))
+            .unwrap();
+
+        let body = String::from_utf8(writer.into_inner())
+            .map_err(|e| OnvifError::Internal(format!("non-UTF-8 output from XML writer: {e}")))?;
+        Ok(serialize_soap_response(&body))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GetVideoSourcesHandler
 // ---------------------------------------------------------------------------
 
@@ -299,6 +370,8 @@ mod tests {
     fn test_config() -> Arc<OnvifMediaConfig> {
         Arc::new(OnvifMediaConfig {
             stream_path: "/stream".to_string(),
+            snapshot_port: 0,
+            snapshot_path: "/snapshot.jpg".to_string(),
             camera_width: 1920,
             camera_height: 1080,
             camera_fps: 30,
@@ -396,6 +469,8 @@ mod tests {
     async fn test_get_stream_uri_honors_custom_stream_path() {
         let config = Arc::new(OnvifMediaConfig {
             stream_path: "/live/cam-42".to_string(),
+            snapshot_port: 0,
+            snapshot_path: "/snapshot.jpg".to_string(),
             camera_width: 1280,
             camera_height: 720,
             camera_fps: 25,
@@ -452,6 +527,60 @@ mod tests {
         assert!(
             result.contains("rtsp://10.0.0.1:554/stream"),
             "should use configured RTSP port"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // GetSnapshotUri
+    // ------------------------------------------------------------------
+
+    fn snapshot_config() -> OnvifMediaConfig {
+        let mut cfg = (*test_config()).clone();
+        cfg.snapshot_port = 8088;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn test_get_snapshot_uri_advertises_http_snapshot() {
+        let handler = GetSnapshotUriHandler::new(Arc::new(snapshot_config()));
+        let result = handler.handle("", &req_info("10.0.0.5")).await.unwrap();
+
+        assert!(result.contains("GetSnapshotUriResponse"));
+        assert!(result.contains("MediaUri"));
+        assert!(
+            result.contains("http://10.0.0.5:8088/snapshot.jpg"),
+            "should advertise the host snapshot endpoint, got: {result}"
+        );
+        // MediaUri semantics mirror the onvif-go twin (snapshot: fresh fetch,
+        // invalid after reboot, 5 s validity).
+        assert!(result.contains("<InvalidAfterConnect>false</InvalidAfterConnect>"));
+        assert!(result.contains("<InvalidAfterReboot>true</InvalidAfterReboot>"));
+        assert!(result.contains("<Timeout>PT5S</Timeout>"));
+    }
+
+    #[tokio::test]
+    async fn test_get_snapshot_uri_honors_custom_path_and_fallback_ip() {
+        let mut cfg = snapshot_config();
+        cfg.snapshot_path = "/cgi-bin/snap.jpeg".to_string();
+        let handler = GetSnapshotUriHandler::new(Arc::new(cfg));
+
+        // Empty per-request IP → fall back to the configured device IP.
+        let result = handler.handle("", &req_info("")).await.unwrap();
+        assert!(
+            result.contains("http://192.168.1.100:8088/cgi-bin/snap.jpeg"),
+            "custom path + fallback IP, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_snapshot_uri_disabled_faults() {
+        // snapshot_port = 0 (the default) → the handler must fault instead of
+        // advertising a URI nothing serves (onvif-go's ErrSnapshotNotSupported).
+        let handler = GetSnapshotUriHandler::new(test_config());
+        let err = handler.handle("", &req_info("10.0.0.1")).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("not supported"),
+            "expected a not-supported fault, got: {err}"
         );
     }
 
