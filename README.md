@@ -9,7 +9,7 @@
 
 ONVIF **Device (server)** library for Rust — expose a camera or media source to ONVIF consumers (NVRs, video management systems) over SOAP + WS-Discovery.
 
-> **Naming note**: this project is unrelated to [lumeohq/onvif-rs](https://github.com/lumeohq/onvif-rs) (a WSDL-generated ONVIF *client*). The crates.io name `onvif-rs` is held by an abandoned 2018 placeholder; consume this library via git dependency (a crates.io release, if it ever happens, would need a different package name).
+> **Naming decision**: this project is unrelated to [lumeohq/onvif-rs](https://github.com/lumeohq/onvif-rs) (a WSDL-generated ONVIF *client*). The crates.io name `onvif-rs` is held by an abandoned 2018 placeholder, so **the supported distribution is the git dependency pinned by tag** (see the install snippet above). A crates.io release is intentionally not planned while there are no external consumers; if one becomes warranted it would ship under a different package name (e.g. `onvif-device-rs`).
 
 ## Features
 
@@ -25,7 +25,7 @@ Extracted verbatim from the production implementation in [mibee-eye-raspi-rs](ht
 
 ```toml
 [dependencies]
-onvif-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git" }
+onvif-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.1.0" }
 ```
 
 ```rust
