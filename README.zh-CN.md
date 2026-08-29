@@ -9,7 +9,7 @@
 
 **ONVIF 设备端（服务端）Rust 库** —— 让 NVR / 视频管理平台等 ONVIF 消费方通过 SOAP + WS-Discovery 发现并拉取你的摄像头或媒体源。
 
-> **命名说明**：本项目与 [lumeohq/onvif-rs](https://github.com/lumeohq/onvif-rs)（WSDL 生成的 ONVIF *客户端*）无关。crates.io 上的 `onvif-rs` 名字被一个 2018 年废弃占位 crate 占据；请通过 git 依赖使用本库（若将来发布 crates.io 需换用别的包名）。
+> **命名决策**：本项目与 [lumeohq/onvif-rs](https://github.com/lumeohq/onvif-rs)（WSDL 生成的 ONVIF *客户端*）无关。crates.io 上的 `onvif-rs` 名字被一个 2018 年废弃占位 crate 占据，因此**本库的正式分发方式就是按 tag 锁定的 git 依赖**（见上方安装示例）。在没有外部消费者之前不计划发布 crates.io；若将来确有需要，将换用其他包名（如 `onvif-device-rs`）发布。
 
 ## 功能
 
@@ -25,7 +25,7 @@
 
 ```toml
 [dependencies]
-onvif-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git" }
+onvif-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.1.0" }
 ```
 
 ```rust
