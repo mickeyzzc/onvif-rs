@@ -5,7 +5,7 @@
 [![CI](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
-![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-137%20passing-brightgreen.svg)
 
 **ONVIF 设备端（服务端）Rust 库** —— 让 NVR / 视频管理平台等 ONVIF 消费方通过 SOAP + WS-Discovery 发现并拉取你的摄像头或媒体源。
 
@@ -25,7 +25,7 @@
 
 ```toml
 [dependencies]
-onvif-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.1.0" }
+onvif-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.2.1" }
 ```
 
 ```rust
@@ -59,17 +59,27 @@ async fn main() {
 
 完整生产接线示例（发现应答、快照 URI、流 URI、PTZ）见 `mibee-eye-raspi-rs` 的 `main.rs`。
 
+## 示例
+
+[`examples/`](examples/) 提供可运行的自检演示：
+
+```sh
+cargo run --example device_demo [-- --port 8080] [-- --serve]
+```
+
+它启动真实的 SOAP 服务端 + WS-Discovery 应答器，再像外来 ONVIF 客户端一样驱动它们：匿名 `GetSystemDateAndTime`、无凭据的 `GetDeviceInformation` 被拒 401 而带 WS-Security UsernameToken 摘要（由演示内独立实现的 SHA-1 计算）则通过、`GetCapabilities`、`GetProfiles`/`GetStreamUri`、UDP WS-Discovery Probe。全部通过后以 0 退出 —— 免硬件的整机冒烟测试。`--serve` 让服务保持运行，便于手工探测（curl / ONVIF Device Manager / NVR）。
+
 ## 字节稳定性保证
 
-MiBee NVR 这类消费方按本地元素名对 SOAP 响应做原始字节流匹配。本 crate 的序列化是承重结构：**不要在未重跑消费方互操作测试的情况下改动响应元素名、命名空间前缀或属性顺序**。133 个测试中的黄金响应字符串锁定了这一约束。
+MiBee NVR 这类消费方按本地元素名对 SOAP 响应做原始字节流匹配。本 crate 的序列化是承重结构：**不要在未重跑消费方互操作测试的情况下改动响应元素名、命名空间前缀或属性顺序**。137 个测试中的黄金响应字符串锁定了这一约束。
 
 ## 开发
 
-本项目严格执行 **TDD**，见 [CONTRIBUTING.md](CONTRIBUTING.md)。CI 强制 `rustfmt`、`clippy -D warnings` 与全量测试（133 个，含黄金响应字符串）；`main` 分支受保护（仅 PR 合入，CI 必过）。
+本项目严格执行 **TDD**，见 [CONTRIBUTING.md](CONTRIBUTING.md)。CI 强制 `rustfmt`、`clippy -D warnings`（同时编译 examples）与全量测试（137 个，含黄金响应字符串）；`main` 分支受保护（仅 PR 合入，CI 必过）。
 
 ## 状态
 
-v0.1.0 —— 接缝（`ImagingParams`、`DeviceConfig`、media 注册）趋于稳定但尚未冻结。在 [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) 每日对 MiBee NVR 生产验证。
+v0.2.1 —— 接缝（`ImagingParams`、`DeviceConfig`、media 注册）趋于稳定但尚未冻结。在 [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) 每日对 MiBee NVR 生产验证。
 
 ## 许可
 

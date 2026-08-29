@@ -5,7 +5,7 @@
 [![CI](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
-![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-137%20passing-brightgreen.svg)
 
 ONVIF **Device (server)** library for Rust — expose a camera or media source to ONVIF consumers (NVRs, video management systems) over SOAP + WS-Discovery.
 
@@ -25,7 +25,7 @@ Extracted verbatim from the production implementation in [mibee-eye-raspi-rs](ht
 
 ```toml
 [dependencies]
-onvif-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.1.0" }
+onvif-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.2.1" }
 ```
 
 ```rust
@@ -59,17 +59,27 @@ async fn main() {
 
 See the `mibee-eye-raspi-rs` `main.rs` for a complete production wiring example (discovery responder, snapshot URI, stream URIs, PTZ).
 
+## Examples
+
+A runnable self-check demo lives in [`examples/`](examples/):
+
+```sh
+cargo run --example device_demo [-- --port 8080] [-- --serve]
+```
+
+It starts the real SOAP server + WS-Discovery responder, then drives them like a foreign ONVIF client: anonymous `GetSystemDateAndTime`, `GetDeviceInformation` rejected 401 without credentials and accepted with a WS-Security UsernameToken digest (computed by an independent SHA-1 in the demo), `GetCapabilities`, `GetProfiles`/`GetStreamUri`, and a WS-Discovery Probe over UDP. Exits 0 when every check passes — a no-hardware smoke test of the whole stack. `--serve` keeps the servers up for manual poking (curl / ONVIF Device Manager / an NVR).
+
 ## Byte stability guarantee
 
-Consumers like the MiBee NVR match SOAP responses by local element names on the raw byte stream. The serialization in this crate is load-bearing: **do not change response element names, namespace prefixes, or attribute order** without re-running consumer interop tests. The crate's 133 tests include golden response strings that pin this.
+Consumers like the MiBee NVR match SOAP responses by local element names on the raw byte stream. The serialization in this crate is load-bearing: **do not change response element names, namespace prefixes, or attribute order** without re-running consumer interop tests. The crate's 137 tests include golden response strings that pin this.
 
 ## Development
 
-This project follows strict **TDD** — see [CONTRIBUTING.md](CONTRIBUTING.md). CI enforces `rustfmt`, `clippy -D warnings`, and the full test suite (133 tests incl. golden response strings); `main` is protected (PR-only merges, CI required).
+This project follows strict **TDD** — see [CONTRIBUTING.md](CONTRIBUTING.md). CI enforces `rustfmt`, `clippy -D warnings`, and the full test suite (137 tests incl. golden response strings); `main` is protected (PR-only merges, CI required).
 
 ## Status
 
-v0.1.0 — seams (`ImagingParams`, `DeviceConfig`, media registration) are settling but not frozen. Production-tested daily at [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) against the MiBee NVR.
+v0.2.1 — seams (`ImagingParams`, `DeviceConfig`, media registration) are settling but not frozen. Production-tested daily at [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) against the MiBee NVR.
 
 ## License
 
