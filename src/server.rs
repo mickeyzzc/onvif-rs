@@ -444,7 +444,18 @@ pub(crate) fn parse_soap_request(xml: &str) -> Result<ParsedSoap, OnvifError> {
                 let qname = str::from_utf8(&name_bytes).unwrap_or("");
                 let local = qname.rsplit(':').next().unwrap_or(qname);
 
-                if st.in_body {
+                // The Body's own close tag terminates body_xml — do not copy
+                // it in (its opening twin was never written, so appending it
+                // would leave a dangling close tag for strict downstream
+                // parsers like imaging's SetImagingSettings).
+                if local == "Body" && st.in_body {
+                    st.in_body = false;
+                    st.body_xml = st
+                        .body_writer
+                        .take()
+                        .map(|w| String::from_utf8(w.into_inner()).unwrap_or_default())
+                        .unwrap_or_default();
+                } else if st.in_body {
                     if let Some(ref mut w) = st.body_writer {
                         let _ = w.write_event(Event::End(e.clone()));
                     }
@@ -456,14 +467,6 @@ pub(crate) fn parse_soap_request(xml: &str) -> Result<ParsedSoap, OnvifError> {
                     "UsernameToken" => {
                         st.in_ut = false;
                         st.current_field.clear();
-                    }
-                    "Body" => {
-                        st.in_body = false;
-                        st.body_xml = st
-                            .body_writer
-                            .take()
-                            .map(|w| String::from_utf8(w.into_inner()).unwrap_or_default())
-                            .unwrap_or_default();
                     }
                     _ => {
                         if st.in_ut {
@@ -566,6 +569,45 @@ mod tests {
         assert_eq!(parsed.action, "GetDeviceInformation");
         assert!(parsed.body_xml.contains("GetDeviceInformation"));
         assert!(parsed.username_token.is_none());
+    }
+
+    #[test]
+    fn test_parse_body_xml_is_balanced() {
+        // Regression: the writer used to emit the closing `</soap:Body>` (and
+        // could not emit its opening twin) into body_xml, leaving a dangling
+        // close tag. Substring-searching handlers tolerated it, but strict
+        // downstream parsers (imaging's SetImagingSettings) failed end-to-end
+        // even though their unit tests — fed balanced fragments — passed.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+        <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
+          <soap:Body>
+            <SetImagingSettings xmlns="http://www.onvif.org/ver20/imaging/wsdl/">
+              <Settings><Brightness Value="0.8"/></Settings>
+            </SetImagingSettings>
+          </soap:Body>
+        </soap:Envelope>"#;
+
+        let parsed = parse_soap_request(xml).unwrap();
+        let body = &parsed.body_xml;
+        assert!(
+            !body.contains("</soap:Body>") && !body.contains("</s:Body>"),
+            "body_xml must not leak the Body close tag: {body}"
+        );
+        assert!(
+            body.trim_end().ends_with("</SetImagingSettings>"),
+            "body_xml must end at the action element: {body}"
+        );
+
+        // The strict reader used by imaging's parse_settings must accept it.
+        let mut reader = quick_xml::Reader::from_str(body);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+                Ok(_) => {}
+            }
+            buf.clear();
+        }
     }
 
     #[test]

@@ -187,8 +187,10 @@ fn build_set_preset(body: &str, state: &PtzState) -> Result<String, OnvifError> 
             t
         }
         None => {
-            // Auto-generate a token
-            state.save_preset("Preset")
+            // Auto-generate a token; honor the WSDL PresetName when provided.
+            let name =
+                parse_text_content(body, "PresetName").unwrap_or_else(|| "Preset".to_string());
+            state.save_preset(&name)
         }
     };
 
@@ -801,5 +803,20 @@ mod tests {
 
         // State should have one preset with an auto-generated token
         assert_eq!(state.get_presets().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_set_preset_honors_preset_name() {
+        // ONVIF WSDL: SetPreset carries PresetName — the stored preset (and
+        // later GetPresets) must show it, not the hardcoded fallback.
+        let state = test_state();
+        let handler = PtzHandler(state.clone());
+
+        let body = r#"<SetPreset><ProfileToken>p1</ProfileToken><PresetName>gate</PresetName></SetPreset>"#;
+        handler.handle(body, &test_info()).await.unwrap();
+
+        let presets = state.list_presets();
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].name, "gate", "PresetName must be honored");
     }
 }
