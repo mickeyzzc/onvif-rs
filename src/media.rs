@@ -35,6 +35,35 @@ pub struct OnvifMediaConfig {
     pub camera_bitrate: u32,
     pub rtsp_port: u16,
     pub device_ip: String,
+    /// RTSP URL path returned by GetStreamUri (default `/stream`).
+    ///
+    /// Hosts whose RTSP server serves streams under a different path
+    /// (e.g. notebook-cam's `/live/{camera_id}`) set this so the advertised
+    /// URI actually resolves.
+    pub stream_path: String,
+}
+
+impl OnvifMediaConfig {
+    /// Construct with the historical default stream path `/stream`.
+    #[must_use]
+    pub fn new(
+        camera_width: u32,
+        camera_height: u32,
+        camera_fps: u32,
+        camera_bitrate: u32,
+        rtsp_port: u16,
+        device_ip: String,
+    ) -> Self {
+        Self {
+            camera_width,
+            camera_height,
+            camera_fps,
+            camera_bitrate,
+            rtsp_port,
+            device_ip,
+            stream_path: "/stream".to_string(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +209,10 @@ impl GetStreamUriHandler {
 impl OnvifActionHandler for GetStreamUriHandler {
     async fn handle(&self, _body: &str, request_info: &RequestInfo) -> Result<String, OnvifError> {
         let ip = resolve_server_ip(&request_info.server_ip, &self.config.device_ip);
-        let uri = format!("rtsp://{}:{}/stream", ip, self.config.rtsp_port);
+        let uri = format!(
+            "rtsp://{}:{}{}",
+            ip, self.config.rtsp_port, self.config.stream_path
+        );
 
         let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
         writer
@@ -266,6 +298,7 @@ mod tests {
 
     fn test_config() -> Arc<OnvifMediaConfig> {
         Arc::new(OnvifMediaConfig {
+            stream_path: "/stream".to_string(),
             camera_width: 1920,
             camera_height: 1080,
             camera_fps: 30,
@@ -358,6 +391,25 @@ mod tests {
     // ------------------------------------------------------------------
     // GetStreamUri
     // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_stream_uri_honors_custom_stream_path() {
+        let config = Arc::new(OnvifMediaConfig {
+            stream_path: "/live/cam-42".to_string(),
+            camera_width: 1280,
+            camera_height: 720,
+            camera_fps: 25,
+            camera_bitrate: 2_500_000,
+            rtsp_port: 8554,
+            device_ip: "192.168.1.10".to_string(),
+        });
+        let handler = GetStreamUriHandler::new(config);
+        let result = handler.handle("", &req_info("192.168.1.10")).await.unwrap();
+        assert!(
+            result.contains("rtsp://192.168.1.10:8554/live/cam-42"),
+            "custom stream path must be advertised, got: {result}"
+        );
+    }
 
     #[tokio::test]
     async fn test_get_stream_uri_dynamic_ip() {
