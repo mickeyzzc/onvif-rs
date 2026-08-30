@@ -9,7 +9,7 @@
 
 **ONVIF 设备端（服务端）Rust 库** —— 让 NVR / 视频管理平台等 ONVIF 消费方通过 SOAP + WS-Discovery 发现并拉取你的摄像头或媒体源。
 
-> **命名决策**：本项目与 [lumeohq/onvif-rs](https://github.com/lumeohq/onvif-rs)（WSDL 生成的 ONVIF *客户端*）无关。crates.io 上的 `onvif-rs` 名字被一个 2018 年废弃占位 crate 占据，因此**本库的正式分发方式就是按 tag 锁定的 git 依赖**（见上方安装示例）。在没有外部消费者之前不计划发布 crates.io；若将来确有需要，将换用其他包名（如 `onvif-device-rs`）发布。
+> **命名决策**：本项目与 [lumeohq/onvif-rs](https://github.com/lumeohq/onvif-rs)（WSDL 生成的 ONVIF *客户端*）无关。crates.io 上的 `onvif-rs` 名字被一个 2018 年废弃占位 crate 占据，因此 crate 以 **`onvif-device-rs`** 名义发布；仓库名保持不变。
 
 ## 功能
 
@@ -25,12 +25,13 @@
 
 ```toml
 [dependencies]
-onvif-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.2.1" }
+onvif-device-rs = "0.2.1"
+# git 替代方式: onvif-device-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.2.1" }
 ```
 
 ```rust
-use onvif_rs::{DeviceConfig, OnvifConfig, OnvifServer};
-use onvif_rs::imaging::{ImagingParams, ImagingParamError, register_imaging_actions};
+use onvif_device_rs::{DeviceConfig, OnvifConfig, OnvifServer};
+use onvif_device_rs::imaging::{ImagingParams, ImagingParamError, register_imaging_actions};
 use std::sync::Arc;
 
 // 在相机参数管理器上实现 Imaging 接缝。
@@ -50,8 +51,8 @@ async fn main() {
     };
 
     let mut server = OnvifServer::new(OnvifConfig { /* port, auth, ... */ });
-    onvif_rs::device::register_device_actions(&mut server, /* ... */);
-    onvif_rs::media::register_media_actions(&mut server, /* ... */);
+    onvif_device_rs::device::register_device_actions(&mut server, /* ... */);
+    onvif_device_rs::media::register_media_actions(&mut server, /* ... */);
     register_imaging_actions(&mut server, Arc::new(MyParams));
     server.run().await;
 }

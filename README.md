@@ -9,7 +9,7 @@
 
 ONVIF **Device (server)** library for Rust — expose a camera or media source to ONVIF consumers (NVRs, video management systems) over SOAP + WS-Discovery.
 
-> **Naming decision**: this project is unrelated to [lumeohq/onvif-rs](https://github.com/lumeohq/onvif-rs) (a WSDL-generated ONVIF *client*). The crates.io name `onvif-rs` is held by an abandoned 2018 placeholder, so **the supported distribution is the git dependency pinned by tag** (see the install snippet above). A crates.io release is intentionally not planned while there are no external consumers; if one becomes warranted it would ship under a different package name (e.g. `onvif-device-rs`).
+> **Naming decision**: this project is unrelated to [lumeohq/onvif-rs](https://github.com/lumeohq/onvif-rs) (a WSDL-generated ONVIF *client*). The crates.io name `onvif-rs` is held by an abandoned 2018 placeholder, so the crate is published as **`onvif-device-rs`**; this repository keeps its original name.
 
 ## Features
 
@@ -25,12 +25,13 @@ Extracted verbatim from the production implementation in [mibee-eye-raspi-rs](ht
 
 ```toml
 [dependencies]
-onvif-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.2.1" }
+onvif-device-rs = "0.2.1"
+# git alternative: onvif-device-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.2.1" }
 ```
 
 ```rust
-use onvif_rs::{DeviceConfig, OnvifConfig, OnvifServer};
-use onvif_rs::imaging::{ImagingParams, ImagingParamError, register_imaging_actions};
+use onvif_device_rs::{DeviceConfig, OnvifConfig, OnvifServer};
+use onvif_device_rs::imaging::{ImagingParams, ImagingParamError, register_imaging_actions};
 use std::sync::Arc;
 
 // Implement the Imaging seam over your camera's parameter manager.
@@ -50,8 +51,8 @@ async fn main() {
     };
 
     let mut server = OnvifServer::new(OnvifConfig { /* port, auth, ... */ });
-    onvif_rs::device::register_device_actions(&mut server, /* ... */);
-    onvif_rs::media::register_media_actions(&mut server, /* ... */);
+    onvif_device_rs::device::register_device_actions(&mut server, /* ... */);
+    onvif_device_rs::media::register_media_actions(&mut server, /* ... */);
     register_imaging_actions(&mut server, Arc::new(MyParams));
     server.run().await;
 }

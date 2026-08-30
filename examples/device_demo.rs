@@ -1,7 +1,7 @@
 //! ONVIF device demo — a complete self-check in one process.
 //!
-//! Starts the real [`onvif_rs::server::OnvifServer`] (Device + Media
-//! services) and a [`onvif_rs::discovery::DiscoveryServer`], then drives
+//! Starts the real [`onvif_device_rs::server::OnvifServer`] (Device + Media
+//! services) and a [`onvif_device_rs::discovery::DiscoveryServer`], then drives
 //! them exactly like a foreign ONVIF client would:
 //!
 //! 1. `GetSystemDateAndTime` — pre-auth (anonymous) per the ONVIF Core spec
@@ -30,13 +30,13 @@ use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
-use onvif_rs::config::DeviceConfig;
-use onvif_rs::device::{DeviceHandler, DeviceServiceHandlers};
-use onvif_rs::discovery::DiscoveryServer;
-use onvif_rs::media::{
+use onvif_device_rs::config::DeviceConfig;
+use onvif_device_rs::device::{DeviceHandler, DeviceServiceHandlers};
+use onvif_device_rs::discovery::DiscoveryServer;
+use onvif_device_rs::media::{
     GetProfilesHandler, GetSnapshotUriHandler, GetStreamUriHandler, OnvifMediaConfig,
 };
-use onvif_rs::server::{OnvifConfig, OnvifServer};
+use onvif_device_rs::server::{OnvifConfig, OnvifServer};
 
 const USERNAME: &str = "admin";
 const PASSWORD: &str = "12345678";
@@ -174,7 +174,7 @@ fn xml_field(xml: &str, tag: &str) -> String {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    println!("== onvif-rs device demo: SOAP + WS-Discovery self-check ==\n");
+    println!("== onvif-device-rs device demo: SOAP + WS-Discovery self-check ==\n");
 
     let mut port: u16 = 8080;
     let mut serve = false;
@@ -202,7 +202,7 @@ async fn main() -> Result<()> {
 
     let device = Arc::new(DeviceServiceHandlers::new(
         DeviceConfig {
-            name: "onvif-rs demo camera".into(),
+            name: "onvif-device-rs demo camera".into(),
             manufacturer: "MiBee".into(),
             model: "DEMO".into(),
             firmware: "0.2.1".into(),
@@ -350,7 +350,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!("\nonvif-rs device demo: all checks passed");
+    println!("\nonvif-device-rs device demo: all checks passed");
     if serve {
         println!(
             "\nserving for 10 minutes — try:\n\

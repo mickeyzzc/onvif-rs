@@ -26,9 +26,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use onvif_rs::ptz::PtzHandler;
-use onvif_rs::ptz_state::PtzState;
-use onvif_rs::server::{OnvifConfig, OnvifServer};
+use onvif_device_rs::ptz::PtzHandler;
+use onvif_device_rs::ptz_state::PtzState;
+use onvif_device_rs::server::{OnvifConfig, OnvifServer};
 
 const USERNAME: &str = "admin";
 const PASSWORD: &str = "12345678";
@@ -167,7 +167,7 @@ fn approx(a: f64, b: f64, eps: f64) -> bool {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    println!("== onvif-rs PTZ demo: move / status / presets self-check ==\n");
+    println!("== onvif-device-rs PTZ demo: move / status / presets self-check ==\n");
 
     let mut port: u16 = 8080;
     let mut serve = false;
@@ -351,7 +351,7 @@ async fn main() -> Result<()> {
     }
     println!("[client] unknown verb -> SOAP fault (as required)");
 
-    println!("\nonvif-rs PTZ demo: all checks passed");
+    println!("\nonvif-device-rs PTZ demo: all checks passed");
     if serve {
         println!("--serve: keeping server on tcp/{port} (Ctrl-C to quit)");
         motion.abort();
