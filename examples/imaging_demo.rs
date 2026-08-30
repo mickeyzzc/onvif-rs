@@ -206,6 +206,7 @@ async fn main() -> Result<()> {
         port,
         username: USERNAME.to_string(),
         password: PASSWORD.to_string(),
+        ..Default::default()
     });
     register_imaging_actions(&mut soap, store.clone());
     println!("[server] ONVIF SOAP + Imaging service on tcp/{port}");

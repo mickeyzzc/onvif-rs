@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::str;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 use crate::auth::verify_username_token;
 use crate::types::{serialize_soap_fault, AuthResult, OnvifError, RequestInfo, UsernameToken};
@@ -15,12 +17,88 @@ use crate::types::{serialize_soap_fault, AuthResult, OnvifError, RequestInfo, Us
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Default cap on a request body (SOAP envelopes are a few KiB).
+const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Default per-connection read timeout.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap on the HTTP header section.
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+
 /// Configuration for the ONVIF SOAP server.
+///
+/// Auth is **fail-closed**: starting the server with an empty password and
+/// `allow_no_auth = false` (the default) is a configuration error. Hosts
+/// that deliberately want an open server must set `allow_no_auth = true`.
 #[derive(Debug, Clone)]
 pub struct OnvifConfig {
+    /// Port to bind (`OnvifServer::start`). Ignored by [`OnvifServer::start_on`].
     pub port: u16,
+    /// WS-UsernameToken username expected from clients.
     pub username: String,
+    /// WS-UsernameToken password expected from clients.
     pub password: String,
+    /// Explicitly permit running without authentication when the password is
+    /// empty (every action becomes open). Default `false` — fail closed.
+    pub allow_no_auth: bool,
+    /// Maximum accepted HTTP request body in bytes. Larger bodies are
+    /// rejected with 413. Default 1 MiB.
+    pub max_body_bytes: usize,
+    /// Per-connection read timeout (header + body). Default 30 s.
+    pub read_timeout: Duration,
+}
+
+impl Default for OnvifConfig {
+    fn default() -> Self {
+        Self {
+            port: 8080,
+            username: String::new(),
+            password: String::new(),
+            allow_no_auth: false,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server handle
+// ---------------------------------------------------------------------------
+
+/// Handle to a running ONVIF SOAP server.
+///
+/// Await it (`handle.await`) to wait for the accept loop to finish, or call
+/// [`OnvifServerHandle::shutdown`] for a graceful stop.
+#[derive(Debug)]
+pub struct OnvifServerHandle {
+    task: Option<tokio::task::JoinHandle<()>>,
+    shutdown: watch::Sender<bool>,
+}
+
+impl OnvifServerHandle {
+    /// Request a graceful shutdown and wait for the accept loop to finish.
+    /// In-flight connections finish their current request first.
+    pub async fn shutdown(&mut self) -> Result<(), OnvifError> {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.task.take() {
+            task.await
+                .map_err(|e| OnvifError::Internal(format!("server task join failed: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::future::Future for OnvifServerHandle {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.task.as_mut() {
+            Some(task) => std::pin::Pin::new(task).poll(cx).map(|_| ()),
+            None => std::task::Poll::Ready(()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -85,52 +163,96 @@ impl OnvifServer {
         self.anonymous_actions.insert(action.to_string());
     }
 
-    /// Start listening and serving.  Consumes `self` — all handlers must
-    /// be registered before calling this.
-    pub async fn start(self) -> Result<(), OnvifError> {
+    /// Validate the configuration. Fail-closed: an empty password without an
+    /// explicit `allow_no_auth` is a configuration error, not an open server.
+    fn validate_config(config: &OnvifConfig) -> Result<(), OnvifError> {
+        if config.password.is_empty() && !config.allow_no_auth {
+            return Err(OnvifError::NotAuthorized(
+                "OnvifConfig.password is empty — set credentials, or set \
+                 allow_no_auth = true to deliberately run an open server"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Start listening on `0.0.0.0:{config.port}` and serve.
+    ///
+    /// Consumes `self` — all handlers must be registered before calling
+    /// this. Returns an [`OnvifServerHandle`] for graceful shutdown.
+    pub async fn start(self) -> Result<OnvifServerHandle, OnvifError> {
+        Self::validate_config(&self.config)?;
         let addr = format!("0.0.0.0:{}", self.config.port);
         let listener = TcpListener::bind(&addr)
             .await
             .map_err(|e| OnvifError::Internal(format!("bind {addr}: {e}")))?;
+        self.start_on(listener).await
+    }
+
+    /// Serve on an already-bound listener (injection point for tests, custom
+    /// bind addresses, or sharing a port with host infrastructure).
+    ///
+    /// `OnvifConfig::port` is ignored; the listener's own address is used.
+    pub async fn start_on(self, listener: TcpListener) -> Result<OnvifServerHandle, OnvifError> {
+        Self::validate_config(&self.config)?;
+        let local_addr = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        log::info!("onvif: serving SOAP on {local_addr}");
 
         let handlers = Arc::new(self.handlers);
         let cfg = Arc::new(self.config);
         let anonymous = Arc::new(self.anonymous_actions);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
-        loop {
-            let (mut stream, peer_addr) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    // Accept errors are usually transient
-                    eprintln!("onvif: accept error: {e}");
-                    continue;
-                }
-            };
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, peer_addr) = tokio::select! {
+                    accepted = listener.accept() => match accepted {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            // Accept errors are usually transient
+                            log::warn!("onvif: accept error: {e}");
+                            continue;
+                        }
+                    },
+                    _ = shutdown_rx.changed() => {
+                        log::info!("onvif: shutdown requested — accept loop stopping");
+                        break;
+                    }
+                };
 
-            let handlers = Arc::clone(&handlers);
-            let cfg = Arc::clone(&cfg);
-            let anonymous = Arc::clone(&anonymous);
+                let handlers = Arc::clone(&handlers);
+                let cfg = Arc::clone(&cfg);
+                let anonymous = Arc::clone(&anonymous);
 
-            tokio::spawn(async move {
-                let client_ip = peer_addr.ip().to_string();
-                let server_ip = stream
-                    .local_addr()
-                    .map(|a| a.ip().to_string())
-                    .unwrap_or_default();
-                if let Err(e) = handle_connection(
-                    &mut stream,
-                    &client_ip,
-                    &server_ip,
-                    &handlers,
-                    &cfg,
-                    &anonymous,
-                )
-                .await
-                {
-                    eprintln!("onvif: connection error from {client_ip}: {e}");
-                }
-            });
-        }
+                tokio::spawn(async move {
+                    let client_ip = peer_addr.ip().to_string();
+                    let server_ip = stream
+                        .local_addr()
+                        .map(|a| a.ip().to_string())
+                        .unwrap_or_default();
+                    if let Err(e) = handle_connection(
+                        &mut stream,
+                        &client_ip,
+                        &server_ip,
+                        &handlers,
+                        &cfg,
+                        &anonymous,
+                    )
+                    .await
+                    {
+                        log::error!("onvif: connection error from {client_ip}: {e}");
+                    }
+                });
+            }
+        });
+
+        Ok(OnvifServerHandle {
+            task: Some(task),
+            shutdown: shutdown_tx,
+        })
     }
 }
 
@@ -151,8 +273,24 @@ async fn handle_connection(
     cfg: &SharedConfig,
     anonymous: &SharedAnonymous,
 ) -> Result<(), OnvifError> {
-    // --- Read HTTP request ---
-    let (method, body) = read_http_request(stream).await?;
+    // --- Read HTTP request (bounded header, bounded body, read timeout) ---
+    let read = read_http_request(stream, cfg);
+    let (method, body) = match tokio::time::timeout(cfg.read_timeout, read).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(OnvifError::InvalidXml(m))) if m.starts_with("body too large") => {
+            let fault = serialize_soap_fault("soap:Sender", &m);
+            write_http_response(stream, 413, &fault).await?;
+            // Drain the in-flight body before closing so the client sees the
+            // 413 instead of a connection reset (RFC 7230 §6.6 politeness).
+            drain_before_close(stream).await;
+            return Ok(());
+        }
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            log::warn!("onvif: read timeout from {client_ip}");
+            return Ok(());
+        }
+    };
 
     if method != "POST" {
         let fault = serialize_soap_fault("soap:Sender", "only POST method is supported");
@@ -171,6 +309,9 @@ async fn handle_connection(
     };
 
     // --- Auth ---
+    // `auth_disabled` requires BOTH an explicit opt-in flag and an empty
+    // password — an empty password alone never silently disables auth.
+    let auth_disabled = cfg.allow_no_auth && cfg.password.is_empty();
     let auth_result = if let Some(ref token) = parsed.username_token {
         let ok = verify_username_token(token, &cfg.username, &cfg.password);
         AuthResult {
@@ -202,7 +343,6 @@ async fn handle_connection(
     };
 
     let is_anonymous = anonymous.contains(&parsed.action);
-    let auth_disabled = cfg.password.is_empty();
     if !is_anonymous && !auth_disabled && !auth_result.authenticated {
         let fault = serialize_soap_fault(
             "soap:Sender",
@@ -235,26 +375,33 @@ async fn handle_connection(
 // Minimal HTTP request reader
 // ---------------------------------------------------------------------------
 
+/// Read one HTTP request: header section (capped at [`MAX_HEADER_BYTES`],
+/// may span multiple reads), then exactly `Content-Length` body bytes
+/// (capped at `cfg.max_body_bytes`).
 async fn read_http_request(
     stream: &mut tokio::net::TcpStream,
+    cfg: &OnvifConfig,
 ) -> Result<(String, String), OnvifError> {
-    let mut buf = [0u8; 8192];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .map_err(|e| OnvifError::Internal(format!("read request: {e}")))?;
+    let mut data: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
 
-    if n == 0 {
-        return Err(OnvifError::InvalidXml("empty request".into()));
-    }
-
-    let data = &buf[..n];
-
-    // Find \r\n\r\n (end of headers)
-    let header_end = data
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| OnvifError::InvalidXml("malformed HTTP headers".into()))?;
+    // Read until the end of the header section (or the cap).
+    let header_end = loop {
+        if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        if data.len() > MAX_HEADER_BYTES {
+            return Err(OnvifError::InvalidXml("malformed HTTP headers".into()));
+        }
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|e| OnvifError::Internal(format!("read request: {e}")))?;
+        if n == 0 {
+            return Err(OnvifError::InvalidXml("empty request".into()));
+        }
+        data.extend_from_slice(&chunk[..n]);
+    };
 
     let header_str = str::from_utf8(&data[..header_end])
         .map_err(|_| OnvifError::InvalidXml("invalid HTTP header encoding".into()))?;
@@ -284,26 +431,54 @@ async fn read_http_request(
         })
         .unwrap_or(0);
 
-    // Body starts after headers
-    let body_start = header_end + 4;
-    let mut body = data[body_start..].to_vec();
+    if content_length > cfg.max_body_bytes {
+        return Err(OnvifError::InvalidXml(format!(
+            "body too large: {content_length} bytes exceeds limit {}",
+            cfg.max_body_bytes
+        )));
+    }
 
-    // If the body is larger than the first read buffer, keep reading.
+    // Body starts after headers; keep whatever arrived with them (bounded
+    // by the declared Content-Length — the connection closes after each
+    // response, so pipelined bytes beyond it are ignored).
+    let body_start = header_end + 4;
+    let mut body: Vec<u8> = data[body_start..].to_vec();
+    body.truncate(content_length);
+
+    // Read the remainder of the declared body.
     while body.len() < content_length {
         let m = stream
-            .read(&mut buf)
+            .read(&mut chunk)
             .await
             .map_err(|e| OnvifError::Internal(format!("read body: {e}")))?;
         if m == 0 {
             break; // EOF before Content-Length — truncated
         }
-        body.extend_from_slice(&buf[..m]);
+        body.extend_from_slice(&chunk[..m]);
     }
 
     let body_str = String::from_utf8(body)
         .map_err(|_| OnvifError::InvalidXml("request body is not valid UTF-8".into()))?;
 
     Ok((method, body_str))
+}
+
+/// Read and discard pending inbound bytes (bounded) so closing the socket
+/// sends FIN instead of RST while the peer is still writing.
+async fn drain_before_close(stream: &mut tokio::net::TcpStream) {
+    let mut scratch = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let mut drained: usize = 0;
+    loop {
+        let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remain.is_zero() || drained > 4 * 1024 * 1024 {
+            break;
+        }
+        match tokio::time::timeout(remain, stream.read(&mut scratch)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => drained += n,
+        }
+    }
 }
 
 /// Write an HTTP 1.1 response with `Content-Type: application/soap+xml`.
@@ -317,6 +492,7 @@ async fn write_http_response(
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
         405 => "405 Method Not Allowed",
+        413 => "413 Content Too Large",
         500 => "500 Internal Server Error",
         _ => "500 Internal Server Error",
     };
@@ -757,6 +933,7 @@ mod tests {
             port: 0, // won't actually listen
             username: "admin".into(),
             password: "pass".into(),
+            ..Default::default()
         });
 
         server.register_handler(
@@ -777,6 +954,7 @@ mod tests {
             port: 0,
             username: "admin".into(),
             password: "pass".into(),
+            ..Default::default()
         });
 
         assert!(!server.handlers.contains_key("GetFoo"));
@@ -788,6 +966,7 @@ mod tests {
             port: 0,
             username: "admin".into(),
             password: "pass".into(),
+            ..Default::default()
         });
 
         assert!(!server.anonymous_actions.contains("GetSystemDateAndTime"));

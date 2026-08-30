@@ -191,6 +191,7 @@ async fn main() -> Result<()> {
         port,
         username: USERNAME.to_string(),
         password: PASSWORD.to_string(),
+        ..Default::default()
     });
     for action in [
         "ContinuousMove",

@@ -59,6 +59,16 @@ pub trait ImagingParams: Send + Sync {
     fn get_param(&self, name: &str) -> Result<f64, ImagingParamError>;
     /// Set a parameter by ONVIF name to a normalized `[0.0, 1.0]` value.
     fn set_param(&self, name: &str, value: f64) -> Result<(), ImagingParamError>;
+    /// Exposure mode reported by GetImagingSettings (`"AUTO"` or
+    /// `"MANUAL"`). Default: `"AUTO"` (not backed by host state).
+    fn exposure_mode(&self) -> String {
+        "AUTO".to_string()
+    }
+    /// White-balance mode reported by GetImagingSettings. Default: `"AUTO"`
+    /// (the historical wire value; not backed by host state).
+    fn white_balance_mode(&self) -> String {
+        "AUTO".to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +155,14 @@ impl OnvifActionHandler for GetImagingSettingsHandler {
             .get_param("Sharpness")
             .map_err(|e| OnvifError::Internal(format!("get sharpness: {e}")))?;
 
-        let body_xml = build_get_imaging_settings_xml(brightness, contrast, saturation, sharpness);
+        let body_xml = build_get_imaging_settings_xml(
+            brightness,
+            contrast,
+            saturation,
+            sharpness,
+            &self.pm.exposure_mode(),
+            &self.pm.white_balance_mode(),
+        );
         Ok(serialize_soap_response(&body_xml))
     }
 }
@@ -155,6 +172,8 @@ fn build_get_imaging_settings_xml(
     contrast: f64,
     saturation: f64,
     sharpness: f64,
+    exposure_mode: &str,
+    white_balance_mode: &str,
 ) -> String {
     let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
 
@@ -171,17 +190,16 @@ fn build_get_imaging_settings_xml(
     write_value_attr(&mut w, "tt:ColorSaturation", saturation);
     write_value_attr(&mut w, "tt:Sharpness", sharpness);
 
-    // Exposure — always AUTO (simplified)
+    // Exposure / WhiteBalance modes come from the host seam (AUTO defaults).
     w.write_event(Event::Start(BytesStart::new("tt:Exposure")))
         .unwrap();
-    write_text(&mut w, "tt:Mode", "AUTO");
+    write_text(&mut w, "tt:Mode", exposure_mode);
     w.write_event(Event::End(BytesEnd::new("tt:Exposure")))
         .unwrap();
 
-    // WhiteBalance — always AUTO (simplified)
     w.write_event(Event::Start(BytesStart::new("tt:WhiteBalance")))
         .unwrap();
-    write_text(&mut w, "tt:Mode", "AUTO");
+    write_text(&mut w, "tt:Mode", white_balance_mode);
     w.write_event(Event::End(BytesEnd::new("tt:WhiteBalance")))
         .unwrap();
 
@@ -787,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_build_get_imaging_settings_xml_well_formed() {
-        let xml = build_get_imaging_settings_xml(0.1, 0.2, 0.3, 0.4);
+        let xml = build_get_imaging_settings_xml(0.1, 0.2, 0.3, 0.4, "AUTO", "AUTO");
         let mut reader = Reader::from_str(&xml);
         let mut buf = Vec::new();
         loop {

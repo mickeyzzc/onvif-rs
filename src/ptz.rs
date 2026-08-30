@@ -337,8 +337,10 @@ fn build_get_configurations() -> String {
 fn write_text(w: &mut Writer<Vec<u8>>, name: &str, text: &str) {
     w.write_event(Event::Start(BytesStart::new(name)))
         .expect("write start");
-    w.write_event(Event::Text(BytesText::new(text)))
-        .expect("write text");
+    w.write_event(Event::Text(BytesText::from_escaped(
+        crate::types::xml_escape(text),
+    )))
+    .expect("write text");
     w.write_event(Event::End(BytesEnd::new(name)))
         .expect("write end");
 }
