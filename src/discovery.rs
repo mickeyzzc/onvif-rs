@@ -212,7 +212,7 @@ fn parse_probe(msg: &[u8]) -> Option<String> {
 /// # Example
 ///
 /// ```rust,no_run
-/// use onvif_rs::discovery::DiscoveryServer;
+/// use onvif_device_rs::discovery::DiscoveryServer;
 ///
 /// let server = DiscoveryServer::new(
 ///     "192.168.1.100".to_string(),

@@ -25,8 +25,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use onvif_rs::imaging::{register_imaging_actions, ImagingParamError, ImagingParams};
-use onvif_rs::server::{OnvifConfig, OnvifServer};
+use onvif_device_rs::imaging::{register_imaging_actions, ImagingParamError, ImagingParams};
+use onvif_device_rs::server::{OnvifConfig, OnvifServer};
 
 const USERNAME: &str = "admin";
 const PASSWORD: &str = "12345678";
@@ -182,7 +182,7 @@ fn xml_attr(xml: &str, tag: &str, attr: &str) -> f64 {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    println!("== onvif-rs imaging demo: get / set / range-fault self-check ==\n");
+    println!("== onvif-device-rs imaging demo: get / set / range-fault self-check ==\n");
 
     let mut port: u16 = 8080;
     let mut serve = false;
@@ -265,7 +265,7 @@ async fn main() -> Result<()> {
     assert_eq!(store.get_param("Brightness").unwrap(), 0.8);
     println!("[client] out-of-range value -> SOAP fault, store unchanged");
 
-    println!("\nonvif-rs imaging demo: all checks passed");
+    println!("\nonvif-device-rs imaging demo: all checks passed");
     if serve {
         println!("--serve: keeping server on tcp/{port} (Ctrl-C to quit)");
         loop {
