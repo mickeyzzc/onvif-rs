@@ -26,6 +26,26 @@ use crate::types::{resolve_server_ip, serialize_soap_response, OnvifError, Reque
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Video encoder advertised by the Media service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoEncoding {
+    /// H.264 (`<Encoding>H264</Encoding>`).
+    H264,
+    /// H.265 / HEVC (`<Encoding>H265</Encoding>`).
+    H265,
+}
+
+impl VideoEncoding {
+    /// ONVIF wire token.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VideoEncoding::H264 => "H264",
+            VideoEncoding::H265 => "H265",
+        }
+    }
+}
+
 /// Camera/media configuration consumed by the ONVIF Media service handlers.
 #[derive(Debug, Clone)]
 pub struct OnvifMediaConfig {
@@ -49,10 +69,22 @@ pub struct OnvifMediaConfig {
     pub snapshot_port: u16,
     /// HTTP path of the snapshot endpoint (default `/snapshot.jpg`).
     pub snapshot_path: String,
+    /// Profile token in GetProfiles (default `main`).
+    pub profile_token: String,
+    /// Video source token (default `videoSrc0`).
+    pub video_source_token: String,
+    /// Video encoder configuration token (default `enc0`).
+    pub encoder_token: String,
+    /// Advertised video encoder (default H.264; set H.265 for H.265 hosts).
+    pub encoding: VideoEncoding,
+    /// Human name of the video source in GetVideoSources (default
+    /// `Video Source`). This is host identity, not a product name.
+    pub video_source_name: String,
 }
 
 impl OnvifMediaConfig {
-    /// Construct with the historical default stream path `/stream`.
+    /// Construct with the historical default tokens (`main` / `videoSrc0` /
+    /// `enc0`), H.264 encoding, and stream path `/stream`.
     #[must_use]
     pub fn new(
         camera_width: u32,
@@ -72,6 +104,11 @@ impl OnvifMediaConfig {
             stream_path: "/stream".to_string(),
             snapshot_port: 0,
             snapshot_path: "/snapshot.jpg".to_string(),
+            profile_token: "main".to_string(),
+            video_source_token: "videoSrc0".to_string(),
+            encoder_token: "enc0".to_string(),
+            encoding: VideoEncoding::H264,
+            video_source_name: "Video Source".to_string(),
         }
     }
 }
@@ -82,7 +119,9 @@ impl OnvifMediaConfig {
 
 fn write_text_element(writer: &mut Writer<Vec<u8>>, name: &str, text: &str) {
     let _ = writer.write_event(Event::Start(BytesStart::new(name)));
-    let _ = writer.write_event(Event::Text(BytesText::new(text)));
+    let _ = writer.write_event(Event::Text(BytesText::from_escaped(
+        crate::types::xml_escape(text),
+    )));
     let _ = writer.write_event(Event::End(BytesEnd::new(name)));
 }
 
@@ -120,23 +159,23 @@ impl OnvifActionHandler for GetProfilesHandler {
             .write_event(Event::Start(BytesStart::new("GetProfilesResponse")))
             .unwrap();
 
-        // <Profiles token="main">
+        // <Profiles token="...">
         {
             let mut profiles = BytesStart::new("Profiles");
-            profiles.push_attribute(("token", "main"));
+            profiles.push_attribute(("token", self.config.profile_token.as_str()));
             writer.write_event(Event::Start(profiles)).unwrap();
         }
 
-        write_text_element(&mut writer, "Name", "main");
+        write_text_element(&mut writer, "Name", &self.config.profile_token);
 
-        // <VideoSourceConfiguration token="videoSrc0">
+        // <VideoSourceConfiguration token="...">
         {
             let mut vs_cfg = BytesStart::new("VideoSourceConfiguration");
-            vs_cfg.push_attribute(("token", "videoSrc0"));
+            vs_cfg.push_attribute(("token", self.config.video_source_token.as_str()));
             writer.write_event(Event::Start(vs_cfg)).unwrap();
         }
         write_text_element(&mut writer, "Name", "VideoSourceConfig");
-        write_text_element(&mut writer, "SourceToken", "videoSrc0");
+        write_text_element(&mut writer, "SourceToken", &self.config.video_source_token);
         write_text_element(&mut writer, "UseCount", "1");
         // <Bounds width="W" height="H"/>
         {
@@ -151,15 +190,15 @@ impl OnvifActionHandler for GetProfilesHandler {
             .write_event(Event::End(BytesEnd::new("VideoSourceConfiguration")))
             .unwrap();
 
-        // <VideoEncoderConfiguration token="enc0">
+        // <VideoEncoderConfiguration token="...">
         {
             let mut ve_cfg = BytesStart::new("VideoEncoderConfiguration");
-            ve_cfg.push_attribute(("token", "enc0"));
+            ve_cfg.push_attribute(("token", self.config.encoder_token.as_str()));
             writer.write_event(Event::Start(ve_cfg)).unwrap();
         }
         write_text_element(&mut writer, "Name", "VideoEncoderConfig");
         write_text_element(&mut writer, "UseCount", "1");
-        write_text_element(&mut writer, "Encoding", "H264");
+        write_text_element(&mut writer, "Encoding", self.config.encoding.as_str());
 
         // <Resolution>
         writer
@@ -317,15 +356,17 @@ impl OnvifActionHandler for GetSnapshotUriHandler {
 
 /// Handler for the ONVIF GetVideoSources SOAP action.
 ///
-/// Returns a single physical video source (Pi Camera) with the configured
-/// resolution, frame rate, and bitrate baked into the profile.
+/// Returns a single physical video source whose token and name come from
+/// [`OnvifMediaConfig`]. By design (byte-stability against raw-SOAP NVR
+/// matching) the response carries only `token` + `Name` — resolution and
+/// frame rate live in the profile (GetProfiles), not here.
 pub struct GetVideoSourcesHandler {
-    _config: Arc<OnvifMediaConfig>,
+    config: Arc<OnvifMediaConfig>,
 }
 
 impl GetVideoSourcesHandler {
     pub fn new(config: Arc<OnvifMediaConfig>) -> Self {
-        Self { _config: config }
+        Self { config }
     }
 }
 
@@ -337,13 +378,13 @@ impl OnvifActionHandler for GetVideoSourcesHandler {
             .write_event(Event::Start(BytesStart::new("GetVideoSourcesResponse")))
             .unwrap();
 
-        // <VideoSources token="videoSrc0">
+        // <VideoSources token="...">
         {
             let mut vs = BytesStart::new("VideoSources");
-            vs.push_attribute(("token", "videoSrc0"));
+            vs.push_attribute(("token", self.config.video_source_token.as_str()));
             writer.write_event(Event::Start(vs)).unwrap();
         }
-        write_text_element(&mut writer, "Name", "Pi Camera");
+        write_text_element(&mut writer, "Name", &self.config.video_source_name);
         writer
             .write_event(Event::End(BytesEnd::new("VideoSources")))
             .unwrap();
@@ -372,6 +413,11 @@ mod tests {
             stream_path: "/stream".to_string(),
             snapshot_port: 0,
             snapshot_path: "/snapshot.jpg".to_string(),
+            profile_token: "main".to_string(),
+            video_source_token: "videoSrc0".to_string(),
+            encoder_token: "enc0".to_string(),
+            encoding: VideoEncoding::H264,
+            video_source_name: "Video Source".to_string(),
             camera_width: 1920,
             camera_height: 1080,
             camera_fps: 30,
@@ -471,6 +517,11 @@ mod tests {
             stream_path: "/live/cam-42".to_string(),
             snapshot_port: 0,
             snapshot_path: "/snapshot.jpg".to_string(),
+            profile_token: "main".to_string(),
+            video_source_token: "videoSrc0".to_string(),
+            encoder_token: "enc0".to_string(),
+            encoding: VideoEncoding::H264,
+            video_source_name: "Video Source".to_string(),
             camera_width: 1280,
             camera_height: 720,
             camera_fps: 25,
@@ -595,7 +646,8 @@ mod tests {
 
         assert!(result.contains("GetVideoSourcesResponse"));
         assert!(result.contains(r#"token="videoSrc0""#));
-        assert!(result.contains("Pi Camera"));
+        assert!(result.contains("Video Source"), "neutral default name");
+        assert!(!result.contains("Pi Camera"), "no origin-hardware branding");
         assert!(result.contains("soap:Envelope"));
     }
 

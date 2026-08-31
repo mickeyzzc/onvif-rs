@@ -34,7 +34,7 @@ use onvif_device_rs::config::DeviceConfig;
 use onvif_device_rs::device::{DeviceHandler, DeviceServiceHandlers};
 use onvif_device_rs::discovery::DiscoveryServer;
 use onvif_device_rs::media::{
-    GetProfilesHandler, GetSnapshotUriHandler, GetStreamUriHandler, OnvifMediaConfig,
+    GetProfilesHandler, GetSnapshotUriHandler, GetStreamUriHandler, OnvifMediaConfig, VideoEncoding,
 };
 use onvif_device_rs::server::{OnvifConfig, OnvifServer};
 
@@ -198,6 +198,7 @@ async fn main() -> Result<()> {
         port,
         username: USERNAME.to_string(),
         password: PASSWORD.to_string(),
+        ..Default::default()
     });
 
     let device = Arc::new(DeviceServiceHandlers::new(
@@ -237,6 +238,11 @@ async fn main() -> Result<()> {
         // itself; hosts with a real snapshot server point this at their port.
         snapshot_port: 8080,
         snapshot_path: "/snapshot.jpg".to_string(),
+        profile_token: "main".to_string(),
+        video_source_token: "videoSrc0".to_string(),
+        encoder_token: "enc0".to_string(),
+        encoding: VideoEncoding::H264,
+        video_source_name: "Video Source".to_string(),
     });
     soap.register_handler(
         "GetProfiles",
@@ -251,12 +257,12 @@ async fn main() -> Result<()> {
         Box::new(GetSnapshotUriHandler::new(Arc::clone(&media))),
     );
 
-    match DiscoveryServer::new(device_ip.clone(), port).start().await {
-        Ok(()) => println!("[server] WS-Discovery responder on udp/3702"),
+    match DiscoveryServer::new(&device_ip, port).start().await {
+        Ok(_handle) => println!("[server] WS-Discovery responder on udp/3702"),
         Err(e) => println!("[server] WS-Discovery not started ({e}) — probe check will be skipped"),
     }
     println!("[server] ONVIF SOAP service on tcp/{port} (device {SERIAL})");
-    tokio::spawn(soap.start());
+    let _soap_handle = tokio::spawn(soap.start());
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // -- client side checks -------------------------------------------------

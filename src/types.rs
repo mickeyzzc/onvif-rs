@@ -3,6 +3,16 @@ use quick_xml::Writer;
 
 use crate::namespaces::SOAP_ENVELOPE;
 
+/// Escape a string for interpolation as XML text content.
+///
+/// Client-controlled data (SOAP action names, preset names, host identity
+/// strings) reaches response text through this helper — without escaping, a
+/// `<` or `&` in any of them produces malformed XML that strict NVR parsers
+/// reject.
+pub(crate) fn xml_escape(text: &str) -> std::borrow::Cow<'_, str> {
+    quick_xml::escape::escape(text)
+}
+
 // ---------------------------------------------------------------------------
 // SOAP data types
 // ---------------------------------------------------------------------------
@@ -72,12 +82,16 @@ pub struct RequestInfo {
 }
 
 /// Resolve the server IP to use in ONVIF URI responses.
-//
-// Uses the per-request `server_ip` (the local interface that received the
-// TCP connection) when it is a real routable address.  Falls back to the
-// startup-detected `device_ip` when `server_ip` is empty or a loopback
-// address — this happens when the request arrives through the web UI's
-// localhost ONVIF proxy (port 8088 → 127.0.0.1:8080).
+///
+/// Uses the per-request `server_ip` (the local interface that received the
+/// TCP connection) when it is a real routable address. Falls back to the
+/// startup-detected `device_ip` when `server_ip` is empty or a loopback
+/// address — this covers requests arriving through a host-side localhost
+/// reverse proxy (e.g. a web UI on :8088 proxying to the ONVIF port).
+///
+/// NOTE for multi-homed hosts: this rewrites loopback-sourced requests to
+/// the startup `device_ip`. Hosts that genuinely serve ONVIF on loopback to
+/// external callers should pass the loopback address as `device_ip`.
 pub fn resolve_server_ip<'a>(server_ip: &'a str, device_ip: &'a str) -> &'a str {
     if server_ip.is_empty() || server_ip.starts_with("127.") || server_ip == "::1" {
         device_ip
@@ -195,7 +209,7 @@ fn write_text_tag(writer: &mut Writer<Vec<u8>>, name: &str, text: &str) {
         .write_event(Event::Start(BytesStart::new(name)))
         .expect("write text tag start");
     writer
-        .write_event(Event::Text(BytesText::new(text)))
+        .write_event(Event::Text(BytesText::from_escaped(xml_escape(text))))
         .expect("write text");
     writer
         .write_event(Event::End(BytesEnd::new(name)))

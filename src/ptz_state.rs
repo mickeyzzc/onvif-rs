@@ -4,6 +4,11 @@
 //! preset save/restore, and position querying.  Thread-safe via interior
 //! mutability (`std::sync::RwLock`) so that a single `PtzState` can be
 //! shared between ONVIF handler tasks and a background tick loop.
+/// Recover from a poisoned lock: a prior panic under the lock already
+/// violated state consistency enough that reusing the value beats cascading panics.
+fn poison<T>(p: std::sync::PoisonError<T>) -> T {
+    p.into_inner()
+}
 
 use std::collections::HashMap;
 
@@ -113,7 +118,7 @@ impl PtzState {
     /// | Absolute     | Exponential easing toward target: `pos += (target − pos) × 0.15`.         |
     /// |              | Snaps to target and transitions to Idle when < 0.001 away or ≥ 20 steps.  |
     pub fn tick(&self, dt_ms: u64) {
-        let mode = *self.mode.read().expect("ptz mode lock");
+        let mode = *self.mode.read().unwrap_or_else(poison);
         match mode {
             MoveMode::Idle => {}
             MoveMode::Continuous => self.tick_continuous(dt_ms),
@@ -122,10 +127,10 @@ impl PtzState {
     }
 
     fn tick_continuous(&self, dt_ms: u64) {
-        let vel = *self.velocity.read().expect("ptz velocity lock");
+        let vel = *self.velocity.read().unwrap_or_else(poison);
         let dt = dt_ms as f64;
         let f = dt * 0.0002;
-        let mut pos = self.position.write().expect("ptz position lock");
+        let mut pos = self.position.write().unwrap_or_else(poison);
         pos.x = clampf(pos.x + vel.x * f, -1.0, 1.0);
         pos.y = clampf(pos.y + vel.y * f, -1.0, 1.0);
         pos.zoom = clampf(pos.zoom + vel.zoom * f, 0.0, 1.0);
@@ -136,7 +141,7 @@ impl PtzState {
         const SNAP: f64 = 0.001;
         const MAX_STEPS: u32 = 20;
 
-        let mut pos = self.position.write().expect("ptz position lock");
+        let mut pos = self.position.write().unwrap_or_else(poison);
         pos.x += (target.x - pos.x) * EASE;
         pos.y += (target.y - pos.y) * EASE;
         pos.zoom += (target.zoom - pos.zoom) * EASE;
@@ -149,12 +154,12 @@ impl PtzState {
         if done {
             *pos = target;
             drop(pos);
-            *self.velocity.write().expect("ptz velocity lock") = Velocity::default();
-            *self.moving.write().expect("ptz moving lock") = false;
-            *self.mode.write().expect("ptz mode lock") = MoveMode::Idle;
+            *self.velocity.write().unwrap_or_else(poison) = Velocity::default();
+            *self.moving.write().unwrap_or_else(poison) = false;
+            *self.mode.write().unwrap_or_else(poison) = MoveMode::Idle;
         } else {
             drop(pos);
-            *self.mode.write().expect("ptz mode lock") = MoveMode::Absolute {
+            *self.mode.write().unwrap_or_else(poison) = MoveMode::Absolute {
                 target,
                 step: step + 1,
             };
@@ -169,16 +174,16 @@ impl PtzState {
     /// subsequent [`tick`](Self::tick) call.
     pub fn continuous_move(&self, vel: Velocity) {
         self.stop();
-        *self.velocity.write().expect("ptz velocity lock") = vel;
-        *self.moving.write().expect("ptz moving lock") = true;
-        *self.mode.write().expect("ptz mode lock") = MoveMode::Continuous;
+        *self.velocity.write().unwrap_or_else(poison) = vel;
+        *self.moving.write().unwrap_or_else(poison) = true;
+        *self.mode.write().unwrap_or_else(poison) = MoveMode::Continuous;
     }
 
     /// Halt all movement immediately.
     pub fn stop(&self) {
-        *self.mode.write().expect("ptz mode lock") = MoveMode::Idle;
-        *self.velocity.write().expect("ptz velocity lock") = Velocity::default();
-        *self.moving.write().expect("ptz moving lock") = false;
+        *self.mode.write().unwrap_or_else(poison) = MoveMode::Idle;
+        *self.velocity.write().unwrap_or_else(poison) = Velocity::default();
+        *self.moving.write().unwrap_or_else(poison) = false;
     }
 
     /// Move to an absolute position with exponential easing.
@@ -192,16 +197,16 @@ impl PtzState {
             y: clampf(target.y, -1.0, 1.0),
             zoom: clampf(target.zoom, 0.0, 1.0),
         };
-        *self.mode.write().expect("ptz mode lock") = MoveMode::Absolute {
+        *self.mode.write().unwrap_or_else(poison) = MoveMode::Absolute {
             target: clamped,
             step: 0,
         };
-        *self.moving.write().expect("ptz moving lock") = true;
+        *self.moving.write().unwrap_or_else(poison) = true;
     }
 
     /// Apply relative movement immediately (no animation).
     pub fn relative_move(&self, delta: Velocity) {
-        let mut pos = self.position.write().expect("ptz position lock");
+        let mut pos = self.position.write().unwrap_or_else(poison);
         pos.x = clampf(pos.x + delta.x, -1.0, 1.0);
         pos.y = clampf(pos.y + delta.y, -1.0, 1.0);
         pos.zoom = clampf(pos.zoom + delta.zoom, 0.0, 1.0);
@@ -212,9 +217,9 @@ impl PtzState {
     /// Save current position as a named preset, auto-generating a token
     /// (e.g. `"preset-1"`).  Returns the generated token.
     pub fn save_preset(&self, name: &str) -> String {
-        let pos = *self.position.read().expect("ptz position lock");
+        let pos = *self.position.read().unwrap_or_else(poison);
         let token = {
-            let presets = self.presets.read().expect("ptz presets lock");
+            let presets = self.presets.read().unwrap_or_else(poison);
             format!("preset-{}", presets.len() + 1)
         };
         let preset = Preset {
@@ -232,7 +237,7 @@ impl PtzState {
     /// Save current position with an explicit token (used by ONVIF SetPreset
     /// when the client provides a token).
     pub fn save_preset_with_token(&self, token: &str, name: &str) {
-        let pos = *self.position.read().expect("ptz position lock");
+        let pos = *self.position.read().unwrap_or_else(poison);
         let preset = Preset {
             token: token.to_string(),
             name: name.to_string(),
@@ -247,7 +252,7 @@ impl PtzState {
     /// Move to a saved preset position (delegates to [`absolute_move`]).
     pub fn goto_preset(&self, token: &str) -> Result<(), String> {
         let position = {
-            let presets = self.presets.read().expect("ptz presets lock");
+            let presets = self.presets.read().unwrap_or_else(poison);
             presets
                 .get(token)
                 .ok_or_else(|| format!("preset not found: {token}"))
@@ -259,7 +264,7 @@ impl PtzState {
 
     /// Remove a preset by token.
     pub fn remove_preset(&self, token: &str) -> Result<(), String> {
-        let mut presets = self.presets.write().expect("ptz presets lock");
+        let mut presets = self.presets.write().unwrap_or_else(poison);
         presets
             .remove(token)
             .ok_or_else(|| format!("preset not found: {token}"))?;
@@ -270,12 +275,12 @@ impl PtzState {
 
     /// Return the current position.
     pub fn get_position(&self) -> Position {
-        *self.position.read().expect("ptz position lock")
+        *self.position.read().unwrap_or_else(poison)
     }
 
     /// Return movement status: `"IDLE"` or `"MOVING"`.
     pub fn get_status(&self) -> &'static str {
-        if *self.moving.read().expect("ptz moving lock") {
+        if *self.moving.read().unwrap_or_else(poison) {
             "MOVING"
         } else {
             "IDLE"

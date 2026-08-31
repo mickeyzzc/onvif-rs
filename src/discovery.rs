@@ -101,6 +101,10 @@ fn generate_uuid() -> String {
 ///
 /// Uses the "connect to a known address" technique which finds the IP
 /// associated with the default route without actually sending any data.
+/// On an isolated network with no default route the fallback is loopback —
+/// XAddrs built from it are unreachable for remote clients, so a warning is
+/// logged. Pass an explicit `device_ip` to [`DiscoveryServer::new`] to avoid
+/// the fallback entirely.
 pub fn detect_local_ip() -> String {
     if let Ok(socket) = StdUdpSocket::bind("0.0.0.0:0") {
         if socket.connect("8.8.8.8:80").is_ok() {
@@ -113,6 +117,10 @@ pub fn detect_local_ip() -> String {
         }
     }
     // Last resort
+    log::warn!(
+        "onvif: could not detect a routable local IP — discovery XAddrs fall back to 127.0.0.1 \
+         (unreachable for remote clients); pass an explicit device_ip"
+    );
     "127.0.0.1".to_string()
 }
 
@@ -121,6 +129,30 @@ pub fn detect_local_ip() -> String {
 /// Matches both the full URI and suffix form (used by some NVR clients).
 fn is_probe_action(action: &str) -> bool {
     action == PROBE_ACTION || action.ends_with("/discovery/Probe")
+}
+
+/// Build an `onvif://www.onvif.org/<category>/<value>` scope URI.
+///
+/// The value is percent-encoded: the `<d:Scopes>` element is a
+/// space-separated list, so a literal space in a name would split one scope
+/// into two broken fragments on the wire.
+fn scope_uri(category: &str, value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    format!("onvif://www.onvif.org/{category}/{encoded}")
+}
+
+/// Escape a string for interpolation as XML text (client-supplied
+/// MessageIDs and host-configured URIs both reach ProbeMatches).
+fn xml_escape(text: &str) -> std::borrow::Cow<'_, str> {
+    quick_xml::escape::escape(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -214,12 +246,13 @@ fn parse_probe(msg: &[u8]) -> Option<String> {
 /// ```rust,no_run
 /// use onvif_device_rs::discovery::DiscoveryServer;
 ///
-/// let server = DiscoveryServer::new(
-///     "192.168.1.100".to_string(),
+/// let server = DiscoveryServer::with_identity(
+///     "192.0.2.10",
 ///     8080,
+///     "Front Gate Camera",
+///     "IMX219",
 /// );
-/// // Start the UDP multicast listener
-/// // server.start().await.unwrap();
+/// // let handle = server.start().await.unwrap();
 /// ```
 #[derive(Debug, Clone)]
 pub struct DiscoveryServer {
@@ -234,32 +267,59 @@ pub struct DiscoveryServer {
 }
 
 impl DiscoveryServer {
-    /// Create a new `DiscoveryServer`.
+    /// Create a new `DiscoveryServer` with neutral scopes.
     ///
     /// `device_ip` is the IP address to use in XAddr URLs. If empty, the
-    /// server will attempt to auto-detect the local non-loopback IPv4 address.
+    /// server attempts to auto-detect the local non-loopback IPv4 address
+    /// (and logs a warning when detection falls back to loopback).
     ///
-    /// `onvif_port` is the ONVIF HTTP server port (default 8080).
-    ///
-    /// Scopes are set to default ONVIF profiles (Streaming) with the device
-    /// name "Pi Camera V1" and hardware "OV5647".
-    pub fn new(device_ip: String, onvif_port: u16) -> Self {
+    /// The default scope set is only `onvif://www.onvif.org/Profile/Streaming`
+    /// — use [`DiscoveryServer::with_identity`] or
+    /// [`DiscoveryServer::with_scopes`] to advertise a name/hardware scope.
+    /// A fresh random UUID is generated; persist one across restarts with
+    /// [`DiscoveryServer::with_uuid`] so NVRs keying on EndpointReference
+    /// do not see a new device after every reboot.
+    #[must_use]
+    pub fn new(device_ip: &str, onvif_port: u16) -> Self {
         let ip = if device_ip.is_empty() {
             detect_local_ip()
         } else {
-            device_ip
+            device_ip.to_string()
         };
 
         Self {
             device_ip: ip,
             onvif_port,
             uuid: generate_uuid(),
-            scopes: vec![
-                "onvif://www.onvif.org/Profile/Streaming".to_string(),
-                "onvif://www.onvif.org/name/PiCameraV1".to_string(),
-                "onvif://www.onvif.org/hardware/OV5647".to_string(),
-            ],
+            scopes: vec!["onvif://www.onvif.org/Profile/Streaming".to_string()],
         }
+    }
+
+    /// Create a `DiscoveryServer` that advertises the device's name and
+    /// hardware in its scopes:
+    /// `onvif://www.onvif.org/name/<name>` and
+    /// `onvif://www.onvif.org/hardware/<hardware_id>`.
+    #[must_use]
+    pub fn with_identity(device_ip: &str, onvif_port: u16, name: &str, hardware_id: &str) -> Self {
+        let mut server = Self::new(device_ip, onvif_port);
+        server.scopes.push(scope_uri("name", name));
+        server.scopes.push(scope_uri("hardware", hardware_id));
+        server
+    }
+
+    /// Override the scope set entirely (caller controls the full URIs).
+    #[must_use]
+    pub fn with_scopes(mut self, scopes: Vec<String>) -> Self {
+        self.scopes = scopes;
+        self
+    }
+
+    /// Set a stable device UUID (with `uuid:` prefix) so the discovery
+    /// identity survives process restarts.
+    #[must_use]
+    pub fn with_uuid(mut self, uuid: &str) -> Self {
+        self.uuid = uuid.to_string();
+        self
     }
 
     /// Returns the device UUID (with `uuid:` prefix).
@@ -292,6 +352,8 @@ impl DiscoveryServer {
     /// Build the ProbeMatches XML response for a given `message_id`.
     ///
     /// `host_ip` controls the IP in XAddr URLs (empty = use device's own IP).
+    /// Client-controlled values (the echoed `message_id`) and host-configured
+    /// scopes are XML-escaped.
     pub fn build_probe_matches(&self, message_id: &str, host_ip: &str) -> Vec<u8> {
         let scopes_str = self.scopes.join(" ");
         let xaddrs_str = self.xaddrs(host_ip).join(" ");
@@ -305,7 +367,10 @@ impl DiscoveryServer {
             r#"<a:Action s:mustUnderstand="1">{}</a:Action>"#,
             PROBE_MATCHES_ACTION
         ));
-        xml.push_str(&format!("<a:RelatesTo>{}</a:RelatesTo>", message_id));
+        xml.push_str(&format!(
+            "<a:RelatesTo>{}</a:RelatesTo>",
+            xml_escape(message_id)
+        ));
         xml.push_str(
             r#"<a:To s:mustUnderstand="1">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:To>"#,
         );
@@ -315,10 +380,10 @@ impl DiscoveryServer {
         xml.push_str("<d:ProbeMatch>");
         xml.push_str(&format!(
             r#"<a:EndpointReference xmlns:a="http://www.w3.org/2005/08/addressing"><a:Address>{}</a:Address></a:EndpointReference>"#,
-            self.uuid
+            xml_escape(&self.uuid)
         ));
-        xml.push_str(&format!("<d:Scopes>{}</d:Scopes>", scopes_str));
-        xml.push_str(&format!("<d:XAddrs>{}</d:XAddrs>", xaddrs_str));
+        xml.push_str(&format!("<d:Scopes>{}</d:Scopes>", xml_escape(&scopes_str)));
+        xml.push_str(&format!("<d:XAddrs>{}</d:XAddrs>", xml_escape(&xaddrs_str)));
         xml.push_str("<d:Types>tdn:NetworkVideoTransmitter tdn:Device</d:Types>");
         xml.push_str("<d:MetadataVersion>1</d:MetadataVersion>");
         xml.push_str("</d:ProbeMatch>");
@@ -347,24 +412,22 @@ impl DiscoveryServer {
     /// and spawns a background task that reads Probe messages and sends
     /// ProbeMatches responses.
     ///
-    /// The listener runs until the program exits.
+    /// Returns a [`DiscoveryHandle`] — await it for the listener task's exit
+    /// or call [`DiscoveryHandle::shutdown`] to stop it. (Binding and
+    /// joining happen before the handle is returned, so `Ok` really means
+    /// the responder is up.)
     ///
     /// # Errors
     ///
     /// Returns `DiscoveryError::Io` if the UDP socket cannot be bound or
     /// the multicast group cannot be joined.
-    pub async fn start(&self) -> Result<(), DiscoveryError> {
+    pub async fn start(&self) -> Result<DiscoveryHandle, DiscoveryError> {
         // Create UDP socket with SO_REUSEADDR (required for multicast + restarts).
         use socket2::{Domain, Protocol, Socket, Type};
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         sock.set_reuse_address(true)?;
         sock.set_nonblocking(true)?;
-        sock.bind(
-            &"0.0.0.0:3702"
-                .parse::<std::net::SocketAddr>()
-                .unwrap()
-                .into(),
-        )?;
+        sock.bind(&(std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, 3702))).into())?;
         let std_socket: StdUdpSocket = sock.into();
         // Join multicast on the specific interface.
         let iface: Ipv4Addr = self.device_ip.parse().unwrap_or(Ipv4Addr::UNSPECIFIED);
@@ -374,14 +437,61 @@ impl DiscoveryServer {
 
         let socket = UdpSocket::from_std(std_socket)?;
         let server = Arc::new(self.clone());
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-        tokio::spawn(async move {
-            if let Err(e) = run_udp_listener(socket, server).await {
-                eprintln!("discovery: UDP listener error: {e}");
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = run_udp_listener_once(&socket, &server) => {
+                        if let Err(e) = result {
+                            log::error!("discovery: UDP listener error: {e}");
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        log::info!("discovery: shutdown requested — UDP listener stopping");
+                        break;
+                    }
+                }
             }
         });
 
+        Ok(DiscoveryHandle {
+            task: Some(task),
+            shutdown: shutdown_tx,
+        })
+    }
+}
+
+/// Handle to a running WS-Discovery responder.
+#[derive(Debug)]
+pub struct DiscoveryHandle {
+    task: Option<tokio::task::JoinHandle<()>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl DiscoveryHandle {
+    /// Stop the discovery listener and wait for its task to finish.
+    pub async fn shutdown(&mut self) -> Result<(), DiscoveryError> {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.task.take() {
+            task.await
+                .map_err(|e| DiscoveryError::Server(format!("listener task join failed: {e}")))?;
+        }
         Ok(())
+    }
+}
+
+impl std::future::Future for DiscoveryHandle {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.task.as_mut() {
+            Some(task) => std::pin::Pin::new(task).poll(cx).map(|_| ()),
+            None => std::task::Poll::Ready(()),
+        }
     }
 }
 
@@ -389,36 +499,23 @@ impl DiscoveryServer {
 // Background UDP listener task
 // ---------------------------------------------------------------------------
 
-/// Background task that reads UDP multicast messages and responds to Probes.
-async fn run_udp_listener(
-    socket: UdpSocket,
-    server: Arc<DiscoveryServer>,
+/// Serve one UDP datagram (probe response). Errors are returned so the
+/// caller's select loop can log and keep running.
+async fn run_udp_listener_once(
+    socket: &UdpSocket,
+    server: &DiscoveryServer,
 ) -> Result<(), DiscoveryError> {
     let mut buf = vec![0u8; 8192];
-
-    loop {
-        match socket.recv_from(&mut buf).await {
-            Ok((n, src)) => {
-                let msg = &buf[..n];
-                // For UDP probes, always use the device's own IP for XAddr —
-                // never the requester's source IP.
-                let resp = server.handle_probe(msg, "");
-                if let Some(resp) = resp {
-                    if let Err(e) = socket.send_to(&resp, src).await {
-                        eprintln!("discovery: failed to send ProbeMatches to {}: {e}", src);
-                    }
-                }
-            }
-            Err(e) => {
-                // tokio handles EAGAIN/EWOULDBLOCK internally; this arm
-                // catches real I/O errors.
-                eprintln!("discovery: UDP read error: {e}");
-                // yield before retrying to avoid busy-looping on persistent
-                // errors
-                tokio::task::yield_now().await;
-            }
+    let (n, src) = socket.recv_from(&mut buf).await?;
+    let msg = &buf[..n];
+    // For UDP probes, always use the device's own IP for XAddr —
+    // never the requester's source IP.
+    if let Some(resp) = server.handle_probe(msg, "") {
+        if let Err(e) = socket.send_to(&resp, src).await {
+            log::error!("discovery: failed to send ProbeMatches to {src}: {e}");
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -554,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_build_probe_matches_contains_required_elements() {
-        let server = DiscoveryServer::new("192.168.1.100".to_string(), 8080);
+        let server = DiscoveryServer::new("192.168.1.100", 8080);
         let resp = server.build_probe_matches("uuid:test-id", "");
         let xml = String::from_utf8(resp).expect("valid UTF-8");
 
@@ -586,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_build_probe_matches_with_host_ip() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 8080);
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
         let resp = server.build_probe_matches("uuid:test", "10.0.0.2");
         let xml = String::from_utf8(resp).expect("valid UTF-8");
 
@@ -597,7 +694,7 @@ mod tests {
 
     #[test]
     fn test_build_probe_matches_is_valid_xml() {
-        let server = DiscoveryServer::new("192.168.1.1".to_string(), 8080);
+        let server = DiscoveryServer::new("192.168.1.1", 8080);
         let resp = server.build_probe_matches("uuid:validate", "");
         let xml = String::from_utf8(resp).expect("valid UTF-8");
 
@@ -622,7 +719,7 @@ mod tests {
 
     #[test]
     fn test_xaddrs_with_explicit_host() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 8080);
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
         let addrs = server.xaddrs("10.0.0.2");
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0], "http://10.0.0.2:8080/onvif/device_service");
@@ -630,7 +727,7 @@ mod tests {
 
     #[test]
     fn test_xaddrs_with_empty_host_uses_device_ip() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 8080);
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
         let addrs = server.xaddrs("");
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0], "http://10.0.0.1:8080/onvif/device_service");
@@ -638,7 +735,7 @@ mod tests {
 
     #[test]
     fn test_xaddrs_custom_port() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 2020);
+        let server = DiscoveryServer::new("10.0.0.1", 2020);
         let addrs = server.xaddrs("");
         assert_eq!(addrs[0], "http://10.0.0.1:2020/onvif/device_service");
     }
@@ -649,19 +746,53 @@ mod tests {
 
     #[test]
     fn test_scopes_contains_required_categories() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 8080);
+        let server = DiscoveryServer::with_identity("10.0.0.1", 8080, "Gate Cam", "IMX219");
         let scopes = server.scopes();
         // Must have a Streaming profile scope
         assert!(scopes.iter().any(|s| s.contains("Profile/Streaming")));
-        // Must have a name scope
-        assert!(scopes.iter().any(|s| s.contains("/name/")));
+        // Must have a name scope (percent-encoded — scope lists are
+        // space-separated, so spaces must not appear literally)
+        assert!(scopes.iter().any(|s| s.contains("/name/Gate%20Cam")));
         // Must have a hardware scope
-        assert!(scopes.iter().any(|s| s.contains("/hardware/")));
+        assert!(scopes.iter().any(|s| s.contains("/hardware/IMX219")));
+    }
+
+    /// Regression: plain `new()` must NOT advertise origin-hardware
+    /// branding (PiCameraV1/OV5647) — the neutral default carries only the
+    /// spec profile scope.
+    #[test]
+    fn test_scopes_default_is_neutral() {
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
+        let scopes = server.scopes();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0], "onvif://www.onvif.org/Profile/Streaming");
+        assert!(!scopes.iter().any(|s| s.contains("PiCameraV1")));
+        assert!(!scopes.iter().any(|s| s.contains("OV5647")));
+    }
+
+    /// Regression: the discovery UUID must be persistable across restarts.
+    #[test]
+    fn test_uuid_can_be_pinned() {
+        let pinned = "uuid:12345678-1234-4123-8123-123456789abc";
+        let server = DiscoveryServer::new("10.0.0.1", 8080).with_uuid(pinned);
+        assert_eq!(server.uuid(), pinned);
+    }
+
+    /// Regression: a client-controlled MessageID must be XML-escaped in
+    /// RelatesTo (injection guard).
+    #[test]
+    fn test_probe_matches_escapes_message_id() {
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
+        let evil = "uuid:abc--<inject/>&amp;";
+        let resp = server.build_probe_matches(evil, "");
+        let xml = String::from_utf8(resp).expect("utf8");
+        assert!(xml.contains("&lt;inject/&gt;"), "escaped: {xml}");
+        assert!(!xml.contains("<inject/>"), "no raw injection: {xml}");
     }
 
     #[test]
     fn test_scopes_are_onvif_urls() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 8080);
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
         for scope in server.scopes() {
             assert!(
                 scope.starts_with("onvif://www.onvif.org/"),
@@ -672,7 +803,7 @@ mod tests {
 
     #[test]
     fn test_scopes_joined_format() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 8080);
+        let server = DiscoveryServer::with_identity("10.0.0.1", 8080, "Gate Cam", "IMX219");
         let joined = server.scopes.join(" ");
         // Must be space-separated
         assert!(joined.contains(' '));
@@ -691,7 +822,7 @@ mod tests {
 
     #[test]
     fn test_handle_probe_round_trip() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 8080);
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
 
         let probe = r#"<?xml version="1.0"?>
         <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
@@ -716,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_handle_probe_non_probe_returns_none() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 8080);
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
         let non_probe = b"GET / HTTP/1.1\r\n\r\n";
         assert!(server.handle_probe(non_probe, "").is_none());
     }
@@ -727,7 +858,7 @@ mod tests {
 
     #[test]
     fn test_handle_http_probe_returns_probe_matches() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 8080);
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
         let body = r#"<?xml version="1.0"?>
         <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
           <s:Header>
@@ -747,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_handle_http_probe_non_probe_returns_200_empty() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 8080);
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
         let (status, body) = handle_http_probe(&server, "not a probe", "");
         assert_eq!(status, 200);
         assert!(body.is_empty());
@@ -802,14 +933,14 @@ mod tests {
 
     #[test]
     fn test_discovery_server_new_sets_device_ip() {
-        let server = DiscoveryServer::new("10.0.0.1".to_string(), 8080);
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
         assert_eq!(server.device_ip, "10.0.0.1");
         assert_eq!(server.onvif_port, 8080);
     }
 
     #[test]
     fn test_discovery_server_empty_ip_auto_detects() {
-        let server = DiscoveryServer::new(String::new(), 8080);
+        let server = DiscoveryServer::new("", 8080);
         assert!(!server.device_ip.is_empty(), "IP should be auto-detected");
     }
 
