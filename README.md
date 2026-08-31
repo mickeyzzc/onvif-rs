@@ -107,17 +107,17 @@ See [`examples/device_demo.rs`](examples/device_demo.rs) for the complete wiring
 
 ## Documentation
 
-Topic guides under [`docs/`](docs/) (English, with Chinese counterparts in [`docs/zh/`](docs/zh/)):
+Topic guides live under [`docs/en/`](docs/en/) — each has a Chinese counterpart under `docs/zh/`:
 
 | Guide | Covers |
 |---|---|
-| [Configuration](docs/configuration.md) · [配置](docs/zh/configuration.md) | `OnvifConfig` fields, fail-closed credentials, `DeviceConfig` identity, `start_on` |
-| [Action handlers](docs/handlers.md) · [动作 handler](docs/zh/handlers.md) | local-name routing, `RequestInfo`, anonymous actions, custom handlers |
-| [Media service](docs/media.md) · [媒体服务](docs/zh/media.md) | `OnvifMediaConfig` field by field, tokens, snapshot honesty switch, byte stability |
-| [Imaging](docs/imaging.md) · [成像](docs/zh/imaging.md) | the `ImagingParams` seam, error→fault mapping, normalized values |
-| [PTZ](docs/ptz.md) · [虚拟云台](docs/zh/ptz.md) | `PtzState` API, motion simulation, wiring all eleven actions |
-| [Discovery](docs/discovery.md) · [设备发现](docs/zh/discovery.md) | UDP + HTTP probe paths, identity/scopes, per-interface XAddrs |
-| [Security](docs/security.md) · [安全](docs/zh/security.md) | UsernameToken modes, fail-closed config, body/read limits |
+| [Configuration](docs/en/configuration.md) | `OnvifConfig` fields, fail-closed credentials, `DeviceConfig` identity, `start_on` |
+| [Action handlers](docs/en/handlers.md) | local-name routing, `RequestInfo`, anonymous actions, custom handlers |
+| [Media service](docs/en/media.md) | `OnvifMediaConfig` field by field, tokens, snapshot honesty switch, byte stability |
+| [Imaging](docs/en/imaging.md) | the `ImagingParams` seam, error→fault mapping, normalized values |
+| [PTZ](docs/en/ptz.md) | `PtzState` API, motion simulation, wiring all eleven actions |
+| [Discovery](docs/en/discovery.md) | UDP + HTTP probe paths, identity/scopes, per-interface XAddrs |
+| [Security](docs/en/security.md) | UsernameToken modes, fail-closed config, body/read limits |
 
 ## Library hygiene (v0.3.0 hardening)
 

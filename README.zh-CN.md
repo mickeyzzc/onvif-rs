@@ -107,17 +107,17 @@ async fn main() -> anyhow::Result<()> {
 
 ## 文档
 
-专题教程在 [`docs/`](docs/)（中文版在 [`docs/zh/`](docs/zh/)，英文版在 [`docs/en/`](docs/en/)）：
+专题教程在 [`docs/zh/`](docs/zh/) —— 每篇在 `docs/en/` 下有英文对照版：
 
 | 教程 | 内容 |
 |---|---|
-| [配置](docs/zh/configuration.md) · [EN](docs/en/configuration.md) | `OnvifConfig` 字段、fail-closed 凭证、`DeviceConfig` 身份、`start_on` |
-| [动作 handler](docs/zh/handlers.md) · [EN](docs/en/handlers.md) | 局部名路由、`RequestInfo`、匿名动作、自定义 handler |
-| [媒体服务](docs/zh/media.md) · [EN](docs/en/media.md) | `OnvifMediaConfig` 逐字段、token、快照诚实开关、字节稳定 |
-| [成像](docs/zh/imaging.md) · [EN](docs/en/imaging.md) | `ImagingParams` 接缝、错误→fault 映射、归一化取值 |
-| [虚拟云台](docs/zh/ptz.md) · [EN](docs/en/ptz.md) | `PtzState` API、运动模拟、十一个动作接线 |
-| [设备发现](docs/zh/discovery.md) · [EN](docs/en/discovery.md) | UDP + HTTP 双探测路径、身份/scope、按网卡回显 XAddrs |
-| [安全](docs/zh/security.md) · [EN](docs/en/security.md) | UsernameToken 双模式、fail-closed 配置、请求体/读超时限制 |
+| [配置](docs/zh/configuration.md) | `OnvifConfig` 字段、fail-closed 凭证、`DeviceConfig` 身份、`start_on` |
+| [动作 handler](docs/zh/handlers.md) | 局部名路由、`RequestInfo`、匿名动作、自定义 handler |
+| [媒体服务](docs/zh/media.md) | `OnvifMediaConfig` 逐字段、token、快照诚实开关、字节稳定 |
+| [成像](docs/zh/imaging.md) | `ImagingParams` 接缝、错误→fault 映射、归一化取值 |
+| [虚拟云台](docs/zh/ptz.md) | `PtzState` API、运动模拟、十一个动作接线 |
+| [设备发现](docs/zh/discovery.md) | UDP + HTTP 双探测路径、身份/scope、按网卡回显 XAddrs |
+| [安全](docs/zh/security.md) | UsernameToken 双模式、fail-closed 配置、请求体/读超时限制 |
 
 ## 库卫生（v0.3.0 加固）
 
