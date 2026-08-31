@@ -105,6 +105,20 @@ async fn main() -> anyhow::Result<()> {
 
 完整接线见 [`examples/device_demo.rs`](examples/device_demo.rs)（它同时是 README 式代码的编译验证参照），生产接线见 `mibee-eye-raspi-rs` 的 `main.rs`。
 
+## 文档
+
+专题教程在 [`docs/`](docs/)（中文版在 [`docs/zh/`](docs/zh/)，英文版在 [`docs/en/`](docs/en/)）：
+
+| 教程 | 内容 |
+|---|---|
+| [配置](docs/zh/configuration.md) · [EN](docs/en/configuration.md) | `OnvifConfig` 字段、fail-closed 凭证、`DeviceConfig` 身份、`start_on` |
+| [动作 handler](docs/zh/handlers.md) · [EN](docs/en/handlers.md) | 局部名路由、`RequestInfo`、匿名动作、自定义 handler |
+| [媒体服务](docs/zh/media.md) · [EN](docs/en/media.md) | `OnvifMediaConfig` 逐字段、token、快照诚实开关、字节稳定 |
+| [成像](docs/zh/imaging.md) · [EN](docs/en/imaging.md) | `ImagingParams` 接缝、错误→fault 映射、归一化取值 |
+| [虚拟云台](docs/zh/ptz.md) · [EN](docs/en/ptz.md) | `PtzState` API、运动模拟、十一个动作接线 |
+| [设备发现](docs/zh/discovery.md) · [EN](docs/en/discovery.md) | UDP + HTTP 双探测路径、身份/scope、按网卡回显 XAddrs |
+| [安全](docs/zh/security.md) · [EN](docs/en/security.md) | UsernameToken 双模式、fail-closed 配置、请求体/读超时限制 |
+
 ## 库卫生（v0.3.0 加固）
 
 v0.3.0 把本 crate 打磨为可放心嵌入的中性基础库。[`tests/library_hygiene.rs`](tests/library_hygiene.rs) 与 [`tests/server_lifecycle.rs`](tests/server_lifecycle.rs) 中的回归测试逐条锁定以下保证：

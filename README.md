@@ -105,6 +105,20 @@ async fn main() -> anyhow::Result<()> {
 
 See [`examples/device_demo.rs`](examples/device_demo.rs) for the complete wiring (it is also the compile-checked reference for README-style code), and the `mibee-eye-raspi-rs` `main.rs` for production wiring.
 
+## Documentation
+
+Topic guides under [`docs/`](docs/) (English, with Chinese counterparts in [`docs/zh/`](docs/zh/)):
+
+| Guide | Covers |
+|---|---|
+| [Configuration](docs/configuration.md) · [配置](docs/zh/configuration.md) | `OnvifConfig` fields, fail-closed credentials, `DeviceConfig` identity, `start_on` |
+| [Action handlers](docs/handlers.md) · [动作 handler](docs/zh/handlers.md) | local-name routing, `RequestInfo`, anonymous actions, custom handlers |
+| [Media service](docs/media.md) · [媒体服务](docs/zh/media.md) | `OnvifMediaConfig` field by field, tokens, snapshot honesty switch, byte stability |
+| [Imaging](docs/imaging.md) · [成像](docs/zh/imaging.md) | the `ImagingParams` seam, error→fault mapping, normalized values |
+| [PTZ](docs/ptz.md) · [虚拟云台](docs/zh/ptz.md) | `PtzState` API, motion simulation, wiring all eleven actions |
+| [Discovery](docs/discovery.md) · [设备发现](docs/zh/discovery.md) | UDP + HTTP probe paths, identity/scopes, per-interface XAddrs |
+| [Security](docs/security.md) · [安全](docs/zh/security.md) | UsernameToken modes, fail-closed config, body/read limits |
+
 ## Library hygiene (v0.3.0 hardening)
 
 v0.3.0 made the crate safe to embed as a neutral foundation library. The regression tests in [`tests/library_hygiene.rs`](tests/library_hygiene.rs) and [`tests/server_lifecycle.rs`](tests/server_lifecycle.rs) pin each guarantee:
