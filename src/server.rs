@@ -68,7 +68,13 @@ impl Default for OnvifConfig {
 ///
 /// Await it (`handle.await`) to wait for the accept loop to finish, or call
 /// [`OnvifServerHandle::shutdown`] for a graceful stop.
+///
+/// `#[must_use]`: **dropping the handle stops the server** (Drop sends the
+/// shutdown signal). Hosts that spawn `server.start()` inside a task and
+/// discard the Ok value have shipped servers that die the instant they
+/// start — await the handle in the task, or store it and call shutdown().
 #[derive(Debug)]
+#[must_use = "dropping the handle stops the server; await it or store it for shutdown()"]
 pub struct OnvifServerHandle {
     task: Option<tokio::task::JoinHandle<()>>,
     shutdown: watch::Sender<bool>,
