@@ -463,7 +463,11 @@ impl DiscoveryServer {
 }
 
 /// Handle to a running WS-Discovery responder.
+///
+/// `#[must_use]`: dropping the handle stops the responder (same Drop
+/// semantics as the SOAP server handle).
 #[derive(Debug)]
+#[must_use = "dropping the handle stops the responder; await it or store it for shutdown()"]
 pub struct DiscoveryHandle {
     task: Option<tokio::task::JoinHandle<()>>,
     shutdown: tokio::sync::watch::Sender<bool>,

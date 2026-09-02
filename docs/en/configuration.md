@@ -71,3 +71,10 @@ handle.shutdown().await?;                   // graceful stop; handle.await waits
 
 `start_on` exists for hosts that manage their own listeners (dynamic
 ports, systemd socket activation, test harnesses).
+
+> **Keep the handle.** `start()` resolves as soon as the accept loop is
+> spawned and the returned handle's `Drop` **stops the server**. Await it in
+> the spawning task (`let handle = soap.start().await?; handle.await;`) or
+> store it and call `shutdown()`. Discarding the `Ok` value silently kills
+> the server — both handles are `#[must_use]` since 0.3.1 to catch this at
+> compile time.

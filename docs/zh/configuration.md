@@ -67,3 +67,9 @@ handle.shutdown().await?;                   // 优雅停机；handle.await 等�
 
 `start_on` 面向自管 listener 的宿主（动态端口、systemd socket
 激活、测试台）。
+
+> **务必持有句柄。** `start()` 在接收循环启动后立即返回，返回句柄的
+> `Drop` 会**停止服务器**。在派生任务里 await 它
+> （`let handle = soap.start().await?; handle.await;`），或保存并调用
+> `shutdown()`。丢弃 `Ok` 值会悄悄杀死服务器——自 0.3.1 起两个句柄均为
+> `#[must_use]`，在编译期拦截该错误。
