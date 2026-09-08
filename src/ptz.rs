@@ -113,34 +113,34 @@ fn build_get_status(state: &PtzState) -> String {
     let mut root = BytesStart::new("tptz:GetStatusResponse");
     root.push_attribute(("xmlns:tptz", PTZ_SERVICE));
     root.push_attribute(("xmlns:tt", SCHEMAS));
-    w.write_event(Event::Start(root)).expect("write root");
+    w.write_event(Event::Start(root)).unwrap_or_default();
 
     // PTZStatus
     w.write_event(Event::Start(BytesStart::new("tptz:PTZStatus")))
-        .expect("write PTZStatus");
+        .unwrap_or_default();
 
     // Position
     w.write_event(Event::Start(BytesStart::new("tptz:Position")))
-        .expect("write Position");
+        .unwrap_or_default();
     write_pan_tilt(&mut w, pos.x, pos.y, PAN_TILT_POSITION_SPACE);
     write_zoom(&mut w, pos.zoom, ZOOM_POSITION_SPACE);
     w.write_event(Event::End(BytesEnd::new("tptz:Position")))
-        .expect("close Position");
+        .unwrap_or_default();
 
     // MoveStatus
     w.write_event(Event::Start(BytesStart::new("tptz:MoveStatus")))
-        .expect("write MoveStatus");
+        .unwrap_or_default();
     write_text(&mut w, "tt:PanTilt", status);
     write_text(&mut w, "tt:Zoom", status);
     w.write_event(Event::End(BytesEnd::new("tptz:MoveStatus")))
-        .expect("close MoveStatus");
+        .unwrap_or_default();
 
     w.write_event(Event::End(BytesEnd::new("tptz:PTZStatus")))
-        .expect("close PTZStatus");
+        .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new("tptz:GetStatusResponse")))
-        .expect("close root");
+        .unwrap_or_default();
 
-    String::from_utf8(w.into_inner()).expect("UTF-8 body")
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
 /// Build `<tptz:GetPresetsResponse>` with preset list.
@@ -152,12 +152,12 @@ fn build_get_presets(state: &PtzState) -> String {
     let mut root = BytesStart::new("tptz:GetPresetsResponse");
     root.push_attribute(("xmlns:tptz", PTZ_SERVICE));
     root.push_attribute(("xmlns:tt", SCHEMAS));
-    w.write_event(Event::Start(root)).expect("write root");
+    w.write_event(Event::Start(root)).unwrap_or_default();
 
     for preset in &presets {
         let mut elem = BytesStart::new("tptz:Preset");
         elem.push_attribute(("token", preset.token.as_str()));
-        w.write_event(Event::Start(elem)).expect("write Preset");
+        w.write_event(Event::Start(elem)).unwrap_or_default();
         write_text(&mut w, "tt:Name", &preset.name);
         write_pan_tilt(
             &mut w,
@@ -167,13 +167,13 @@ fn build_get_presets(state: &PtzState) -> String {
         );
         write_zoom(&mut w, preset.position.zoom, ZOOM_POSITION_SPACE);
         w.write_event(Event::End(BytesEnd::new("tptz:Preset")))
-            .expect("close Preset");
+            .unwrap_or_default();
     }
 
     w.write_event(Event::End(BytesEnd::new("tptz:GetPresetsResponse")))
-        .expect("close root");
+        .unwrap_or_default();
 
-    String::from_utf8(w.into_inner()).expect("UTF-8 body")
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
 /// Build `<tptz:SetPresetResponse>` containing the preset token.
@@ -198,12 +198,12 @@ fn build_set_preset(body: &str, state: &PtzState) -> Result<String, OnvifError> 
 
     let mut root = BytesStart::new("tptz:SetPresetResponse");
     root.push_attribute(("xmlns:tptz", PTZ_SERVICE));
-    w.write_event(Event::Start(root)).expect("write root");
+    w.write_event(Event::Start(root)).unwrap_or_default();
     write_text(&mut w, "tptz:PresetToken", &token);
     w.write_event(Event::End(BytesEnd::new("tptz:SetPresetResponse")))
-        .expect("close root");
+        .unwrap_or_default();
 
-    Ok(String::from_utf8(w.into_inner()).expect("UTF-8 body"))
+    Ok(String::from_utf8(w.into_inner()).unwrap_or_default())
 }
 
 /// Build `<tptz:GotoPresetResponse>` (empty success).
@@ -229,17 +229,17 @@ fn build_get_nodes() -> String {
     let mut root = BytesStart::new("tptz:GetNodesResponse");
     root.push_attribute(("xmlns:tptz", PTZ_SERVICE));
     root.push_attribute(("xmlns:tt", SCHEMAS));
-    w.write_event(Event::Start(root)).expect("write root");
+    w.write_event(Event::Start(root)).unwrap_or_default();
 
     let mut node = BytesStart::new("tptz:PTZNode");
     node.push_attribute(("NodeToken", "PTZNode_01"));
-    w.write_event(Event::Start(node)).expect("write PTZNode");
+    w.write_event(Event::Start(node)).unwrap_or_default();
     write_text(&mut w, "tt:Name", "Main PTZ Node");
     write_text(&mut w, "tt:FixedHomePosition", "false");
 
     // SupportedPTZSpaces
     w.write_event(Event::Start(BytesStart::new("tt:SupportedPTZSpaces")))
-        .expect("write SupportedPTZSpaces");
+        .unwrap_or_default();
 
     write_pan_tilt_space(
         &mut w,
@@ -291,13 +291,13 @@ fn build_get_nodes() -> String {
     );
 
     w.write_event(Event::End(BytesEnd::new("tt:SupportedPTZSpaces")))
-        .expect("close SupportedPTZSpaces");
+        .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new("tptz:PTZNode")))
-        .expect("close PTZNode");
+        .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new("tptz:GetNodesResponse")))
-        .expect("close root");
+        .unwrap_or_default();
 
-    String::from_utf8(w.into_inner()).expect("UTF-8 body")
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
 /// Build `<tptz:GetConfigurationsResponse>` — returns a single default config.
@@ -307,26 +307,26 @@ fn build_get_configurations() -> String {
     let mut root = BytesStart::new("tptz:GetConfigurationsResponse");
     root.push_attribute(("xmlns:tptz", PTZ_SERVICE));
     root.push_attribute(("xmlns:tt", SCHEMAS));
-    w.write_event(Event::Start(root)).expect("write root");
+    w.write_event(Event::Start(root)).unwrap_or_default();
 
     w.write_event(Event::Start(BytesStart::new("tptz:PTZConfiguration")))
-        .expect("write PTZConfiguration");
+        .unwrap_or_default();
     write_text(&mut w, "tt:Name", "Default PTZ Configuration");
     write_text(&mut w, "tt:UseCount", "1");
     write_text(&mut w, "tt:NodeToken", "PTZNode_01");
     // DefaultPTZSpeed
     w.write_event(Event::Start(BytesStart::new("tt:DefaultPTZSpeed")))
-        .expect("write DefaultPTZSpeed");
+        .unwrap_or_default();
     write_pan_tilt(&mut w, 1.0, 1.0, PAN_TILT_SPEED_SPACE);
     write_zoom(&mut w, 1.0, ZOOM_SPEED_SPACE);
     w.write_event(Event::End(BytesEnd::new("tt:DefaultPTZSpeed")))
-        .expect("close DefaultPTZSpeed");
+        .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new("tptz:PTZConfiguration")))
-        .expect("close PTZConfiguration");
+        .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new("tptz:GetConfigurationsResponse")))
-        .expect("close root");
+        .unwrap_or_default();
 
-    String::from_utf8(w.into_inner()).expect("UTF-8 body")
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -336,13 +336,13 @@ fn build_get_configurations() -> String {
 /// Write a simple text element: `<name>text</name>`.
 fn write_text(w: &mut Writer<Vec<u8>>, name: &str, text: &str) {
     w.write_event(Event::Start(BytesStart::new(name)))
-        .expect("write start");
+        .unwrap_or_default();
     w.write_event(Event::Text(BytesText::from_escaped(
         crate::types::xml_escape(text),
     )))
-    .expect("write text");
+    .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new(name)))
-        .expect("write end");
+        .unwrap_or_default();
 }
 
 /// Write a `<tt:PanTilt x=".." y=".." space=".."/>` empty element.
@@ -353,7 +353,7 @@ fn write_pan_tilt(w: &mut Writer<Vec<u8>>, x: f64, y: f64, space: &str) {
     elem.push_attribute(("x", xs.as_str()));
     elem.push_attribute(("y", ys.as_str()));
     elem.push_attribute(("space", space));
-    w.write_event(Event::Empty(elem)).expect("write PanTilt");
+    w.write_event(Event::Empty(elem)).unwrap_or_default();
 }
 
 /// Write a `<tt:Zoom x=".." space=".."/>` empty element.
@@ -362,7 +362,7 @@ fn write_zoom(w: &mut Writer<Vec<u8>>, x: f64, space: &str) {
     let xs = format_float(x);
     elem.push_attribute(("x", xs.as_str()));
     elem.push_attribute(("space", space));
-    w.write_event(Event::Empty(elem)).expect("write Zoom");
+    w.write_event(Event::Empty(elem)).unwrap_or_default();
 }
 
 /// Write a 2D coordinate space definition.
@@ -376,40 +376,40 @@ fn write_pan_tilt_space(
     y_max: f64,
 ) {
     w.write_event(Event::Start(BytesStart::new(elem_name)))
-        .expect("write space start");
+        .unwrap_or_default();
     write_text(w, "tt:URI", uri);
     // XRange
     w.write_event(Event::Start(BytesStart::new("tt:XRange")))
-        .expect("write XRange");
+        .unwrap_or_default();
     write_text(w, "tt:Min", &format_float(x_min));
     write_text(w, "tt:Max", &format_float(x_max));
     w.write_event(Event::End(BytesEnd::new("tt:XRange")))
-        .expect("close XRange");
+        .unwrap_or_default();
     // YRange
     w.write_event(Event::Start(BytesStart::new("tt:YRange")))
-        .expect("write YRange");
+        .unwrap_or_default();
     write_text(w, "tt:Min", &format_float(y_min));
     write_text(w, "tt:Max", &format_float(y_max));
     w.write_event(Event::End(BytesEnd::new("tt:YRange")))
-        .expect("close YRange");
+        .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new(elem_name)))
-        .expect("close space");
+        .unwrap_or_default();
 }
 
 /// Write a 1D coordinate space definition.
 fn write_zoom_space(w: &mut Writer<Vec<u8>>, elem_name: &str, uri: &str, x_min: f64, x_max: f64) {
     w.write_event(Event::Start(BytesStart::new(elem_name)))
-        .expect("write space start");
+        .unwrap_or_default();
     write_text(w, "tt:URI", uri);
     // XRange
     w.write_event(Event::Start(BytesStart::new("tt:XRange")))
-        .expect("write XRange");
+        .unwrap_or_default();
     write_text(w, "tt:Min", &format_float(x_min));
     write_text(w, "tt:Max", &format_float(x_max));
     w.write_event(Event::End(BytesEnd::new("tt:XRange")))
-        .expect("close XRange");
+        .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new(elem_name)))
-        .expect("close space");
+        .unwrap_or_default();
 }
 
 /// Build an empty `<tptz:XxxResponse/>` for commands that return no data.
@@ -419,8 +419,8 @@ fn empty_response(action: &str) -> String {
     let mut root = BytesStart::new(&name);
     root.push_attribute(("xmlns:tptz", PTZ_SERVICE));
     w.write_event(Event::Empty(root))
-        .expect("write empty response");
-    String::from_utf8(w.into_inner()).expect("UTF-8 body")
+        .unwrap_or_default();
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
 /// Format a float with minimal precision (strip trailing zeros).

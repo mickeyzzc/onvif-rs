@@ -69,3 +69,39 @@ fn no_private_lab_ips_in_library_code() {
         );
     }
 }
+
+/// Production paths must be free of panic-capable unwrap/expect (#15):
+/// every request-facing code path answers errors as faults, never panics.
+/// Serializer writes to the in-memory quick-xml buffer use
+/// `.unwrap_or_default()` (provably infallible Vec writes — the release
+/// behavior discards nothing real and never panics), and lock acquisition
+/// goes through the poison-tolerant helpers in `ptz_state.rs`.
+#[test]
+fn production_code_has_no_unwrap_or_expect() {
+    let mut violations = Vec::new();
+    for (name, prod) in production_sources() {
+        // Strip comments first — doc examples may legitimately unwrap.
+        let no_comments = strip_comments(&prod);
+        for (i, line) in no_comments.lines().enumerate() {
+            let t = line.trim();
+            if t.contains(".unwrap()") || t.contains(".expect(") {
+                violations.push(format!("{name}:{}: {}", i + 1, t));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "production unwrap/expect found (see #15):\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Removes // line comments (naive but sufficient — the sources keep
+/// strings on their own lines and contain no // inside string literals
+/// on unwrap-bearing lines).
+fn strip_comments(src: &str) -> String {
+    src.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}

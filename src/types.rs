@@ -114,7 +114,7 @@ pub fn serialize_soap_response(body_xml: &str) -> String {
     envelope.push_attribute(("xmlns:soap", SOAP_ENVELOPE));
     writer
         .write_event(Event::Start(envelope))
-        .expect("write soap:Envelope start");
+        .unwrap_or_default();
 
     // Empty header
     write_empty_tag(&mut writer, "soap:Header");
@@ -123,9 +123,9 @@ pub fn serialize_soap_response(body_xml: &str) -> String {
 
     writer
         .write_event(Event::End(BytesEnd::new("soap:Envelope")))
-        .expect("write soap:Envelope end");
+        .unwrap_or_default();
 
-    String::from_utf8(writer.into_inner()).expect("SOAP envelope UTF-8")
+    String::from_utf8(writer.into_inner()).unwrap_or_default()
 }
 
 /// Build a SOAP 1.2 Fault Envelope.
@@ -140,49 +140,49 @@ pub fn serialize_soap_fault(fault_code: &str, reason: &str) -> String {
     envelope.push_attribute(("xmlns:soap", SOAP_ENVELOPE));
     writer
         .write_event(Event::Start(envelope))
-        .expect("write soap:Envelope start");
+        .unwrap_or_default();
 
     write_empty_tag(&mut writer, "soap:Header");
 
     // ---- Body / Fault ----
     writer
         .write_event(Event::Start(BytesStart::new("soap:Body")))
-        .expect("write soap:Body start");
+        .unwrap_or_default();
 
     writer
         .write_event(Event::Start(BytesStart::new("soap:Fault")))
-        .expect("write soap:Fault start");
+        .unwrap_or_default();
 
     // Code
     writer
         .write_event(Event::Start(BytesStart::new("soap:Code")))
-        .expect("write soap:Code start");
+        .unwrap_or_default();
     write_text_tag(&mut writer, "soap:Value", fault_code);
     writer
         .write_event(Event::End(BytesEnd::new("soap:Code")))
-        .expect("write soap:Code end");
+        .unwrap_or_default();
 
     // Reason
     writer
         .write_event(Event::Start(BytesStart::new("soap:Reason")))
-        .expect("write soap:Reason start");
+        .unwrap_or_default();
     write_text_tag(&mut writer, "soap:Text", reason);
     writer
         .write_event(Event::End(BytesEnd::new("soap:Reason")))
-        .expect("write soap:Reason end");
+        .unwrap_or_default();
 
     writer
         .write_event(Event::End(BytesEnd::new("soap:Fault")))
-        .expect("write soap:Fault end");
+        .unwrap_or_default();
     writer
         .write_event(Event::End(BytesEnd::new("soap:Body")))
-        .expect("write soap:Body end");
+        .unwrap_or_default();
 
     writer
         .write_event(Event::End(BytesEnd::new("soap:Envelope")))
-        .expect("write soap:Envelope end");
+        .unwrap_or_default();
 
-    String::from_utf8(writer.into_inner()).expect("SOAP fault UTF-8")
+    String::from_utf8(writer.into_inner()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -192,43 +192,43 @@ pub fn serialize_soap_fault(fault_code: &str, reason: &str) -> String {
 fn write_declaration(writer: &mut Writer<Vec<u8>>) {
     writer
         .write_event(Event::Decl(BytesDecl::new("1.0", Some("utf-8"), None)))
-        .expect("write XML declaration");
+        .unwrap_or_default();
 }
 
 fn write_empty_tag(writer: &mut Writer<Vec<u8>>, name: &str) {
     writer
         .write_event(Event::Start(BytesStart::new(name)))
-        .expect("write empty tag start");
+        .unwrap_or_default();
     writer
         .write_event(Event::End(BytesEnd::new(name)))
-        .expect("write empty tag end");
+        .unwrap_or_default();
 }
 
 fn write_text_tag(writer: &mut Writer<Vec<u8>>, name: &str, text: &str) {
     writer
         .write_event(Event::Start(BytesStart::new(name)))
-        .expect("write text tag start");
+        .unwrap_or_default();
     writer
         .write_event(Event::Text(BytesText::from_escaped(xml_escape(text))))
-        .expect("write text");
+        .unwrap_or_default();
     writer
         .write_event(Event::End(BytesEnd::new(name)))
-        .expect("write text tag end");
+        .unwrap_or_default();
 }
 
 fn write_tag_with_raw(writer: &mut Writer<Vec<u8>>, name: &str, raw: &str) {
     use std::io::Write;
     writer
         .write_event(Event::Start(BytesStart::new(name)))
-        .expect("write raw tag start");
+        .unwrap_or_default();
     // Write raw content WITHOUT XML escaping
     writer
         .get_mut()
         .write_all(raw.as_bytes())
-        .expect("write raw content");
+        .unwrap_or_default();
     writer
         .write_event(Event::End(BytesEnd::new(name)))
-        .expect("write raw tag end");
+        .unwrap_or_default();
 }
 
 // ---------------------------------------------------------------------------

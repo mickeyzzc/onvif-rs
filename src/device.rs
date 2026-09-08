@@ -91,10 +91,10 @@ impl DeviceServiceHandlers {
         let mut root = BytesStart::new("tds:GetSystemDateAndTimeResponse");
         root.push_attribute(("xmlns:tds", DEVICE_SERVICE));
         root.push_attribute(("xmlns:tt", SCHEMAS));
-        w.write_event(Event::Start(root)).expect("write root");
+        w.write_event(Event::Start(root)).unwrap_or_default();
 
         w.write_event(Event::Start(BytesStart::new("tds:SystemDateAndTime")))
-            .expect("write SystemDateAndTime");
+            .unwrap_or_default();
         write_text(&mut w, "tt:DateTimeType", "Manual");
         write_text(&mut w, "tt:DaylightSavings", "false");
         open_close(&mut w, "tt:TimeZone", |w| {
@@ -113,13 +113,13 @@ impl DeviceServiceHandlers {
             });
         });
         w.write_event(Event::End(BytesEnd::new("tds:SystemDateAndTime")))
-            .expect("close SystemDateAndTime");
+            .unwrap_or_default();
         w.write_event(Event::End(BytesEnd::new(
             "tds:GetSystemDateAndTimeResponse",
         )))
-        .expect("close root");
+        .unwrap_or_default();
 
-        String::from_utf8(w.into_inner()).expect("UTF-8 body")
+        String::from_utf8(w.into_inner()).unwrap_or_default()
     }
 
     /// Build `<tds:GetDeviceInformationResponse>` body.
@@ -129,7 +129,7 @@ impl DeviceServiceHandlers {
 
         let mut root = BytesStart::new("tds:GetDeviceInformationResponse");
         root.push_attribute(("xmlns:tds", DEVICE_SERVICE));
-        w.write_event(Event::Start(root)).expect("write root");
+        w.write_event(Event::Start(root)).unwrap_or_default();
 
         write_text(&mut w, "tds:Manufacturer", &cfg.manufacturer);
         write_text(&mut w, "tds:Model", &cfg.model);
@@ -140,9 +140,9 @@ impl DeviceServiceHandlers {
         w.write_event(Event::End(BytesEnd::new(
             "tds:GetDeviceInformationResponse",
         )))
-        .expect("close root");
+        .unwrap_or_default();
 
-        String::from_utf8(w.into_inner()).expect("UTF-8 body")
+        String::from_utf8(w.into_inner()).unwrap_or_default()
     }
 
     /// Build `<tds:GetCapabilitiesResponse>` body.
@@ -153,20 +153,20 @@ impl DeviceServiceHandlers {
         let mut root = BytesStart::new("tds:GetCapabilitiesResponse");
         root.push_attribute(("xmlns:tds", DEVICE_SERVICE));
         root.push_attribute(("xmlns:tt", SCHEMAS));
-        w.write_event(Event::Start(root)).expect("write root");
+        w.write_event(Event::Start(root)).unwrap_or_default();
 
         w.write_event(Event::Start(BytesStart::new("tds:Capabilities")))
-            .expect("write Capabilities");
+            .unwrap_or_default();
         capability_xaddr(&mut w, "tt:Device", &base, "/device_service");
         capability_xaddr(&mut w, "tt:Media", &base, "/media_service");
         capability_xaddr(&mut w, "tt:PTZ", &base, "/ptz_service");
         capability_xaddr(&mut w, "tt:Imaging", &base, "/device_service");
         w.write_event(Event::End(BytesEnd::new("tds:Capabilities")))
-            .expect("close Capabilities");
+            .unwrap_or_default();
 
         w.write_event(Event::End(BytesEnd::new("tds:GetCapabilitiesResponse")))
-            .expect("close root");
-        String::from_utf8(w.into_inner()).expect("UTF-8 body")
+            .unwrap_or_default();
+        String::from_utf8(w.into_inner()).unwrap_or_default()
     }
 
     /// Build `<tds:GetServicesResponse>` body.
@@ -184,14 +184,14 @@ impl DeviceServiceHandlers {
         let mut root = BytesStart::new("tds:GetServicesResponse");
         root.push_attribute(("xmlns:tds", DEVICE_SERVICE));
         root.push_attribute(("xmlns:tt", SCHEMAS));
-        w.write_event(Event::Start(root)).expect("write root");
+        w.write_event(Event::Start(root)).unwrap_or_default();
 
         w.write_event(Event::Start(BytesStart::new("tds:Services")))
-            .expect("write Services");
+            .unwrap_or_default();
 
         for (ns, path) in services {
             w.write_event(Event::Start(BytesStart::new("tds:Service")))
-                .expect("write Service");
+                .unwrap_or_default();
             write_text(&mut w, "tds:Namespace", ns);
             write_text(&mut w, "tds:XAddr", &format!("{}{}", base, path));
             open_close(&mut w, "tds:Version", |w| {
@@ -199,14 +199,14 @@ impl DeviceServiceHandlers {
                 write_int(w, "tt:Minor", 0);
             });
             w.write_event(Event::End(BytesEnd::new("tds:Service")))
-                .expect("close Service");
+                .unwrap_or_default();
         }
 
         w.write_event(Event::End(BytesEnd::new("tds:Services")))
-            .expect("close Services");
+            .unwrap_or_default();
         w.write_event(Event::End(BytesEnd::new("tds:GetServicesResponse")))
-            .expect("close root");
-        String::from_utf8(w.into_inner()).expect("UTF-8 body")
+            .unwrap_or_default();
+        String::from_utf8(w.into_inner()).unwrap_or_default()
     }
 
     /// Build `<tds:GetScopesResponse>` body.
@@ -217,7 +217,7 @@ impl DeviceServiceHandlers {
         let mut root = BytesStart::new("tds:GetScopesResponse");
         root.push_attribute(("xmlns:tds", DEVICE_SERVICE));
         root.push_attribute(("xmlns:tt", SCHEMAS));
-        w.write_event(Event::Start(root)).expect("write root");
+        w.write_event(Event::Start(root)).unwrap_or_default();
 
         write_text(
             &mut w,
@@ -236,8 +236,8 @@ impl DeviceServiceHandlers {
         );
 
         w.write_event(Event::End(BytesEnd::new("tds:GetScopesResponse")))
-            .expect("close root");
-        String::from_utf8(w.into_inner()).expect("UTF-8 body")
+            .unwrap_or_default();
+        String::from_utf8(w.into_inner()).unwrap_or_default()
     }
 }
 
@@ -247,11 +247,11 @@ impl DeviceServiceHandlers {
 
 fn write_text(w: &mut Writer<Vec<u8>>, name: &str, text: &str) {
     w.write_event(Event::Start(BytesStart::new(name)))
-        .expect("write start");
+        .unwrap_or_default();
     w.write_event(Event::Text(BytesText::new(text)))
-        .expect("write text");
+        .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new(name)))
-        .expect("write end");
+        .unwrap_or_default();
 }
 
 fn write_int(w: &mut Writer<Vec<u8>>, name: &str, value: i32) {
@@ -264,10 +264,10 @@ where
     F: FnOnce(&mut Writer<Vec<u8>>),
 {
     w.write_event(Event::Start(BytesStart::new(name)))
-        .expect("write open");
+        .unwrap_or_default();
     f(w);
     w.write_event(Event::End(BytesEnd::new(name)))
-        .expect("write close");
+        .unwrap_or_default();
 }
 
 /// Write `<tt:XXX><tt:XAddr>base/path</tt:XAddr></tt:XXX>`.
