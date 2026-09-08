@@ -254,7 +254,7 @@ fn parse_probe(msg: &[u8]) -> Option<String> {
 /// );
 /// // let handle = server.start().await.unwrap();
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DiscoveryServer {
     /// The device's own IP address used in XAddr URLs.
     device_ip: String,
@@ -264,6 +264,19 @@ pub struct DiscoveryServer {
     uuid: String,
     /// ONVIF scope URIs.
     scopes: Vec<String>,
+    /// Library-neutral observability hooks (issue #18).
+    metrics: std::sync::Arc<dyn crate::metrics::MetricsHooks>,
+}
+
+impl std::fmt::Debug for DiscoveryServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscoveryServer")
+            .field("device_ip", &self.device_ip)
+            .field("onvif_port", &self.onvif_port)
+            .field("uuid", &self.uuid)
+            .field("scopes", &self.scopes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DiscoveryServer {
@@ -292,7 +305,16 @@ impl DiscoveryServer {
             onvif_port,
             uuid: generate_uuid(),
             scopes: vec!["onvif://www.onvif.org/Profile/Streaming".to_string()],
+            metrics: std::sync::Arc::new(crate::metrics::NoopMetrics),
         }
+    }
+
+    /// Install observability hooks (issue #18): `discovery_probe_answered`
+    /// fires for every ProbeMatches sent. Defaults to no-ops.
+    #[must_use]
+    pub fn with_metrics(mut self, hooks: std::sync::Arc<dyn crate::metrics::MetricsHooks>) -> Self {
+        self.metrics = hooks;
+        self
     }
 
     /// Create a `DiscoveryServer` that advertises the device's name and
@@ -517,6 +539,8 @@ async fn run_udp_listener_once(
     if let Some(resp) = server.handle_probe(msg, "") {
         if let Err(e) = socket.send_to(&resp, src).await {
             log::error!("discovery: failed to send ProbeMatches to {src}: {e}");
+        } else {
+            server.metrics.discovery_probe_answered();
         }
     }
     Ok(())

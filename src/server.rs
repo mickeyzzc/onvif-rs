@@ -154,6 +154,8 @@ pub struct OnvifServer {
     handlers: HashMap<String, Box<dyn OnvifActionHandler>>,
     /// SOAP actions exempt from authentication (pre-auth per ONVIF spec).
     anonymous_actions: HashSet<String>,
+    /// Library-neutral observability hooks (issue #18).
+    metrics: Arc<dyn crate::metrics::MetricsHooks>,
 }
 
 impl OnvifServer {
@@ -163,7 +165,17 @@ impl OnvifServer {
             config: config.clone(),
             handlers: HashMap::new(),
             anonymous_actions: HashSet::new(),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
         }
+    }
+
+    /// Install observability hooks (issue #18): request counts, fault
+    /// rate, and authentication outcomes, bridged by the host to any
+    /// backend. Defaults to no-ops.
+    #[must_use]
+    pub fn with_metrics(mut self, hooks: Arc<dyn crate::metrics::MetricsHooks>) -> Self {
+        self.metrics = hooks;
+        self
     }
 
     /// Register a handler for a SOAP action (local element name of the
@@ -222,6 +234,7 @@ impl OnvifServer {
         let auth_state = Arc::new(AuthState::new(&self.config));
         let cfg = Arc::new(self.config);
         let anonymous = Arc::new(self.anonymous_actions);
+        let metrics = self.metrics;
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let task = tokio::spawn(async move {
@@ -245,6 +258,7 @@ impl OnvifServer {
                 let cfg = Arc::clone(&cfg);
                 let anonymous = Arc::clone(&anonymous);
                 let auth_state = Arc::clone(&auth_state);
+                let metrics = Arc::clone(&metrics);
 
                 tokio::spawn(async move {
                     let client_ip = peer_addr.ip().to_string();
@@ -260,6 +274,7 @@ impl OnvifServer {
                         &cfg,
                         &anonymous,
                         &auth_state,
+                        &metrics,
                     )
                     .await
                     {
@@ -349,6 +364,7 @@ impl AuthState {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // connection-scoped shared state passed as-is
 async fn handle_connection(
     stream: &mut tokio::net::TcpStream,
     client_ip: &str,
@@ -357,6 +373,7 @@ async fn handle_connection(
     cfg: &SharedConfig,
     anonymous: &SharedAnonymous,
     auth_state: &Arc<AuthState>,
+    metrics: &Arc<dyn crate::metrics::MetricsHooks>,
 ) -> Result<(), OnvifError> {
     // --- Read HTTP request (bounded header, bounded body, read timeout) ---
     let read = read_http_request(stream, cfg);
@@ -398,6 +415,7 @@ async fn handle_connection(
     // password — an empty password alone never silently disables auth.
     let auth_disabled = cfg.allow_no_auth && cfg.password.is_empty();
     if !auth_disabled && auth_state.locked(client_ip) {
+        metrics.auth_lockout();
         log::warn!("onvif: auth lockout active for {client_ip}");
         let fault = serialize_soap_fault("soap:Sender", "too many authentication failures");
         write_http_response(stream, 401, &fault).await?;
@@ -420,6 +438,7 @@ async fn handle_connection(
         }
         token_ok = ok;
         if !ok {
+            metrics.auth_fail();
             auth_state.record_failure(
                 client_ip,
                 cfg.auth_failure_limit,
@@ -475,6 +494,7 @@ async fn handle_connection(
 
     // Handler panics are contained (issue #15): the request gets a 500
     // and the server keeps serving instead of losing the connection task.
+    metrics.soap_request(&parsed.action);
     let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
         handler.handle(&parsed.body_xml, &request_info),
     ))
@@ -484,10 +504,12 @@ async fn handle_connection(
             write_http_response(stream, 200, &response_xml).await?;
         }
         Ok(Err(e)) => {
+            metrics.soap_fault(&parsed.action);
             let fault = serialize_soap_fault("soap:Receiver", &e.to_string());
             write_http_response(stream, 500, &fault).await?;
         }
         Err(panic_payload) => {
+            metrics.soap_fault(&parsed.action);
             log::error!(
                 "onvif: handler panicked for action {}: {panic_payload:?}",
                 parsed.action
