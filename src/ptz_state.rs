@@ -227,10 +227,7 @@ impl PtzState {
             name: name.to_string(),
             position: pos,
         };
-        self.presets
-            .write()
-            .expect("ptz presets lock")
-            .insert(token.clone(), preset);
+        presets_write(&self.presets).insert(token.clone(), preset);
         token
     }
 
@@ -243,10 +240,7 @@ impl PtzState {
             name: name.to_string(),
             position: pos,
         };
-        self.presets
-            .write()
-            .expect("ptz presets lock")
-            .insert(token.to_string(), preset);
+        presets_write(&self.presets).insert(token.to_string(), preset);
     }
 
     /// Move to a saved preset position (delegates to [`absolute_move`]).
@@ -289,31 +283,17 @@ impl PtzState {
 
     /// Return all preset tokens.
     pub fn get_presets(&self) -> Vec<String> {
-        self.presets
-            .read()
-            .expect("ptz presets lock")
-            .keys()
-            .cloned()
-            .collect()
+        presets_read(&self.presets).keys().cloned().collect()
     }
 
     /// Get a preset by token (full details).
     pub fn get_preset(&self, token: &str) -> Option<Preset> {
-        self.presets
-            .read()
-            .expect("ptz presets lock")
-            .get(token)
-            .cloned()
+        presets_read(&self.presets).get(token).cloned()
     }
 
     /// List all presets with full details.
     pub fn list_presets(&self) -> Vec<Preset> {
-        self.presets
-            .read()
-            .expect("ptz presets lock")
-            .values()
-            .cloned()
-            .collect()
+        presets_read(&self.presets).values().cloned().collect()
     }
 }
 
@@ -334,6 +314,27 @@ fn clampf(v: f64, lo: f64, hi: f64) -> f64 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// Locks the presets table tolerating poisoning: the table is plain data
+// with no invariants, so a panicked peer thread's guard is still consistent
+// to read/write. Keeps the production paths unwrap/expect-free (#15).
+fn presets_write(
+    lock: &std::sync::RwLock<std::collections::HashMap<String, Preset>>,
+) -> std::sync::RwLockWriteGuard<'_, std::collections::HashMap<String, Preset>> {
+    match lock.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn presets_read(
+    lock: &std::sync::RwLock<std::collections::HashMap<String, Preset>>,
+) -> std::sync::RwLockReadGuard<'_, std::collections::HashMap<String, Preset>> {
+    match lock.read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 #[cfg(test)]
 mod tests {

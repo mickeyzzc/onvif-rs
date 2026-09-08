@@ -180,10 +180,10 @@ fn build_get_imaging_settings_xml(
     let mut root = BytesStart::new("timg:GetImagingSettingsResponse");
     root.push_attribute(("xmlns:timg", IMAGING_SERVICE));
     root.push_attribute(("xmlns:tt", SCHEMAS));
-    w.write_event(Event::Start(root)).unwrap();
+    w.write_event(Event::Start(root)).unwrap_or_default();
 
     w.write_event(Event::Start(BytesStart::new("timg:Settings")))
-        .unwrap();
+        .unwrap_or_default();
 
     write_value_attr(&mut w, "tt:Brightness", brightness);
     write_value_attr(&mut w, "tt:Contrast", contrast);
@@ -192,23 +192,23 @@ fn build_get_imaging_settings_xml(
 
     // Exposure / WhiteBalance modes come from the host seam (AUTO defaults).
     w.write_event(Event::Start(BytesStart::new("tt:Exposure")))
-        .unwrap();
+        .unwrap_or_default();
     write_text(&mut w, "tt:Mode", exposure_mode);
     w.write_event(Event::End(BytesEnd::new("tt:Exposure")))
-        .unwrap();
+        .unwrap_or_default();
 
     w.write_event(Event::Start(BytesStart::new("tt:WhiteBalance")))
-        .unwrap();
+        .unwrap_or_default();
     write_text(&mut w, "tt:Mode", white_balance_mode);
     w.write_event(Event::End(BytesEnd::new("tt:WhiteBalance")))
-        .unwrap();
+        .unwrap_or_default();
 
     w.write_event(Event::End(BytesEnd::new("timg:Settings")))
-        .unwrap();
+        .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new("timg:GetImagingSettingsResponse")))
-        .unwrap();
+        .unwrap_or_default();
 
-    String::from_utf8(w.into_inner()).expect("UTF-8")
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -262,9 +262,9 @@ fn build_set_imaging_settings_response_xml() -> String {
 
     let mut root = BytesStart::new("timg:SetImagingSettingsResponse");
     root.push_attribute(("xmlns:timg", IMAGING_SERVICE));
-    w.write_event(Event::Empty(root)).unwrap();
+    w.write_event(Event::Empty(root)).unwrap_or_default();
 
-    String::from_utf8(w.into_inner()).expect("UTF-8")
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -285,10 +285,10 @@ fn build_get_options_xml() -> String {
     let mut root = BytesStart::new("timg:GetOptionsResponse");
     root.push_attribute(("xmlns:timg", IMAGING_SERVICE));
     root.push_attribute(("xmlns:tt", SCHEMAS));
-    w.write_event(Event::Start(root)).unwrap();
+    w.write_event(Event::Start(root)).unwrap_or_default();
 
     w.write_event(Event::Start(BytesStart::new("timg:ImagingOptions")))
-        .unwrap();
+        .unwrap_or_default();
 
     // Brightness, Contrast, ColorSaturation, Sharpness — all [0, 1]
     for param in &[
@@ -302,36 +302,36 @@ fn build_get_options_xml() -> String {
 
     // Exposure options
     w.write_event(Event::Start(BytesStart::new("tt:Exposure")))
-        .unwrap();
+        .unwrap_or_default();
     write_text(&mut w, "tt:MinExposureTime", "0");
     write_text(&mut w, "tt:MaxExposureTime", "1");
     write_text(&mut w, "tt:MinGain", "0");
     write_text(&mut w, "tt:MaxGain", "1");
     w.write_event(Event::End(BytesEnd::new("tt:Exposure")))
-        .unwrap();
+        .unwrap_or_default();
 
     // WhiteBalance options
     w.write_event(Event::Start(BytesStart::new("tt:WhiteBalance")))
-        .unwrap();
+        .unwrap_or_default();
 
     // Mode with Auto/Manual boolean attributes
     let mut mode = BytesStart::new("tt:Mode");
     mode.push_attribute(("Auto", "true"));
     mode.push_attribute(("Manual", "true"));
-    w.write_event(Event::Empty(mode)).unwrap();
+    w.write_event(Event::Empty(mode)).unwrap_or_default();
 
     write_range(&mut w, "tt:CrGain", 0.0, 1.0);
     write_range(&mut w, "tt:CbGain", 0.0, 1.0);
 
     w.write_event(Event::End(BytesEnd::new("tt:WhiteBalance")))
-        .unwrap();
+        .unwrap_or_default();
 
     w.write_event(Event::End(BytesEnd::new("timg:ImagingOptions")))
-        .unwrap();
+        .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new("timg:GetOptionsResponse")))
-        .unwrap();
+        .unwrap_or_default();
 
-    String::from_utf8(w.into_inner()).expect("UTF-8")
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -341,11 +341,11 @@ fn build_get_options_xml() -> String {
 /// Write `<name>text</name>`.
 fn write_text(w: &mut Writer<Vec<u8>>, name: &str, text: &str) {
     w.write_event(Event::Start(BytesStart::new(name)))
-        .expect("write text start");
+        .unwrap_or_default();
     w.write_event(Event::Text(BytesText::new(text)))
-        .expect("write text content");
+        .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new(name)))
-        .expect("write text end");
+        .unwrap_or_default();
 }
 
 /// Write `<name Value="val"/>`.
@@ -353,18 +353,17 @@ fn write_value_attr(w: &mut Writer<Vec<u8>>, name: &str, val: f64) {
     let mut elem = BytesStart::new(name);
     let val_str = format!("{val}");
     elem.push_attribute(("Value", val_str.as_str()));
-    w.write_event(Event::Empty(elem))
-        .expect("write value-attr tag");
+    w.write_event(Event::Empty(elem)).unwrap_or_default();
 }
 
 /// Write `<name><Min>x</Min><Max>y</Max></name>`.
 fn write_range(w: &mut Writer<Vec<u8>>, name: &str, min: f64, max: f64) {
     w.write_event(Event::Start(BytesStart::new(name)))
-        .expect("write range start");
+        .unwrap_or_default();
     write_text(w, "tt:Min", &format!("{min}"));
     write_text(w, "tt:Max", &format!("{max}"));
     w.write_event(Event::End(BytesEnd::new(name)))
-        .expect("write range end");
+        .unwrap_or_default();
 }
 
 // ---------------------------------------------------------------------------

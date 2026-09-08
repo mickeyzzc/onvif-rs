@@ -157,13 +157,15 @@ impl OnvifActionHandler for GetProfilesHandler {
         // <GetProfilesResponse>
         writer
             .write_event(Event::Start(BytesStart::new("GetProfilesResponse")))
-            .unwrap();
+            .unwrap_or_default();
 
         // <Profiles token="...">
         {
             let mut profiles = BytesStart::new("Profiles");
             profiles.push_attribute(("token", self.config.profile_token.as_str()));
-            writer.write_event(Event::Start(profiles)).unwrap();
+            writer
+                .write_event(Event::Start(profiles))
+                .unwrap_or_default();
         }
 
         write_text_element(&mut writer, "Name", &self.config.profile_token);
@@ -172,7 +174,7 @@ impl OnvifActionHandler for GetProfilesHandler {
         {
             let mut vs_cfg = BytesStart::new("VideoSourceConfiguration");
             vs_cfg.push_attribute(("token", self.config.video_source_token.as_str()));
-            writer.write_event(Event::Start(vs_cfg)).unwrap();
+            writer.write_event(Event::Start(vs_cfg)).unwrap_or_default();
         }
         write_text_element(&mut writer, "Name", "VideoSourceConfig");
         write_text_element(&mut writer, "SourceToken", &self.config.video_source_token);
@@ -184,17 +186,17 @@ impl OnvifActionHandler for GetProfilesHandler {
             let h_str = h.to_string();
             bounds.push_attribute(("width", w_str.as_str()));
             bounds.push_attribute(("height", h_str.as_str()));
-            writer.write_event(Event::Empty(bounds)).unwrap();
+            writer.write_event(Event::Empty(bounds)).unwrap_or_default();
         }
         writer
             .write_event(Event::End(BytesEnd::new("VideoSourceConfiguration")))
-            .unwrap();
+            .unwrap_or_default();
 
         // <VideoEncoderConfiguration token="...">
         {
             let mut ve_cfg = BytesStart::new("VideoEncoderConfiguration");
             ve_cfg.push_attribute(("token", self.config.encoder_token.as_str()));
-            writer.write_event(Event::Start(ve_cfg)).unwrap();
+            writer.write_event(Event::Start(ve_cfg)).unwrap_or_default();
         }
         write_text_element(&mut writer, "Name", "VideoEncoderConfig");
         write_text_element(&mut writer, "UseCount", "1");
@@ -203,33 +205,33 @@ impl OnvifActionHandler for GetProfilesHandler {
         // <Resolution>
         writer
             .write_event(Event::Start(BytesStart::new("Resolution")))
-            .unwrap();
+            .unwrap_or_default();
         write_text_element(&mut writer, "Width", &w.to_string());
         write_text_element(&mut writer, "Height", &h.to_string());
         writer
             .write_event(Event::End(BytesEnd::new("Resolution")))
-            .unwrap();
+            .unwrap_or_default();
 
         // <RateControl>
         writer
             .write_event(Event::Start(BytesStart::new("RateControl")))
-            .unwrap();
+            .unwrap_or_default();
         write_text_element(&mut writer, "FrameRateLimit", &fps.to_string());
         write_text_element(&mut writer, "BitrateLimit", &bitrate.to_string());
         write_text_element(&mut writer, "EncodingInterval", "1");
         writer
             .write_event(Event::End(BytesEnd::new("RateControl")))
-            .unwrap();
+            .unwrap_or_default();
 
         writer
             .write_event(Event::End(BytesEnd::new("VideoEncoderConfiguration")))
-            .unwrap();
+            .unwrap_or_default();
         writer
             .write_event(Event::End(BytesEnd::new("Profiles")))
-            .unwrap();
+            .unwrap_or_default();
         writer
             .write_event(Event::End(BytesEnd::new("GetProfilesResponse")))
-            .unwrap();
+            .unwrap_or_default();
 
         let body = String::from_utf8(writer.into_inner())
             .map_err(|e| OnvifError::Internal(format!("non-UTF-8 output from XML writer: {e}")))?;
@@ -266,22 +268,22 @@ impl OnvifActionHandler for GetStreamUriHandler {
         let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
         writer
             .write_event(Event::Start(BytesStart::new("GetStreamUriResponse")))
-            .unwrap();
+            .unwrap_or_default();
 
         writer
             .write_event(Event::Start(BytesStart::new("MediaUri")))
-            .unwrap();
+            .unwrap_or_default();
         write_text_element(&mut writer, "Uri", &uri);
         write_text_element(&mut writer, "InvalidAfterConnect", "false");
         write_text_element(&mut writer, "InvalidAfterReboot", "false");
         write_text_element(&mut writer, "Timeout", "PT0S");
         writer
             .write_event(Event::End(BytesEnd::new("MediaUri")))
-            .unwrap();
+            .unwrap_or_default();
 
         writer
             .write_event(Event::End(BytesEnd::new("GetStreamUriResponse")))
-            .unwrap();
+            .unwrap_or_default();
 
         let body = String::from_utf8(writer.into_inner())
             .map_err(|e| OnvifError::Internal(format!("non-UTF-8 output from XML writer: {e}")))?;
@@ -327,22 +329,22 @@ impl OnvifActionHandler for GetSnapshotUriHandler {
         let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
         writer
             .write_event(Event::Start(BytesStart::new("GetSnapshotUriResponse")))
-            .unwrap();
+            .unwrap_or_default();
 
         writer
             .write_event(Event::Start(BytesStart::new("MediaUri")))
-            .unwrap();
+            .unwrap_or_default();
         write_text_element(&mut writer, "Uri", &uri);
         write_text_element(&mut writer, "InvalidAfterConnect", "false");
         write_text_element(&mut writer, "InvalidAfterReboot", "true");
         write_text_element(&mut writer, "Timeout", "PT5S");
         writer
             .write_event(Event::End(BytesEnd::new("MediaUri")))
-            .unwrap();
+            .unwrap_or_default();
 
         writer
             .write_event(Event::End(BytesEnd::new("GetSnapshotUriResponse")))
-            .unwrap();
+            .unwrap_or_default();
 
         let body = String::from_utf8(writer.into_inner())
             .map_err(|e| OnvifError::Internal(format!("non-UTF-8 output from XML writer: {e}")))?;
@@ -376,22 +378,22 @@ impl OnvifActionHandler for GetVideoSourcesHandler {
         let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
         writer
             .write_event(Event::Start(BytesStart::new("GetVideoSourcesResponse")))
-            .unwrap();
+            .unwrap_or_default();
 
         // <VideoSources token="...">
         {
             let mut vs = BytesStart::new("VideoSources");
             vs.push_attribute(("token", self.config.video_source_token.as_str()));
-            writer.write_event(Event::Start(vs)).unwrap();
+            writer.write_event(Event::Start(vs)).unwrap_or_default();
         }
         write_text_element(&mut writer, "Name", &self.config.video_source_name);
         writer
             .write_event(Event::End(BytesEnd::new("VideoSources")))
-            .unwrap();
+            .unwrap_or_default();
 
         writer
             .write_event(Event::End(BytesEnd::new("GetVideoSourcesResponse")))
-            .unwrap();
+            .unwrap_or_default();
 
         let body = String::from_utf8(writer.into_inner())
             .map_err(|e| OnvifError::Internal(format!("non-UTF-8 output from XML writer: {e}")))?;
