@@ -364,6 +364,7 @@ impl AuthState {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)] // connection-scoped shared state passed as-is
 async fn handle_connection(
     stream: &mut tokio::net::TcpStream,
     client_ip: &str,

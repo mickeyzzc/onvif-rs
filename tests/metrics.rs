@@ -91,29 +91,6 @@ async fn post(port: u16, body: &str) -> String {
         .to_string()
 }
 
-async fn post_body(port: u16, body: &str) -> String {
-    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    let req = format!(
-        "POST /onvif/device_service HTTP/1.1
-Host: x
-Content-Length: {}
-
-{}",
-        body.len(),
-        body
-    );
-    tokio::io::AsyncWriteExt::write_all(&mut sock, req.as_bytes())
-        .await
-        .unwrap();
-    let mut buf = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut sock, &mut buf)
-        .await
-        .unwrap();
-    String::from_utf8_lossy(&buf).to_string()
-}
-
 fn envelope(user: &str, pass: &str, action: &str) -> String {
     format!(
         "<Envelope xmlns=\"http://www.w3.org/2003/05/soap-envelope\"><Header><Security xmlns=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\"><UsernameToken><Username>{user}</Username><Password>{pass}</Password></UsernameToken></Security></Header><Body><{action}/></Body></Envelope>"
