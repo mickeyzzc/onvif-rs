@@ -50,9 +50,12 @@ let device = DeviceConfig {
 };
 ```
 
-默认值描述出身硬件（`Pi Camera V1` / `Raspberry Pi` / `OV5647`）——
-是为了与抽取源项目的配置文件兼容而保留的占位值。**生产环境务必换成
-你自己的**；`Default` 与空 serde 节产出相同值（有测试钉死）。支持
+默认值是**中性占位**（`ONVIF Device` / `unknown` / `unknown`）——
+原出身硬件值（`Pi Camera V1` / `Raspberry Pi` / `OV5647`）已移除，
+库默认值不再指纹（或冒充）它并不运行的硬件。`DeviceConfig::validate`
+会拒绝 `unknown` 占位，`DeviceServiceHandlers::new` 对其 fail-fast
+（issue #20）：**宿主必须显式配置真实身份**。序列号可留空（隐私
+友好）。`Default` 与空 serde 节产出相同值（有测试钉死）。支持
 TOML/JSON，可直接 re-export 进宿主自己的配置结构体。
 
 ## 服务器生命周期

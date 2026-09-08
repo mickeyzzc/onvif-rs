@@ -44,6 +44,8 @@ pub enum OnvifError {
     NotAuthorized(String),
     /// The incoming XML could not be parsed.
     InvalidXml(String),
+    /// The server/handler configuration is invalid (fail-fast at build).
+    InvalidConfig(String),
     /// Internal server error.
     Internal(String),
 }
@@ -54,6 +56,7 @@ impl std::fmt::Display for OnvifError {
             OnvifError::ActionNotSupported(a) => write!(f, "Action not supported: {a}"),
             OnvifError::NotAuthorized(m) => write!(f, "Not authorized: {m}"),
             OnvifError::InvalidXml(m) => write!(f, "Invalid XML: {m}"),
+            OnvifError::InvalidConfig(m) => write!(f, "Invalid configuration: {m}"),
             OnvifError::Internal(m) => write!(f, "Internal error: {m}"),
         }
     }

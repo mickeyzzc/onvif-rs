@@ -64,11 +64,21 @@ async fn main() -> anyhow::Result<()> {
     let mut server = OnvifServer::new(&config);
 
     // Device service: identity comes from DeviceConfig (host-supplied).
+    // The neutral "unknown" placeholders fail validation — set the real
+    // identity explicitly (issue #20).
     let device = Arc::new(DeviceServiceHandlers::new(
-        DeviceConfig { name: "My Camera".into(), ..Default::default() },
+        DeviceConfig {
+            name: "My Camera".into(),
+            manufacturer: "My Company".into(),
+            model: "Cam-X".into(),
+            firmware: "1.0.0".into(),
+            hardware_id: "cam-x".into(),
+            serial_number: "SN-001".into(),
+        },
         port,
         device_ip.clone(),
-    ));
+    )
+    .expect("explicit device identity"));
     for action in ["GetSystemDateAndTime", "GetDeviceInformation",
                    "GetCapabilities", "GetServices", "GetScopes"] {
         // pre-auth action per the ONVIF spec:

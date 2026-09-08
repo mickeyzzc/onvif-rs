@@ -64,11 +64,20 @@ async fn main() -> anyhow::Result<()> {
     let mut server = OnvifServer::new(&config);
 
     // Device 服务：身份信息来自 DeviceConfig（宿主提供）。
+    // 中性 "unknown" 占位会被校验拒绝——必须显式配置真实身份（issue #20）。
     let device = Arc::new(DeviceServiceHandlers::new(
-        DeviceConfig { name: "My Camera".into(), ..Default::default() },
+        DeviceConfig {
+            name: "My Camera".into(),
+            manufacturer: "My Company".into(),
+            model: "Cam-X".into(),
+            firmware: "1.0.0".into(),
+            hardware_id: "cam-x".into(),
+            serial_number: "SN-001".into(),
+        },
         port,
         device_ip.clone(),
-    ));
+    )
+    .expect("explicit device identity"));
     for action in ["GetSystemDateAndTime", "GetDeviceInformation",
                    "GetCapabilities", "GetServices", "GetScopes"] {
         // 按 ONVIF 规范该动作免鉴权：
