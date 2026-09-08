@@ -47,3 +47,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check Windows target
         run: cargo check --target x86_64-pc-windows-msvc
+
+  coverage:
+    # Line coverage summary via cargo-llvm-cov (issue #21, aligned with
+    # gb28181-rs#33). Report-only for now — a gate threshold is a separate
+    # decision.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage
+        run: cargo llvm-cov --summary-only
