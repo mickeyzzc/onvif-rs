@@ -12,6 +12,7 @@ categories = ["network-programming", "multimedia"]
 [dependencies]
 async-trait = "0.1"
 base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 log = "0.4"
 quick-xml = "0.36"
@@ -22,6 +23,7 @@ socket2 = "0.5"
 tokio = { version = "1", features = ["sync", "rt", "macros", "net", "time", "io-util"] }
 
 [dev-dependencies]
+base64 = "0.22"
 anyhow = "1"
 tempfile = "3"
 toml = "0.8"

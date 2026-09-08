@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::str;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use quick_xml::events::Event;
@@ -45,6 +45,14 @@ pub struct OnvifConfig {
     pub max_body_bytes: usize,
     /// Per-connection read timeout (header + body). Default 30 s.
     pub read_timeout: Duration,
+    /// UsernameToken Created freshness window in seconds; replayed nonces
+    /// are rejected within it. 0 disables the replay guard. Default 300.
+    pub replay_window_secs: u64,
+    /// Authentication failures (bad credentials) from one source before a
+    /// lockout; negative disables the limiter. Default 5.
+    pub auth_failure_limit: i32,
+    /// How long a locked-out source is refused, in seconds. Default 60.
+    pub auth_lockout_secs: u64,
 }
 
 impl Default for OnvifConfig {
@@ -56,6 +64,9 @@ impl Default for OnvifConfig {
             allow_no_auth: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             read_timeout: DEFAULT_READ_TIMEOUT,
+            replay_window_secs: 300,
+            auth_failure_limit: 5,
+            auth_lockout_secs: 60,
         }
     }
 }
@@ -208,6 +219,7 @@ impl OnvifServer {
         log::info!("onvif: serving SOAP on {local_addr}");
 
         let handlers = Arc::new(self.handlers);
+        let auth_state = Arc::new(AuthState::new(&self.config));
         let cfg = Arc::new(self.config);
         let anonymous = Arc::new(self.anonymous_actions);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -232,6 +244,7 @@ impl OnvifServer {
                 let handlers = Arc::clone(&handlers);
                 let cfg = Arc::clone(&cfg);
                 let anonymous = Arc::clone(&anonymous);
+                let auth_state = Arc::clone(&auth_state);
 
                 tokio::spawn(async move {
                     let client_ip = peer_addr.ip().to_string();
@@ -246,6 +259,7 @@ impl OnvifServer {
                         &handlers,
                         &cfg,
                         &anonymous,
+                        &auth_state,
                     )
                     .await
                     {
@@ -271,6 +285,70 @@ type HandlerMap = Arc<HashMap<String, Box<dyn OnvifActionHandler>>>;
 type SharedConfig = Arc<OnvifConfig>;
 type SharedAnonymous = Arc<HashSet<String>>;
 
+/// Cross-connection auth state: UsernameToken replay guard plus the
+/// per-source failure lockout (issue #16).
+#[derive(Default)]
+struct AuthState {
+    replay: Option<crate::auth::ReplayGuard>,
+    failures: Mutex<HashMap<String, AuthFailEntry>>,
+}
+
+#[derive(Default)]
+struct AuthFailEntry {
+    fails: i32,
+    locked_until: Option<Instant>,
+}
+
+impl AuthState {
+    fn new(cfg: &OnvifConfig) -> Self {
+        Self {
+            replay: Some(crate::auth::ReplayGuard::new(cfg.replay_window_secs)),
+            failures: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn locked(&self, key: &str) -> bool {
+        let mut failures = match self.failures.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match failures.get_mut(key) {
+            Some(e) => match e.locked_until {
+                Some(until) if Instant::now() < until => true,
+                Some(_) => {
+                    failures.remove(key); // lockout served
+                    false
+                }
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    fn record_failure(&self, key: &str, limit: i32, lockout: Duration) {
+        if limit <= 0 {
+            return;
+        }
+        let mut failures = match self.failures.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let e = failures.entry(key.to_string()).or_default();
+        e.fails += 1;
+        if e.fails >= limit {
+            e.locked_until = Some(Instant::now() + lockout);
+        }
+    }
+
+    fn record_success(&self, key: &str) {
+        let mut failures = match self.failures.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        failures.remove(key);
+    }
+}
+
 async fn handle_connection(
     stream: &mut tokio::net::TcpStream,
     client_ip: &str,
@@ -278,6 +356,7 @@ async fn handle_connection(
     handlers: &HandlerMap,
     cfg: &SharedConfig,
     anonymous: &SharedAnonymous,
+    auth_state: &Arc<AuthState>,
 ) -> Result<(), OnvifError> {
     // --- Read HTTP request (bounded header, bounded body, read timeout) ---
     let read = read_http_request(stream, cfg);
@@ -318,8 +397,37 @@ async fn handle_connection(
     // `auth_disabled` requires BOTH an explicit opt-in flag and an empty
     // password — an empty password alone never silently disables auth.
     let auth_disabled = cfg.allow_no_auth && cfg.password.is_empty();
+    if !auth_disabled && auth_state.locked(client_ip) {
+        log::warn!("onvif: auth lockout active for {client_ip}");
+        let fault = serialize_soap_fault("soap:Sender", "too many authentication failures");
+        write_http_response(stream, 401, &fault).await?;
+        return Ok(());
+    }
+    let mut token_ok = true;
     let auth_result = if let Some(ref token) = parsed.username_token {
-        let ok = verify_username_token(token, &cfg.username, &cfg.password);
+        let mut ok = verify_username_token(token, &cfg.username, &cfg.password);
+        if ok {
+            // Digest tokens additionally pass the replay guard: fresh
+            // Created, nonce never seen before (issue #16).
+            if !token.nonce.is_empty() {
+                if let Some(guard) = &auth_state.replay {
+                    if !guard.check_and_remember(&token.nonce, &token.created) {
+                        log::warn!("onvif: UsernameToken replay/stale rejected from {client_ip}");
+                        ok = false;
+                    }
+                }
+            }
+        }
+        token_ok = ok;
+        if !ok {
+            auth_state.record_failure(
+                client_ip,
+                cfg.auth_failure_limit,
+                Duration::from_secs(cfg.auth_lockout_secs),
+            );
+        } else {
+            auth_state.record_success(client_ip);
+        }
         AuthResult {
             username: token.username.clone(),
             authenticated: ok,
@@ -327,6 +435,7 @@ async fn handle_connection(
     } else {
         AuthResult::default()
     };
+    let _ = token_ok;
 
     // --- Action check ---
     if parsed.action.is_empty() {
@@ -364,12 +473,26 @@ async fn handle_connection(
         auth_result,
     };
 
-    match handler.handle(&parsed.body_xml, &request_info).await {
-        Ok(response_xml) => {
+    // Handler panics are contained (issue #15): the request gets a 500
+    // and the server keeps serving instead of losing the connection task.
+    let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+        handler.handle(&parsed.body_xml, &request_info),
+    ))
+    .await;
+    match outcome {
+        Ok(Ok(response_xml)) => {
             write_http_response(stream, 200, &response_xml).await?;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let fault = serialize_soap_fault("soap:Receiver", &e.to_string());
+            write_http_response(stream, 500, &fault).await?;
+        }
+        Err(panic_payload) => {
+            log::error!(
+                "onvif: handler panicked for action {}: {panic_payload:?}",
+                parsed.action
+            );
+            let fault = serialize_soap_fault("soap:Receiver", "internal handler error");
             write_http_response(stream, 500, &fault).await?;
         }
     }
