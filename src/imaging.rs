@@ -353,8 +353,7 @@ fn write_value_attr(w: &mut Writer<Vec<u8>>, name: &str, val: f64) {
     let mut elem = BytesStart::new(name);
     let val_str = format!("{val}");
     elem.push_attribute(("Value", val_str.as_str()));
-    w.write_event(Event::Empty(elem))
-        .unwrap_or_default();
+    w.write_event(Event::Empty(elem)).unwrap_or_default();
 }
 
 /// Write `<name><Min>x</Min><Max>y</Max></name>`.

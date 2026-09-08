@@ -227,8 +227,7 @@ impl PtzState {
             name: name.to_string(),
             position: pos,
         };
-        presets_write(&self.presets)
-            .insert(token.clone(), preset);
+        presets_write(&self.presets).insert(token.clone(), preset);
         token
     }
 
@@ -241,8 +240,7 @@ impl PtzState {
             name: name.to_string(),
             position: pos,
         };
-        presets_write(&self.presets)
-            .insert(token.to_string(), preset);
+        presets_write(&self.presets).insert(token.to_string(), preset);
     }
 
     /// Move to a saved preset position (delegates to [`absolute_move`]).
@@ -285,25 +283,17 @@ impl PtzState {
 
     /// Return all preset tokens.
     pub fn get_presets(&self) -> Vec<String> {
-        presets_read(&self.presets)
-            .keys()
-            .cloned()
-            .collect()
+        presets_read(&self.presets).keys().cloned().collect()
     }
 
     /// Get a preset by token (full details).
     pub fn get_preset(&self, token: &str) -> Option<Preset> {
-        presets_read(&self.presets)
-            .get(token)
-            .cloned()
+        presets_read(&self.presets).get(token).cloned()
     }
 
     /// List all presets with full details.
     pub fn list_presets(&self) -> Vec<Preset> {
-        presets_read(&self.presets)
-            .values()
-            .cloned()
-            .collect()
+        presets_read(&self.presets).values().cloned().collect()
     }
 }
 

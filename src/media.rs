@@ -163,7 +163,9 @@ impl OnvifActionHandler for GetProfilesHandler {
         {
             let mut profiles = BytesStart::new("Profiles");
             profiles.push_attribute(("token", self.config.profile_token.as_str()));
-            writer.write_event(Event::Start(profiles)).unwrap_or_default();
+            writer
+                .write_event(Event::Start(profiles))
+                .unwrap_or_default();
         }
 
         write_text_element(&mut writer, "Name", &self.config.profile_token);

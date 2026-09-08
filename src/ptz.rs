@@ -418,8 +418,7 @@ fn empty_response(action: &str) -> String {
     let name = format!("tptz:{}Response", action);
     let mut root = BytesStart::new(&name);
     root.push_attribute(("xmlns:tptz", PTZ_SERVICE));
-    w.write_event(Event::Empty(root))
-        .unwrap_or_default();
+    w.write_event(Event::Empty(root)).unwrap_or_default();
     String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
