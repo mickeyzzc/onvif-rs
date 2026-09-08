@@ -9,6 +9,16 @@ Releases are capability packages: merges accumulate on `main` silently
 and ship with the next tag (merge ≠ release). Only urgent security fixes
 are released out of band.
 
+## [Unreleased]
+
+- **Changed (breaking)** `DeviceConfig` defaults are neutral placeholders
+  (`ONVIF Device` / `unknown` / `unknown`) — the origin-hardware values
+  (`Pi Camera V1` / `Raspberry Pi` / `OV5647`) are gone. New
+  `DeviceConfig::validate` rejects the `unknown` placeholders and empty
+  fields, and `DeviceServiceHandlers::new` now returns
+  `Result<Self, OnvifError>` and fails fast on an unconfigured identity;
+  `OnvifError::InvalidConfig` added (#20).
+
 ## [v0.5.0] — 2026-09-08
 
 - **Fixed** panic hygiene: all production `unwrap`/`expect` eliminated

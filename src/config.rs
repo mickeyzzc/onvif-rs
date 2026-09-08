@@ -4,8 +4,8 @@
 //! section, so hosts can re-export [`DeviceConfig`] directly into their own
 //! config structs without changing config files.
 //!
-//! Defaults describe the origin hardware (Raspberry Pi + OV5647 sensor);
-//! non-Pi hosts should set their own values in config.
+//! Defaults are neutral placeholders ("unknown"); [`DeviceConfig::validate`]
+//! rejects them so every host must configure its real identity (issue #20).
 
 use serde::{Deserialize, Serialize};
 
@@ -27,19 +27,19 @@ pub struct DeviceConfig {
 }
 
 fn default_device_name() -> String {
-    "Pi Camera V1".to_string()
+    "ONVIF Device".to_string()
 }
 fn default_manufacturer() -> String {
-    "Raspberry Pi".to_string()
+    "unknown".to_string()
 }
 fn default_model() -> String {
-    "OV5647".to_string()
+    "unknown".to_string()
 }
 fn default_firmware() -> String {
     "1.0.0".to_string()
 }
 fn default_hardware_id() -> String {
-    "OV5647".to_string()
+    "unknown".to_string()
 }
 
 impl Default for DeviceConfig {
@@ -52,6 +52,36 @@ impl Default for DeviceConfig {
             hardware_id: default_hardware_id(),
             serial_number: String::new(),
         }
+    }
+}
+
+/// Placeholder value marking an unconfigured identity field.
+const NEUTRAL_PLACEHOLDER: &str = "unknown";
+
+impl DeviceConfig {
+    /// Validate the identity: every field is non-empty, and the neutral
+    /// placeholders (`unknown`) are rejected — hosts must configure their
+    /// real identity instead of leaking (or faking) someone else's
+    /// hardware fingerprint (issue #20). The serial number may stay empty
+    /// (a privacy-friendly host choice).
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("name", &self.name),
+            ("manufacturer", &self.manufacturer),
+            ("model", &self.model),
+            ("firmware", &self.firmware),
+            ("hardware_id", &self.hardware_id),
+        ] {
+            if value.is_empty() {
+                return Err(format!("device.{field} must not be empty"));
+            }
+            if field != "name" && value.as_str() == NEUTRAL_PLACEHOLDER {
+                return Err(format!(
+                    "device.{field} is the neutral placeholder \"{NEUTRAL_PLACEHOLDER}\" — configure the host's real identity"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -77,11 +107,12 @@ mod tests {
     #[test]
     fn empty_toml_section_yields_documented_defaults() {
         let c: DeviceConfig = toml::from_str("").unwrap();
-        assert_eq!(c.name, "Pi Camera V1");
-        assert_eq!(c.manufacturer, "Raspberry Pi");
-        assert_eq!(c.model, "OV5647");
+        // Neutral placeholders — rejected by validate() until configured.
+        assert_eq!(c.name, "ONVIF Device");
+        assert_eq!(c.manufacturer, "unknown");
+        assert_eq!(c.model, "unknown");
         assert_eq!(c.firmware, "1.0.0");
-        assert_eq!(c.hardware_id, "OV5647");
+        assert_eq!(c.hardware_id, "unknown");
         assert_eq!(c.serial_number, "");
     }
 
@@ -100,7 +131,7 @@ mod tests {
         assert_eq!(c.model, "IMX219");
         assert_eq!(c.serial_number, "SN-42");
         // Untouched fields keep their defaults.
-        assert_eq!(c.manufacturer, "Raspberry Pi");
+        assert_eq!(c.manufacturer, "unknown");
         assert_eq!(c.firmware, "1.0.0");
     }
 
@@ -122,5 +153,64 @@ mod tests {
         assert_eq!(back.firmware, c.firmware);
         assert_eq!(back.hardware_id, c.hardware_id);
         assert_eq!(back.serial_number, c.serial_number);
+    }
+
+    /// Issue #20: defaults must not fingerprint the origin hardware — a
+    /// library default advertising "Raspberry Pi / OV5647" on every
+    /// non-Pi host is leaked branding.
+    #[test]
+    fn defaults_are_neutral() {
+        let d = DeviceConfig::default();
+        assert_eq!(d.manufacturer, "unknown");
+        assert_eq!(d.model, "unknown");
+        assert_eq!(d.hardware_id, "unknown");
+        assert_ne!(d.name, "Pi Camera V1");
+    }
+
+    /// Issue #20: unset identity (the neutral placeholders) must be
+    /// rejected — hosts are required to configure their real identity.
+    #[test]
+    fn validate_rejects_neutral_placeholders() {
+        let err = DeviceConfig::default().validate().unwrap_err();
+        assert!(err.contains("manufacturer"), "got: {err}");
+
+        let c = DeviceConfig {
+            manufacturer: "MiBee".into(),
+            ..DeviceConfig::default()
+        };
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("model"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_fields() {
+        let mut c = explicit_config();
+        c.name = String::new();
+        assert!(c.validate().unwrap_err().contains("name"));
+
+        let mut c = explicit_config();
+        c.firmware = String::new();
+        assert!(c.validate().unwrap_err().contains("firmware"));
+
+        // Serial number may stay empty (privacy-friendly host choice).
+        let mut c = explicit_config();
+        c.serial_number = String::new();
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_explicit_identity() {
+        assert!(explicit_config().validate().is_ok());
+    }
+
+    fn explicit_config() -> DeviceConfig {
+        DeviceConfig {
+            name: "Desk Cam".into(),
+            manufacturer: "MiBee".into(),
+            model: "IMX219".into(),
+            firmware: "1.0.0".into(),
+            hardware_id: "HW-1".into(),
+            serial_number: "SN-1".into(),
+        }
     }
 }

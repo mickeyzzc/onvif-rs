@@ -201,18 +201,21 @@ async fn main() -> Result<()> {
         ..Default::default()
     });
 
-    let device = Arc::new(DeviceServiceHandlers::new(
-        DeviceConfig {
-            name: "onvif-device-rs demo camera".into(),
-            manufacturer: "MiBee".into(),
-            model: "DEMO".into(),
-            firmware: "0.2.1".into(),
-            hardware_id: "demo-hw".into(),
-            serial_number: SERIAL.into(),
-        },
-        port,
-        device_ip.clone(),
-    ));
+    let device = Arc::new(
+        DeviceServiceHandlers::new(
+            DeviceConfig {
+                name: "onvif-device-rs demo camera".into(),
+                manufacturer: "MiBee".into(),
+                model: "DEMO".into(),
+                firmware: "0.2.1".into(),
+                hardware_id: "demo-hw".into(),
+                serial_number: SERIAL.into(),
+            },
+            port,
+            device_ip.clone(),
+        )
+        .expect("device identity must be configured explicitly (issue #20)"),
+    );
     for action in [
         "GetSystemDateAndTime",
         "GetDeviceInformation",

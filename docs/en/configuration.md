@@ -52,12 +52,16 @@ let device = DeviceConfig {
 };
 ```
 
-Defaults describe the origin hardware (`Pi Camera V1` / `Raspberry Pi`
-/ `OV5647`) — they are placeholders kept for config-file compatibility
-with the extraction source. **Set your own values in production**;
-`Default` and an empty serde section produce identical values (pinned
-by test). TOML/JSON friendly, so it can be re-exported into the host's
-own config struct.
+Defaults are **neutral placeholders** (`ONVIF Device` / `unknown` /
+`unknown`) — the old origin-hardware values (`Pi Camera V1` /
+`Raspberry Pi` / `OV5647`) were removed so a library default never
+fingerprints (or fakes) hardware it does not run on. `DeviceConfig::
+validate` rejects the `unknown` placeholders, and
+`DeviceServiceHandlers::new` fails fast on them (issue #20): **the
+host's real identity must be configured explicitly**. The serial number
+may stay empty (privacy-friendly). `Default` and an empty serde section
+produce identical values (pinned by test). TOML/JSON friendly, so it
+can be re-exported into the host's own config struct.
 
 ## Server lifecycle
 

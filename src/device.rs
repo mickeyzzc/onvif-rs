@@ -28,12 +28,22 @@ pub struct DeviceServiceHandlers {
 }
 
 impl DeviceServiceHandlers {
-    pub fn new(device_config: DeviceConfig, onvif_port: u16, device_ip: String) -> Self {
-        Self {
+    /// Fail-fast on an unvalidated identity (issue #20): a config left at
+    /// the neutral placeholders is a configuration error, not a silent
+    /// "unknown" device on the network.
+    pub fn new(
+        device_config: DeviceConfig,
+        onvif_port: u16,
+        device_ip: String,
+    ) -> Result<Self, OnvifError> {
+        device_config
+            .validate()
+            .map_err(OnvifError::InvalidConfig)?;
+        Ok(Self {
             device_config,
             onvif_port,
             device_ip,
-        }
+        })
     }
 
     fn base_url(&self, server_ip: &str) -> String {
@@ -327,7 +337,20 @@ mod tests {
     use crate::types::AuthResult;
 
     fn test_handlers() -> DeviceServiceHandlers {
-        DeviceServiceHandlers::new(DeviceConfig::default(), 8080, "192.168.1.100".to_string())
+        DeviceServiceHandlers::new(test_device_config(), 8080, "192.168.1.100".to_string()).unwrap()
+    }
+
+    /// Explicit, valid identity — the neutral defaults would fail the
+    /// constructor's fail-fast validation (issue #20).
+    fn test_device_config() -> DeviceConfig {
+        DeviceConfig {
+            name: "Test Cam".into(),
+            manufacturer: "MiBee".into(),
+            model: "IMX219".into(),
+            firmware: "1.0.0".into(),
+            hardware_id: "HW-1".into(),
+            serial_number: "SN-1".into(),
+        }
     }
 
     fn test_info(server_ip: &str) -> RequestInfo {
@@ -386,11 +409,12 @@ mod tests {
                 firmware: "1.0.0".into(),
                 serial_number: "SN-001".into(),
                 hardware_id: "OV5647".into(),
-                ..DeviceConfig::default()
+                name: "Pi Camera V1".into(),
             },
             8080,
             "192.168.1.100".to_string(),
-        );
+        )
+        .unwrap();
         let xml = h.build_device_information();
 
         assert!(xml.contains("GetDeviceInformationResponse"));
@@ -447,11 +471,14 @@ mod tests {
             DeviceConfig {
                 name: "Pi Camera V1".into(),
                 hardware_id: "OV5647".into(),
+                manufacturer: "TestVendor".into(),
+                model: "TestModel".into(),
                 ..DeviceConfig::default()
             },
             8080,
             "192.168.1.100".to_string(),
-        );
+        )
+        .unwrap();
         let xml = h.build_scopes();
 
         assert!(xml.contains("GetScopesResponse"));
@@ -498,7 +525,7 @@ mod tests {
 
         assert!(resp.contains("soap:Envelope"));
         assert!(resp.contains("GetDeviceInformationResponse"));
-        assert!(resp.contains("Raspberry Pi"));
+        assert!(resp.contains("MiBee"));
     }
 
     #[tokio::test]
