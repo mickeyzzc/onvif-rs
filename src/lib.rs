@@ -59,6 +59,7 @@ pub mod device;
 pub mod discovery;
 pub mod imaging;
 pub mod media;
+pub mod metrics;
 pub mod namespaces;
 pub mod ptz;
 pub mod ptz_state;
@@ -66,6 +67,7 @@ pub mod server;
 pub mod types;
 
 pub use config::DeviceConfig;
+pub use discovery::DiscoveryServer;
 pub use imaging::ImagingParams;
 pub use ptz_state::{Position, PtzState, Velocity};
 pub use server::{OnvifConfig, OnvifServer, OnvifServerHandle};
