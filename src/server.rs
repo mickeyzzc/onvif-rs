@@ -851,6 +851,55 @@ pub(crate) fn parse_soap_request(xml: &str) -> Result<ParsedSoap, OnvifError> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod proptests {
+    //! Property tests (#17): the quick-xml SOAP request parser faces an
+    //! untrusted HTTP body — arbitrary input must surface as an error,
+    //! never a panic. Valid requests must round-trip the action and the
+    //! UsernameToken fields.
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest::proptest! {
+        #[test]
+        fn parse_soap_request_never_panics_on_arbitrary_chars(input in proptest::collection::vec(any::<char>(), 0..1024)) {
+            let s: String = input.into_iter().collect();
+            let _ = parse_soap_request(&s);
+        }
+
+        #[test]
+        fn parse_soap_request_never_panics_on_xml_shaped_garbage(
+            name in "[A-Za-z][A-Za-z0-9]{0,24}",
+            depth in 1usize..8,
+        ) {
+            let mut s = String::from("<?xml version=\"1.0\"?>");
+            for _ in 0..depth {
+                s.push_str(&format!("<{name} xmlns=\"http://x\">"));
+            }
+            for _ in 0..depth {
+                s.push_str(&format!("</{name}>"));
+            }
+            let _ = parse_soap_request(&s);
+        }
+
+        #[test]
+        fn valid_request_roundtrips_action_and_token(
+            action in "[A-Z][A-Za-z0-9]{0,31}",
+            user in "[a-z]{1,8}",
+        ) {
+            let body = format!(
+                "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\"><s:Header><wsse:Security><wsse:UsernameToken><wsse:Username>{user}</wsse:Username><wsse:Password Type=\"#Digest\">Zm9v</wsse:Password><wsse:Nonce>bm9uY2U=</wsse:Nonce><wsu:Created xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\">2026-09-08T00:00:00Z</wsu:Created></wsse:UsernameToken></wsse:Security></s:Header><s:Body><{action}/></s:Body></s:Envelope>"
+            );
+            let parsed = parse_soap_request(&body).expect("well-formed request must parse");
+            prop_assert_eq!(parsed.action, action);
+            let token = parsed.username_token.as_ref().expect("token must parse");
+            prop_assert_eq!(token.username.as_str(), user.as_str());
+            prop_assert_eq!(token.nonce.as_str(), "bm9uY2U=");
+            prop_assert_eq!(token.created.as_str(), "2026-09-08T00:00:00Z");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::namespaces::SOAP_ENVELOPE;
