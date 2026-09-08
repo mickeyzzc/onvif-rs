@@ -1,6 +1,9 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sha1::Digest;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::types::UsernameToken;
 
@@ -56,6 +59,102 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         result |= x ^ y;
     }
     result == 0
+}
+
+// ---------------------------------------------------------------------------
+// Replay guard (issue #16): a captured digest UsernameToken must not be
+// replayable — nonces are remembered and Created must be fresh.
+// ---------------------------------------------------------------------------
+
+/// Remembers seen nonces (bounded map) and enforces a Created freshness
+/// window. `window_secs == 0` disables both checks (tests only).
+pub struct ReplayGuard {
+    window_secs: u64,
+    seen: Mutex<HashMap<String, Instant>>,
+}
+
+const MAX_REMEMBERED_NONCES: usize = 1024;
+
+impl ReplayGuard {
+    pub fn new(window_secs: u64) -> Self {
+        Self {
+            window_secs,
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Accepts a (nonce, created) pair exactly once: the Created timestamp
+    /// must sit inside the freshness window and the nonce must not have
+    /// been seen before.
+    pub fn check_and_remember(&self, nonce: &str, created: &str) -> bool {
+        if self.window_secs == 0 {
+            return true;
+        }
+        if !created_is_fresh(created, self.window_secs) {
+            return false;
+        }
+        let mut seen = match self.seen.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if seen.len() >= MAX_REMEMBERED_NONCES {
+            prune_stale(&mut seen);
+        }
+        // The nonce (not its decoded bytes) is the identity — the wire
+        // value is what an attacker replays byte-for-byte.
+        seen.insert(nonce.to_string(), Instant::now()).is_none()
+    }
+}
+
+fn prune_stale(seen: &mut HashMap<String, Instant>) {
+    // One full window back covers every accepted token.
+    seen.retain(|_, at| at.elapsed() < Duration::from_secs(600));
+    if seen.len() >= MAX_REMEMBERED_NONCES {
+        // Still full (degenerate all-at-once replay): drop the oldest
+        // quarter instead of growing without bound.
+        let mut times: Vec<(String, Instant)> = seen.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        times.sort_by_key(|(_, at)| *at);
+        for (k, _) in times.into_iter().take(MAX_REMEMBERED_NONCES / 4) {
+            seen.remove(&k);
+        }
+    }
+}
+
+/// Parses an RFC3339-ish `YYYY-MM-DDTHH:MM:SS[.fff]Z` Created value and
+/// checks it lies within ±window of now. Unparseable timestamps are stale
+/// (fail closed).
+fn created_is_fresh(created: &str, window_secs: u64) -> bool {
+    let Some(unix) = parse_created_unix(created) else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    (unix - now).abs() <= window_secs as i64
+}
+
+/// Minimal civil-time parser for the ONVIF Created format (no chrono dep):
+/// Howard Hinnant's days-from-civil over the date part.
+pub fn parse_created_unix(created: &str) -> Option<i64> {
+    let bytes = created.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let num = |a: usize, b: usize| -> Option<i64> { created.get(a..b)?.parse::<i64>().ok() };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, s) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy.rem_euclid(400);
+    let mp = if mo > 2 { mo - 3 } else { mo + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + h * 3600 + mi * 60 + s)
 }
 
 // ---------------------------------------------------------------------------
