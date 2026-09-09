@@ -460,11 +460,14 @@ impl DiscoveryServer {
         let socket = UdpSocket::from_std(std_socket)?;
         let server = Arc::new(self.clone());
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        // The listener arm needs &mut for retry backoff interruption while
+        // the select's shutdown arm holds its own receiver.
+        let mut shutdown_listener = shutdown_rx.clone();
 
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    result = run_udp_listener_once(&socket, &server) => {
+                    result = run_udp_listener_once(&socket, &server, &mut shutdown_listener) => {
                         if let Err(e) = result {
                             log::error!("discovery: UDP listener error: {e}");
                         }
@@ -530,6 +533,7 @@ impl std::future::Future for DiscoveryHandle {
 async fn run_udp_listener_once(
     socket: &UdpSocket,
     server: &DiscoveryServer,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), DiscoveryError> {
     let mut buf = vec![0u8; 8192];
     let (n, src) = socket.recv_from(&mut buf).await?;
@@ -537,13 +541,62 @@ async fn run_udp_listener_once(
     // For UDP probes, always use the device's own IP for XAddr —
     // never the requester's source IP.
     if let Some(resp) = server.handle_probe(msg, "") {
-        if let Err(e) = socket.send_to(&resp, src).await {
-            log::error!("discovery: failed to send ProbeMatches to {src}: {e}");
-        } else {
+        let sent = retry_send(
+            || async { socket.send_to(&resp, src).await.map(|_: usize| ()) },
+            shutdown,
+        )
+        .await;
+        if sent {
             server.metrics.discovery_probe_answered();
+        } else {
+            log::error!("discovery: failed to send ProbeMatches to {src} after {DISCOVERY_SEND_ATTEMPTS} attempts");
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ProbeMatches send retry (issue #22)
+// ---------------------------------------------------------------------------
+
+/// How many times a ProbeMatches send is attempted before the answer is
+/// dropped (transient `ENOBUFS`/`EAGAIN` under burst load).
+pub const DISCOVERY_SEND_ATTEMPTS: u32 = 3;
+
+/// Base backoff between ProbeMatches send attempts; doubles per attempt.
+pub const DISCOVERY_SEND_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Retries a ProbeMatches send with exponential backoff (issue #22): a
+/// unicast UDP reply can hit a transient full send buffer under burst
+/// load; retrying a few times keeps the answer alive where a single
+/// attempt dropped it. `shutdown` interrupts the backoff sleeps.
+///
+/// Generic over the send future so tests can drive failure sequences
+/// without a socket.
+async fn retry_send<F, Fut>(mut send: F, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    let mut backoff = DISCOVERY_SEND_BACKOFF;
+    for _ in 0..DISCOVERY_SEND_ATTEMPTS {
+        if *shutdown.borrow() {
+            return false;
+        }
+        match send().await {
+            Ok(()) => return true,
+            Err(_) => {
+                if backoff.as_millis() > 0 {
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = shutdown.changed() => return false,
+                    }
+                }
+                backoff *= 2;
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +626,108 @@ pub fn handle_http_probe(server: &DiscoveryServer, body: &str, server_ip: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // ProbeMatches send retry (issue #22)
+    // ------------------------------------------------------------------
+
+    fn io_err() -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "transient",
+        ))
+    }
+
+    #[tokio::test]
+    async fn retry_send_recovers_from_transient_failures() {
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        let sent = retry_send(
+            || {
+                let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        io_err()
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            &mut shutdown,
+        )
+        .await;
+
+        assert!(sent, "the third attempt succeeds");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            DISCOVERY_SEND_ATTEMPTS.min(3),
+            "exactly three attempts were made"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_send_gives_up_after_all_attempts() {
+        let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        let sent = retry_send(
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { io_err() }
+            },
+            &mut shutdown,
+        )
+        .await;
+
+        assert!(!sent, "a permanently failing send drops the answer");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            DISCOVERY_SEND_ATTEMPTS,
+            "bounded attempts, no infinite retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_send_shutdown_interrupts_the_backoff() {
+        let (tx, mut shutdown) = tokio::sync::watch::channel(false);
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+
+        // Phase 1 (no shutdown): the always-failing send exhausts its
+        // bounded attempts.
+        let sent = retry_send(
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { io_err() }
+            },
+            &mut shutdown,
+        )
+        .await;
+
+        assert!(!sent, "without shutdown the bounded sequence exhausts");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            DISCOVERY_SEND_ATTEMPTS
+        );
+
+        // Phase 2 (shutdown): the very first check aborts — no retries.
+        tx.send(true).unwrap();
+        let sent_down = retry_send(
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { io_err() }
+            },
+            &mut shutdown,
+        )
+        .await;
+
+        assert!(!sent_down, "a shut-down responder sends nothing");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            DISCOVERY_SEND_ATTEMPTS,
+            "a shut-down responder attempts no send at all"
+        );
+    }
 
     // ------------------------------------------------------------------
     // probe parsing

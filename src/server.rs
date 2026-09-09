@@ -137,7 +137,7 @@ pub trait OnvifActionHandler: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Result of parsing an incoming SOAP 1.2 request.
-pub(crate) struct ParsedSoap {
+pub struct ParsedSoap {
     pub action: String,
     pub body_xml: String,
     pub username_token: Option<UsernameToken>,
@@ -677,7 +677,10 @@ async fn write_http_response(
 /// optional WS-UsernameToken.
 ///
 /// Uses `quick_xml::Reader` as a streaming XML state machine.
-pub(crate) fn parse_soap_request(xml: &str) -> Result<ParsedSoap, OnvifError> {
+/// Parses a raw SOAP 1.2 request envelope into action, body XML, and the
+/// WS-Security UsernameToken when present. Public so hosts can pre-inspect
+/// requests (and so the parse hot path is benchable).
+pub fn parse_soap_request(xml: &str) -> Result<ParsedSoap, OnvifError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 

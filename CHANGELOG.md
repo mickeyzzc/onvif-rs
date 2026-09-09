@@ -11,6 +11,15 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(discovery)` ProbeMatches sends retry with exponential backoff
+  (#22): a unicast UDP reply can hit a transient full send buffer under
+  burst load; up to 3 attempts with a doubling 10ms base backoff,
+  interruptible by shutdown, replace the single-shot send.
+- `bench` criterion suite for the SOAP hot paths (#22):
+  parse (plain + UsernameToken envelopes) and auth verification
+  (plaintext vs digest). `parse_soap_request`/`ParsedSoap` are now
+  public so hosts can pre-inspect requests.
+
 - **Changed (breaking)** `DeviceConfig` defaults are neutral placeholders
   (`ONVIF Device` / `unknown` / `unknown`) — the origin-hardware values
   (`Pi Camera V1` / `Raspberry Pi` / `OV5647`) are gone. New
