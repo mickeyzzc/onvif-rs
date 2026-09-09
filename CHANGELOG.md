@@ -11,6 +11,8 @@ are released out of band.
 
 ## [Unreleased]
 
+## [v0.6.0] — 2026-09-09
+
 - `feat(discovery)` ProbeMatches sends retry with exponential backoff
   (#22): a unicast UDP reply can hit a transient full send buffer under
   burst load; up to 3 attempts with a doubling 10ms base backoff,
