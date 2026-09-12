@@ -5,10 +5,13 @@
 //! the index had also drifted into mixing languages in one table. These
 //! tests fail the build instead:
 //!
-//! - every relative markdown link in the READMEs and `docs/` guides must
-//!   resolve to an existing file;
+//! - every relative markdown link in the READMEs and the `docs/` redirect
+//!   page must resolve to an existing file;
+//! - `docs/` holds exactly one redirect page pointing at the MiBee
+//!   documentation hub (mibee-docs#6, single source of truth) — manuals
+//!   cannot drift back into this repository;
 //! - the English README must not link Chinese guides (`docs/zh/`) and the
-//!   Chinese README must not link English guides (`docs/en/`).
+//!   Chinese README must not link English guides (`docs/en/).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -91,8 +94,8 @@ fn markdown_links_resolve() {
         }
     }
     assert!(
-        checked >= 20,
-        "expected to check a meaningful number of links, checked {checked}"
+        checked >= 3,
+        "expected a meaningful number of links, checked {checked}"
     );
     assert!(
         broken.is_empty(),
@@ -122,4 +125,27 @@ fn readme_indexes_stay_single_language() {
              each language's index must reference only its own guides"
         );
     }
+}
+
+/// Pins the post-migration contract (mibee-docs#6): `docs/` is exactly one
+/// redirect page linking the documentation hub.
+#[test]
+fn docs_is_single_redirect_page() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut entries: Vec<_> = fs::read_dir(root.join("docs"))
+        .expect("read docs/")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec!["README.md".to_string()],
+        "docs/ must contain only the redirect README.md"
+    );
+    let raw = fs::read_to_string(root.join("docs/README.md")).expect("read docs/README.md");
+    assert!(
+        raw.contains("https://www.mlsbs.top/docs/mibeelibs"),
+        "docs/README.md must link the documentation hub"
+    );
 }
