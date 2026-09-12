@@ -117,18 +117,13 @@ See [`examples/device_demo.rs`](examples/device_demo.rs) for the complete wiring
 
 ## Documentation
 
-Topic guides live under [`docs/en/`](docs/en/) — each has a Chinese counterpart under `docs/zh/`:
+Topic guides now live in the MiBee documentation hub — the single
+source of truth for library manuals, bilingual:
 
-| Guide | Covers |
-|---|---|
-| [Configuration](docs/en/configuration.md) | `OnvifConfig` fields, fail-closed credentials, `DeviceConfig` identity, `start_on` |
-| [Action handlers](docs/en/handlers.md) | local-name routing, `RequestInfo`, anonymous actions, custom handlers |
-| [Media service](docs/en/media.md) | `OnvifMediaConfig` field by field, tokens, snapshot honesty switch, byte stability |
-| [Imaging](docs/en/imaging.md) | the `ImagingParams` seam, error→fault mapping, normalized values |
-| [PTZ](docs/en/ptz.md) | `PtzState` API, motion simulation, wiring all eleven actions |
-| [Discovery](docs/en/discovery.md) | UDP + HTTP probe paths, identity/scopes, per-interface XAddrs |
-| [Security](docs/en/security.md) | UsernameToken modes, fail-closed config, body/read limits |
+> **https://www.mlsbs.top/docs/mibeelibs**
 
+Manual changes go there by PR (review flow in the hub repo's GOVERNANCE).
+[`docs/README.md`](docs/README.md) keeps the redirect.
 ## Library hygiene (v0.3.0 hardening)
 
 v0.3.0 made the crate safe to embed as a neutral foundation library. The regression tests in [`tests/library_hygiene.rs`](tests/library_hygiene.rs) and [`tests/server_lifecycle.rs`](tests/server_lifecycle.rs) pin each guarantee:

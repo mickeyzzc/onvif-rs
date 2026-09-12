@@ -116,18 +116,11 @@ async fn main() -> anyhow::Result<()> {
 
 ## 文档
 
-专题教程在 [`docs/zh/`](docs/zh/) —— 每篇在 `docs/en/` 下有英文对照版：
+专题手册已迁移至 MiBee 文档中心——库手册唯一真源（双语）：
 
-| 教程 | 内容 |
-|---|---|
-| [配置](docs/zh/configuration.md) | `OnvifConfig` 字段、fail-closed 凭证、`DeviceConfig` 身份、`start_on` |
-| [动作 handler](docs/zh/handlers.md) | 局部名路由、`RequestInfo`、匿名动作、自定义 handler |
-| [媒体服务](docs/zh/media.md) | `OnvifMediaConfig` 逐字段、token、快照诚实开关、字节稳定 |
-| [成像](docs/zh/imaging.md) | `ImagingParams` 接缝、错误→fault 映射、归一化取值 |
-| [虚拟云台](docs/zh/ptz.md) | `PtzState` API、运动模拟、十一个动作接线 |
-| [设备发现](docs/zh/discovery.md) | UDP + HTTP 双探测路径、身份/scope、按网卡回显 XAddrs |
-| [安全](docs/zh/security.md) | UsernameToken 双模式、fail-closed 配置、请求体/读超时限制 |
+> **https://www.mlsbs.top/docs/mibeelibs**
 
+手册修改向文档中心提 PR（流程见该仓 GOVERNANCE）。本仓 [`docs/README.md`](docs/README.md) 保留引导页。
 ## 库卫生（v0.3.0 加固）
 
 v0.3.0 把本 crate 打磨为可放心嵌入的中性基础库。[`tests/library_hygiene.rs`](tests/library_hygiene.rs) 与 [`tests/server_lifecycle.rs`](tests/server_lifecycle.rs) 中的回归测试逐条锁定以下保证：
