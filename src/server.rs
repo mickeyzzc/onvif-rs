@@ -706,110 +706,30 @@ pub fn parse_soap_request(xml: &str) -> Result<ParsedSoap, OnvifError> {
     }
 
     let mut st = ParseState::default();
+    let mut text_acc = crate::types::TextAccumulator::new();
 
     loop {
         let event = reader.read_event_into(&mut buf);
         match event {
-            Ok(Event::Start(e)) => {
-                let name_bytes = e.name().as_ref().to_owned();
-                let qname = str::from_utf8(&name_bytes).unwrap_or("");
-                let local = qname.rsplit(':').next().unwrap_or(qname);
-
-                match local {
-                    "Header" => st.in_header = true,
-                    "Security" if st.in_header => st.in_security = true,
-                    "UsernameToken" if st.in_security => st.in_ut = true,
-                    "Body" => {
-                        st.in_body = true;
-                        st.body_writer = Some(quick_xml::Writer::new(Vec::new()));
-                    }
-                    _ => {
-                        if st.in_ut && st.current_field.is_empty() {
-                            st.current_field = local.to_string();
-                        }
-                        if st.in_body && st.action.is_empty() {
-                            st.action = local.to_string();
-                            // Write the action element to the body writer
-                            if let Some(ref mut w) = st.body_writer {
-                                let _ = w.write_event(Event::Start(e.clone()));
-                            }
-                        } else if st.in_body {
-                            if let Some(ref mut w) = st.body_writer {
-                                let _ = w.write_event(Event::Start(e.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            Ok(Event::Empty(e)) => {
-                let name_bytes = e.name().as_ref().to_owned();
-                let qname = str::from_utf8(&name_bytes).unwrap_or("");
-                let local = qname.rsplit(':').next().unwrap_or(qname);
-
-                // Self-closing structural elements do not change parse state.
-                // They are handled in the _ branch (writing to body_writer if inside Body).
-                match local {
-                    "Header" | "Security" | "UsernameToken" | "Body" => {}
-                    _ => {
-                        if st.in_ut && st.current_field.is_empty() {
-                            st.current_field = local.to_string();
-                        }
-                        if st.in_body && st.action.is_empty() {
-                            st.action = local.to_string();
-                            if let Some(ref mut w) = st.body_writer {
-                                let _ = w.write_event(Event::Empty(e.clone()));
-                            }
-                        } else if st.in_body {
-                            if let Some(ref mut w) = st.body_writer {
-                                let _ = w.write_event(Event::Empty(e.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            Ok(Event::End(e)) => {
-                let name_bytes = e.name().as_ref().to_owned();
-                let qname = str::from_utf8(&name_bytes).unwrap_or("");
-                let local = qname.rsplit(':').next().unwrap_or(qname);
-
-                // The Body's own close tag terminates body_xml — do not copy
-                // it in (its opening twin was never written, so appending it
-                // would leave a dangling close tag for strict downstream
-                // parsers like imaging's SetImagingSettings).
-                if local == "Body" && st.in_body {
-                    st.in_body = false;
-                    st.body_xml = st
-                        .body_writer
-                        .take()
-                        .map(|w| String::from_utf8(w.into_inner()).unwrap_or_default())
-                        .unwrap_or_default();
-                } else if st.in_body {
-                    if let Some(ref mut w) = st.body_writer {
-                        let _ = w.write_event(Event::End(e.clone()));
-                    }
-                }
-
-                match local {
-                    "Header" => st.in_header = false,
-                    "Security" => st.in_security = false,
-                    "UsernameToken" => {
-                        st.in_ut = false;
-                        st.current_field.clear();
-                    }
-                    _ => {
-                        if st.in_ut {
-                            st.current_field.clear();
-                        }
-                    }
-                }
-            }
-
             Ok(Event::Text(e)) => {
-                if let Ok(text) = e.unescape() {
-                    let text = text.as_ref().to_string();
-                    if st.in_ut {
+                if st.in_body {
+                    if let Some(ref mut w) = st.body_writer {
+                        let _ = w.write_event(Event::Text(e.clone()));
+                    }
+                }
+                let _ = text_acc.push_text(&e);
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if st.in_body {
+                    if let Some(ref mut w) = st.body_writer {
+                        let _ = w.write_event(Event::GeneralRef(e.clone()));
+                    }
+                }
+                let _ = text_acc.push_ref(&e);
+            }
+            other => {
+                if let Some(text) = text_acc.flush() {
+                    if st.in_ut && !text.is_empty() {
                         match st.current_field.as_str() {
                             "Username" => st.ut_username = text,
                             "Password" => st.ut_password = text,
@@ -818,29 +738,121 @@ pub fn parse_soap_request(xml: &str) -> Result<ParsedSoap, OnvifError> {
                             _ => {}
                         }
                     }
-                    if st.in_body {
-                        if let Some(ref mut w) = st.body_writer {
-                            let _ = w.write_event(Event::Text(e.clone()));
+                }
+                match other {
+                    Ok(Event::Start(e)) => {
+                        let name_bytes = e.name().as_ref().to_owned();
+                        let qname = str::from_utf8(&name_bytes).unwrap_or("");
+                        let local = qname.rsplit(':').next().unwrap_or(qname);
+
+                        match local {
+                            "Header" => st.in_header = true,
+                            "Security" if st.in_header => st.in_security = true,
+                            "UsernameToken" if st.in_security => st.in_ut = true,
+                            "Body" => {
+                                st.in_body = true;
+                                st.body_writer = Some(quick_xml::Writer::new(Vec::new()));
+                            }
+                            _ => {
+                                if st.in_ut && st.current_field.is_empty() {
+                                    st.current_field = local.to_string();
+                                }
+                                if st.in_body && st.action.is_empty() {
+                                    st.action = local.to_string();
+                                    // Write the action element to the body writer
+                                    if let Some(ref mut w) = st.body_writer {
+                                        let _ = w.write_event(Event::Start(e.clone()));
+                                    }
+                                } else if st.in_body {
+                                    if let Some(ref mut w) = st.body_writer {
+                                        let _ = w.write_event(Event::Start(e.clone()));
+                                    }
+                                }
+                            }
                         }
                     }
-                }
-            }
 
-            Ok(Event::CData(e)) => {
-                if st.in_body {
-                    if let Some(ref mut w) = st.body_writer {
-                        let _ = w.write_event(Event::CData(e.clone()));
+                    Ok(Event::Empty(e)) => {
+                        let name_bytes = e.name().as_ref().to_owned();
+                        let qname = str::from_utf8(&name_bytes).unwrap_or("");
+                        let local = qname.rsplit(':').next().unwrap_or(qname);
+
+                        // Self-closing structural elements do not change parse state.
+                        // They are handled in the _ branch (writing to body_writer if inside Body).
+                        match local {
+                            "Header" | "Security" | "UsernameToken" | "Body" => {}
+                            _ => {
+                                if st.in_ut && st.current_field.is_empty() {
+                                    st.current_field = local.to_string();
+                                }
+                                if st.in_body && st.action.is_empty() {
+                                    st.action = local.to_string();
+                                    if let Some(ref mut w) = st.body_writer {
+                                        let _ = w.write_event(Event::Empty(e.clone()));
+                                    }
+                                } else if st.in_body {
+                                    if let Some(ref mut w) = st.body_writer {
+                                        let _ = w.write_event(Event::Empty(e.clone()));
+                                    }
+                                }
+                            }
+                        }
                     }
+
+                    Ok(Event::End(e)) => {
+                        let name_bytes = e.name().as_ref().to_owned();
+                        let qname = str::from_utf8(&name_bytes).unwrap_or("");
+                        let local = qname.rsplit(':').next().unwrap_or(qname);
+
+                        // The Body's own close tag terminates body_xml — do not copy
+                        // it in (its opening twin was never written, so appending it
+                        // would leave a dangling close tag for strict downstream
+                        // parsers like imaging's SetImagingSettings).
+                        if local == "Body" && st.in_body {
+                            st.in_body = false;
+                            st.body_xml = st
+                                .body_writer
+                                .take()
+                                .map(|w| String::from_utf8(w.into_inner()).unwrap_or_default())
+                                .unwrap_or_default();
+                        } else if st.in_body {
+                            if let Some(ref mut w) = st.body_writer {
+                                let _ = w.write_event(Event::End(e.clone()));
+                            }
+                        }
+
+                        match local {
+                            "Header" => st.in_header = false,
+                            "Security" => st.in_security = false,
+                            "UsernameToken" => {
+                                st.in_ut = false;
+                                st.current_field.clear();
+                            }
+                            _ => {
+                                if st.in_ut {
+                                    st.current_field.clear();
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(Event::CData(e)) => {
+                        if st.in_body {
+                            if let Some(ref mut w) = st.body_writer {
+                                let _ = w.write_event(Event::CData(e.clone()));
+                            }
+                        }
+                    }
+
+                    Ok(Event::Eof) => break,
+
+                    Err(e) => {
+                        return Err(OnvifError::InvalidXml(format!("XML parse error: {e}")));
+                    }
+
+                    _ => {}
                 }
             }
-
-            Ok(Event::Eof) => break,
-
-            Err(e) => {
-                return Err(OnvifError::InvalidXml(format!("XML parse error: {e}")));
-            }
-
-            _ => {}
         }
         buf.clear();
     }

@@ -399,6 +399,7 @@ fn parse_settings(body: &str) -> Result<ParsedSettings, String> {
     }
 
     let mut st = State::default();
+    let mut text_acc = crate::types::TextAccumulator::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -430,43 +431,57 @@ fn parse_settings(body: &str) -> Result<ParsedSettings, String> {
                     }
                 }
             }
-            Ok(Event::Text(e)) => match e.unescape() {
-                Ok(text) => {
-                    if st.in_exposure && !st.text_field.is_empty() {
-                        match st.text_field.as_str() {
-                            "Mode" => {
-                                result.exposure_mode = Some(text.as_ref().to_string());
-                            }
-                            "ExposureTime" => {
-                                if let Ok(v) = text.as_ref().parse::<f64>() {
-                                    result.exposure_time = Some(v);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Err(e) => return Err(format!("XML unescape error: {e}")),
-            },
-            Ok(Event::End(e)) => {
-                let elem_name = e.name();
-                let local = local_name(elem_name.as_ref());
-                match local {
-                    "Settings" => st.in_settings = false,
-                    "Exposure" => {
-                        st.in_exposure = false;
-                        st.text_field.clear();
-                    }
-                    _ => {
-                        if st.in_exposure {
-                            st.text_field.clear();
-                        }
-                    }
+            Ok(Event::Text(e)) => {
+                if let Err(err) = text_acc.push_text(&e) {
+                    return Err(format!("XML unescape error: {err}"));
                 }
             }
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(format!("XML parse error: {e}")),
-            _ => {}
+            Ok(Event::GeneralRef(e)) => {
+                if let Err(err) = text_acc.push_ref(&e) {
+                    return Err(format!("XML unescape error: {err}"));
+                }
+            }
+            other => {
+                match text_acc.flush() {
+                    Some(region_text) => {
+                        if !region_text.is_empty() && st.in_exposure && !st.text_field.is_empty() {
+                            match st.text_field.as_str() {
+                                "Mode" => {
+                                    result.exposure_mode = Some(region_text);
+                                }
+                                "ExposureTime" => {
+                                    if let Ok(v) = region_text.parse::<f64>() {
+                                        result.exposure_time = Some(v);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    None => return Err("XML unescape error".to_string()),
+                }
+                match other {
+                    Ok(Event::End(e)) => {
+                        let elem_name = e.name();
+                        let local = local_name(elem_name.as_ref());
+                        match local {
+                            "Settings" => st.in_settings = false,
+                            "Exposure" => {
+                                st.in_exposure = false;
+                                st.text_field.clear();
+                            }
+                            _ => {
+                                if st.in_exposure {
+                                    st.text_field.clear();
+                                }
+                            }
+                        }
+                    }
+                    Ok(Event::Eof) => break,
+                    Err(e) => return Err(format!("XML parse error: {e}")),
+                    _ => {}
+                }
+            }
         }
         buf.clear();
     }
