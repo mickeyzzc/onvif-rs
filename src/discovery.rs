@@ -172,53 +172,62 @@ fn parse_probe(msg: &[u8]) -> Option<String> {
     let mut action = String::new();
     let mut message_id = String::new();
     let mut current_field = String::new();
+    let mut text_acc = crate::types::TextAccumulator::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let name_bytes = e.name();
-                let name = std::str::from_utf8(name_bytes.as_ref()).ok()?;
-                let local = name.rsplit(':').next().unwrap_or(name);
-                match local {
-                    "Header" => in_header = true,
-                    "Action" if in_header => current_field = "Action".to_string(),
-                    "MessageID" if in_header => current_field = "MessageID".to_string(),
-                    "Body" => in_header = false,
-                    _ => {}
-                }
-            }
-            Ok(Event::Empty(e)) => {
-                let name_bytes = e.name();
-                let name = std::str::from_utf8(name_bytes.as_ref()).ok()?;
-                let local = name.rsplit(':').next().unwrap_or(name);
-                if local == "Body" {
-                    in_header = false;
-                }
-            }
             Ok(Event::Text(e)) => {
-                if let Ok(text) = e.unescape() {
-                    if in_header {
+                let _ = text_acc.push_text(&e);
+            }
+            Ok(Event::GeneralRef(e)) => {
+                let _ = text_acc.push_ref(&e);
+            }
+            other => {
+                if let Some(text) = text_acc.flush() {
+                    if in_header && !text.is_empty() {
                         match current_field.as_str() {
-                            "Action" => action = text.to_string(),
-                            "MessageID" => message_id = text.to_string(),
+                            "Action" => action = text,
+                            "MessageID" => message_id = text,
                             _ => {}
                         }
                     }
                 }
-            }
-            Ok(Event::End(e)) => {
-                let name_bytes = e.name();
-                let name = std::str::from_utf8(name_bytes.as_ref()).ok()?;
-                let local = name.rsplit(':').next().unwrap_or(name);
-                match local {
-                    "Header" => in_header = false,
-                    "Action" | "MessageID" => current_field.clear(),
+                match other {
+                    Ok(Event::Start(e)) => {
+                        let name_bytes = e.name();
+                        let name = std::str::from_utf8(name_bytes.as_ref()).ok()?;
+                        let local = name.rsplit(':').next().unwrap_or(name);
+                        match local {
+                            "Header" => in_header = true,
+                            "Action" if in_header => current_field = "Action".to_string(),
+                            "MessageID" if in_header => current_field = "MessageID".to_string(),
+                            "Body" => in_header = false,
+                            _ => {}
+                        }
+                    }
+                    Ok(Event::Empty(e)) => {
+                        let name_bytes = e.name();
+                        let name = std::str::from_utf8(name_bytes.as_ref()).ok()?;
+                        let local = name.rsplit(':').next().unwrap_or(name);
+                        if local == "Body" {
+                            in_header = false;
+                        }
+                    }
+                    Ok(Event::End(e)) => {
+                        let name_bytes = e.name();
+                        let name = std::str::from_utf8(name_bytes.as_ref()).ok()?;
+                        let local = name.rsplit(':').next().unwrap_or(name);
+                        match local {
+                            "Header" => in_header = false,
+                            "Action" | "MessageID" => current_field.clear(),
+                            _ => {}
+                        }
+                    }
+                    Ok(Event::Eof) => break,
+                    Err(_) => return None,
                     _ => {}
                 }
             }
-            Ok(Event::Eof) => break,
-            Err(_) => return None,
-            _ => {}
         }
         buf.clear();
     }

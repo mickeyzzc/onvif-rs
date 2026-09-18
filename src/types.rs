@@ -13,6 +13,70 @@ pub(crate) fn xml_escape(text: &str) -> std::borrow::Cow<'_, str> {
     quick_xml::escape::escape(text)
 }
 
+/// Accumulates the fragments of one contiguous text region.
+///
+/// quick-xml 0.41 delivers text content as alternating `Event::Text` (literal
+/// chunks) and `Event::GeneralRef` (entity references) events; an element's
+/// text value is the concatenation with entities resolved — what the pre-0.41
+/// `BytesText::unescape` produced for the whole region. Feed both event kinds,
+/// then [`TextAccumulator::flush`] on the next non-text event. A region that
+/// contained an unresolvable entity flushes to `None` (poisoned).
+#[derive(Default)]
+pub(crate) struct TextAccumulator {
+    buf: String,
+    poisoned: bool,
+}
+
+impl TextAccumulator {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a literal chunk (`Event::Text`).
+    pub(crate) fn push_text(&mut self, e: &BytesText<'_>) -> Result<(), quick_xml::Error> {
+        if self.poisoned {
+            return Ok(());
+        }
+        self.buf
+            .push_str(&e.decode().map_err(quick_xml::Error::from)?);
+        Ok(())
+    }
+
+    /// Resolve and append one entity reference (`Event::GeneralRef`).
+    pub(crate) fn push_ref(
+        &mut self,
+        r: &quick_xml::events::BytesRef<'_>,
+    ) -> Result<(), quick_xml::Error> {
+        if self.poisoned {
+            return Ok(());
+        }
+        if let Some(ch) = r.resolve_char_ref()? {
+            self.buf.push(ch);
+            return Ok(());
+        }
+        match quick_xml::escape::resolve_predefined_entity(&r.decode()?) {
+            Some(text) => self.buf.push_str(text),
+            None => {
+                self.poisoned = true;
+                self.buf.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume the region: `Some(text)` when every fragment resolved,
+    /// `None` when an entity in the region was unresolvable.
+    pub(crate) fn flush(&mut self) -> Option<String> {
+        let poisoned = self.poisoned;
+        self.poisoned = false;
+        if poisoned {
+            None
+        } else {
+            Some(std::mem::take(&mut self.buf))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SOAP data types
 // ---------------------------------------------------------------------------
@@ -241,6 +305,55 @@ fn write_tag_with_raw(writer: &mut Writer<Vec<u8>>, name: &str, raw: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_accumulator_reassembles_split_text_regions() {
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+        let read_text = |xml: &str| -> Option<String> {
+            let mut reader = Reader::from_str(xml);
+            let mut buf = Vec::new();
+            let mut acc = TextAccumulator::new();
+            loop {
+                match reader.read_event_into(&mut buf) {
+                    Ok(Event::Text(e)) => {
+                        let _ = acc.push_text(&e);
+                    }
+                    Ok(Event::GeneralRef(e)) => {
+                        let _ = acc.push_ref(&e);
+                    }
+                    Ok(Event::End(_)) | Ok(Event::Eof) => return acc.flush(),
+                    Err(_) => return None,
+                    _ => {}
+                }
+                buf.clear();
+            }
+        };
+        assert_eq!(
+            read_text("<x>a&gt;b</x>").as_deref(),
+            Some("a>b"),
+            "split Text/GeneralRef chunks must reassemble with entities resolved"
+        );
+        assert_eq!(
+            read_text("<x>&amp;x</x>").as_deref(),
+            Some("&x"),
+            "predefined entity alone must resolve"
+        );
+        assert_eq!(
+            read_text("<x>a&#38;b</x>").as_deref(),
+            Some("a&b"),
+            "numeric character references must resolve"
+        );
+        assert_eq!(
+            read_text("<x></x>").as_deref(),
+            Some(""),
+            "empty region must stay valid"
+        );
+        assert!(
+            read_text("<x>&some;</x>").is_none(),
+            "undefined entity must poison the region"
+        );
+    }
 
     #[test]
     fn test_serialize_soap_response_includes_envelope() {
