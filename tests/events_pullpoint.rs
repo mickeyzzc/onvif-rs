@@ -134,11 +134,19 @@ fn test_device_config() -> DeviceConfig {
 /// Start a server with the events service (and the device service, for
 /// advertisement checks) on an ephemeral port; returns the port, the
 /// events publish seam, and the handle.
-async fn events_server() -> (u16, Arc<onvif_device_rs::events::EventsService>, OnvifServerHandle) {
+async fn events_server() -> (
+    u16,
+    Arc<onvif_device_rs::events::EventsService>,
+    OnvifServerHandle,
+) {
     let mut server = OnvifServer::new(&base_config(true));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
 
     let device = Arc::new(
-        DeviceServiceHandlers::new(test_device_config(), 0, "127.0.0.1".to_string())
+        DeviceServiceHandlers::new(test_device_config(), port, "127.0.0.1".to_string())
             .expect("valid identity")
             .with_events_support(true),
     );
@@ -154,8 +162,6 @@ async fn events_server() -> (u16, Arc<onvif_device_rs::events::EventsService>, O
     }
 
     let events = server.enable_events();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("addr").port();
     let handle = server.start_on(listener).await.expect("start");
     (port, events, handle)
 }
@@ -171,7 +177,10 @@ async fn subscribe(port: u16, termination: &str) -> String {
     let (status, body) = post_soap(port, EVENTS_SERVICE_PATH, &body, true).await;
     assert_eq!(status, 200, "create ({termination}) failed:\n{body}");
     let address = xml_field(&body, "wsa:Address");
-    assert!(!address.is_empty(), "no SubscriptionReference address:\n{body}");
+    assert!(
+        !address.is_empty(),
+        "no SubscriptionReference address:\n{body}"
+    );
     let id = address.rsplit('/').next().expect("id segment");
     format!("/onvif/events_service/sub/{id}")
 }
@@ -205,10 +214,9 @@ async fn golden_get_service_capabilities_over_the_wire() {
 
     let want = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <soap:Envelope xmlns:soap=\"http://www.w3.org/2003/05/soap-envelope\">\n  \
-<soap:Header></soap:Header>\n  \
-<soap:Body>\n    \
-<tev:GetServiceCapabilitiesResponse xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\">\n      \
-<tev:Capabilities WSPullPointSupport=\"true\" MaxPullPoints=\"10\"></tev:Capabilities>\n    \
+<soap:Header>\n  </soap:Header>\n  \
+<soap:Body><tev:GetServiceCapabilitiesResponse xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\">\n  \
+<tev:Capabilities WSPullPointSupport=\"true\" MaxPullPoints=\"10\"></tev:Capabilities>\n\
 </tev:GetServiceCapabilitiesResponse>\n  \
 </soap:Body>\n\
 </soap:Envelope>";
@@ -236,16 +244,15 @@ async fn golden_get_event_properties_over_the_wire() {
 
     let want = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <soap:Envelope xmlns:soap=\"http://www.w3.org/2003/05/soap-envelope\">\n  \
-<soap:Header></soap:Header>\n  \
-<soap:Body>\n    \
-<tev:GetEventPropertiesResponse xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\" xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\" xmlns:wstop=\"http://docs.oasis-open.org/wsn/t-1\">\n      \
-<tev:TopicNamespaceLocation>http://www.onvif.org/ver10/tev/topicns.xml</tev:TopicNamespaceLocation>\n      \
-<wsnt:FixedTopicSet>true</wsnt:FixedTopicSet>\n      \
-<wstop:TopicSet></wstop:TopicSet>\n      \
-<wsnt:TopicExpressionDialect>http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete</wsnt:TopicExpressionDialect>\n      \
-<wsnt:TopicExpressionDialect>http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet</wsnt:TopicExpressionDialect>\n      \
-<wsnt:MessageContentFilterDialect></wsnt:MessageContentFilterDialect>\n      \
-<tev:MessageContentSchemaLocation>http://www.onvif.org/ver10/schema/onvif.xsd</tev:MessageContentSchemaLocation>\n    \
+<soap:Header>\n  </soap:Header>\n  \
+<soap:Body><tev:GetEventPropertiesResponse xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\" xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\" xmlns:wstop=\"http://docs.oasis-open.org/wsn/t-1\">\n  \
+<tev:TopicNamespaceLocation>http://www.onvif.org/ver10/tev/topicns.xml</tev:TopicNamespaceLocation>\n  \
+<wsnt:FixedTopicSet>true</wsnt:FixedTopicSet>\n  \
+<wstop:TopicSet></wstop:TopicSet>\n  \
+<wsnt:TopicExpressionDialect>http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete</wsnt:TopicExpressionDialect>\n  \
+<wsnt:TopicExpressionDialect>http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet</wsnt:TopicExpressionDialect>\n  \
+<wsnt:MessageContentFilterDialect></wsnt:MessageContentFilterDialect>\n  \
+<tev:MessageContentSchemaLocation>http://www.onvif.org/ver10/schema/onvif.xsd</tev:MessageContentSchemaLocation>\n\
 </tev:GetEventPropertiesResponse>\n  \
 </soap:Body>\n\
 </soap:Envelope>";
@@ -297,7 +304,10 @@ async fn full_lifecycle_create_publish_pull_renew_unsubscribe() {
     events.publish_event(Event {
         topic: "tns1:VideoSource/MotionAlarm".into(),
         source: vec![SimpleItem::new("Source", "CSI")],
-        data: vec![SimpleItem::new("State", "true"), SimpleItem::new("Score", "87")],
+        data: vec![
+            SimpleItem::new("State", "true"),
+            SimpleItem::new("Score", "87"),
+        ],
         ..Event::new("tns1:VideoSource/MotionAlarm")
     });
 
@@ -308,7 +318,10 @@ async fn full_lifecycle_create_publish_pull_renew_unsubscribe() {
     // Canonical double-layer payload (issue-shape pinned by the Go twin):
     // wsnt:NotificationMessage > wsnt:Topic + wsnt:Message > tt:Message.
     assert_eq!(body.matches("<wsnt:NotificationMessage>").count(), 1);
-    assert_eq!(xml_field(&body, "wsnt:Topic"), "tns1:VideoSource/MotionAlarm");
+    assert_eq!(
+        xml_field(&body, "wsnt:Topic"),
+        "tns1:VideoSource/MotionAlarm"
+    );
     assert!(
         xml_field(&body, "wsa:Address").starts_with("http://127.0.0.1:"),
         "ProducerReference address missing: {}",
@@ -323,10 +336,24 @@ async fn full_lifecycle_create_publish_pull_renew_unsubscribe() {
         tt_message.contains("PropertyOperation=\"Changed\""),
         "default PropertyOperation missing:\n{tt_message}"
     );
-    assert!(tt_message.contains("UtcTime=\""), "UtcTime attribute missing");
-    let source = tt_message.split("<tt:Source>").nth(1).and_then(|r| r.split("</tt:Source>").next()).unwrap_or_default();
-    assert!(source.contains("<tt:SimpleItem Name=\"Source\" Value=\"CSI\"/>"), "Source SimpleItems:\n{source}");
-    let data = tt_message.split("<tt:Data>").nth(1).and_then(|r| r.split("</tt:Data>").next()).unwrap_or_default();
+    assert!(
+        tt_message.contains("UtcTime=\""),
+        "UtcTime attribute missing"
+    );
+    let source = tt_message
+        .split("<tt:Source>")
+        .nth(1)
+        .and_then(|r| r.split("</tt:Source>").next())
+        .unwrap_or_default();
+    assert!(
+        source.contains("<tt:SimpleItem Name=\"Source\" Value=\"CSI\"/>"),
+        "Source SimpleItems:\n{source}"
+    );
+    let data = tt_message
+        .split("<tt:Data>")
+        .nth(1)
+        .and_then(|r| r.split("</tt:Data>").next())
+        .unwrap_or_default();
     assert!(
         data.contains("<tt:SimpleItem Name=\"State\" Value=\"true\"/>")
             && data.contains("<tt:SimpleItem Name=\"Score\" Value=\"87\"/>"),
@@ -388,7 +415,10 @@ async fn pull_messages_long_poll_waits() {
     let (status, body) = pull(port, &sub, "PT1S", 5).await;
     let elapsed = started.elapsed();
     assert_eq!(status, 200);
-    assert!(elapsed >= Duration::from_millis(900), "returned after {elapsed:?}");
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "returned after {elapsed:?}"
+    );
     assert_eq!(body.matches("<wsnt:NotificationMessage>").count(), 0);
 
     handle.shutdown().await.expect("shutdown");
@@ -411,7 +441,10 @@ async fn max_pull_points_enforced_over_the_wire() {
     )
     .await;
     assert_eq!(status, 400, "beyond cap:\n{body}");
-    assert!(body.contains("soap:Sender"), "cap exceeded must fault as Sender:\n{body}");
+    assert!(
+        body.contains("soap:Sender"),
+        "cap exceeded must fault as Sender:\n{body}"
+    );
 
     handle.shutdown().await.expect("shutdown");
 }
@@ -437,9 +470,18 @@ async fn expired_subscription_rejected_over_the_wire() {
 async fn unknown_subscription_is_sender_fault() {
     let (port, _events, mut handle) = events_server().await;
 
-    let (status, body) = pull(port, "/onvif/events_service/sub/deadbeefdeadbeef", "PT0S", 5).await;
+    let (status, body) = pull(
+        port,
+        "/onvif/events_service/sub/deadbeefdeadbeef",
+        "PT0S",
+        5,
+    )
+    .await;
     assert_eq!(status, 400, "unknown subscription:\n{body}");
-    assert!(body.contains("soap:Sender"), "must fault as Sender:\n{body}");
+    assert!(
+        body.contains("soap:Sender"),
+        "must fault as Sender:\n{body}"
+    );
     assert!(body.contains("Unknown subscription"));
 
     handle.shutdown().await.expect("shutdown");
@@ -473,7 +515,10 @@ async fn topic_filtering_end_to_end() {
     )
     .await;
     assert_eq!(status, 200, "concrete subscribe:\n{body}");
-    let concrete = format!("/onvif/events_service/sub/{}", xml_field(&body, "wsa:Address").rsplit('/').next().unwrap());
+    let concrete = format!(
+        "/onvif/events_service/sub/{}",
+        xml_field(&body, "wsa:Address").rsplit('/').next().unwrap()
+    );
 
     let (status, body) = post_soap(
         port,
@@ -486,7 +531,10 @@ async fn topic_filtering_end_to_end() {
     )
     .await;
     assert_eq!(status, 200, "concreteset subscribe:\n{body}");
-    let wildcard = format!("/onvif/events_service/sub/{}", xml_field(&body, "wsa:Address").rsplit('/').next().unwrap());
+    let wildcard = format!(
+        "/onvif/events_service/sub/{}",
+        xml_field(&body, "wsa:Address").rsplit('/').next().unwrap()
+    );
 
     let unfiltered = subscribe(port, "PT10M").await;
 
@@ -495,14 +543,30 @@ async fn topic_filtering_end_to_end() {
     events.publish_event(Event::new("tns1:VideoAnalytics/LineDetector/Crossed"));
 
     let (_, body) = pull(port, &concrete, "PT0S", 10).await;
-    let topics: Vec<&str> = body.split("<wsnt:Topic>").skip(1).map(|r| r.split('<').next().unwrap_or("")).collect();
-    assert_eq!(topics, ["tns1:VideoSource/MotionAlarm"], "Concrete filter leaked");
+    let topics: Vec<&str> = body
+        .split("<wsnt:Topic>")
+        .skip(1)
+        .map(|r| r.split('<').next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        topics,
+        ["tns1:VideoSource/MotionAlarm"],
+        "Concrete filter leaked"
+    );
 
     let (_, body) = pull(port, &wildcard, "PT0S", 10).await;
-    assert_eq!(body.matches("<wsnt:NotificationMessage>").count(), 2, "ConcreteSet filter:\n{body}");
+    assert_eq!(
+        body.matches("<wsnt:NotificationMessage>").count(),
+        2,
+        "ConcreteSet filter:\n{body}"
+    );
 
     let (_, body) = pull(port, &unfiltered, "PT0S", 10).await;
-    assert_eq!(body.matches("<wsnt:NotificationMessage>").count(), 3, "unfiltered subscriber");
+    assert_eq!(
+        body.matches("<wsnt:NotificationMessage>").count(),
+        3,
+        "unfiltered subscriber"
+    );
 
     // Unsupported dialect faults instead of being silently ignored.
     let (status, _body) = post_soap(
@@ -588,8 +652,18 @@ async fn post_soap_bad_credentials(port: u16) -> u16 {
 #[tokio::test]
 async fn events_paths_404_when_disabled() {
     let mut server = OnvifServer::new(&base_config(false));
+    let device = Arc::new(
+        DeviceServiceHandlers::new(test_device_config(), 0, "127.0.0.1".to_string())
+            .expect("valid identity"),
+    );
     server.register_anonymous_action("GetSystemDateAndTime");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    server.register_handler(
+        "GetSystemDateAndTime",
+        Box::new(DeviceHandler(Arc::clone(&device))),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let mut handle = server.start_on(listener).await.expect("start");
 
@@ -657,7 +731,7 @@ async fn capabilities_and_services_advertise_events() {
         "Events capability block missing:\n{body}"
     );
     assert!(
-        body.contains("http://127.0.0.1:{port}/onvif/events_service"),
+        body.contains(&format!("http://127.0.0.1:{port}/onvif/events_service")),
         "Events XAddr missing:\n{body}"
     );
 
@@ -674,7 +748,7 @@ async fn capabilities_and_services_advertise_events() {
         "events namespace missing from GetServices:\n{body}"
     );
     assert!(
-        body.contains("http://127.0.0.1:{port}/onvif/events_service"),
+        body.contains(&format!("http://127.0.0.1:{port}/onvif/events_service")),
         "events XAddr missing from GetServices:\n{body}"
     );
 
@@ -694,7 +768,9 @@ async fn advertisement_absent_without_events_support() {
         server.register_anonymous_action(action);
         server.register_handler(action, Box::new(DeviceHandler(Arc::clone(&device))));
     }
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let mut handle = server.start_on(listener).await.expect("start");
 
@@ -705,7 +781,10 @@ async fn advertisement_absent_without_events_support() {
         false,
     )
     .await;
-    assert!(!caps.contains("tt:Events"), "Events advertised while unsupported:\n{caps}");
+    assert!(
+        !caps.contains("tt:Events"),
+        "Events advertised while unsupported:\n{caps}"
+    );
 
     let (_status, svcs) = post_soap(
         port,

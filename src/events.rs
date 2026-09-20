@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event as XmlEvent};
 use quick_xml::{Reader, Writer};
@@ -122,10 +122,61 @@ impl Event {
 /// Parse the ISO 8601 duration subset ONVIF uses on the wire (`PnDTnHnMnS`,
 /// `PT0S` included). Date-only forms are rejected — a lifetime without a
 /// time component is not meaningful for subscription terminations and pull
-/// timeouts (parity with onvif-go's `parseISO8601Duration`).
+/// timeouts (parity with onvif-go's `parseISO8601Duration`; arithmetic is
+/// checked so an absurd duration is rejected instead of overflowing).
 pub(crate) fn parse_iso8601_duration(s: &str) -> Option<Duration> {
-    let _ = s;
-    None // TODO(red): implement
+    const HOUR_SECS: u64 = 3600;
+    const MINUTE_SECS: u64 = 60;
+    const DAY_SECS: u64 = 24 * 3600;
+
+    let mut rest = s.strip_prefix('P')?;
+
+    let mut days: u64 = 0;
+    while !rest.is_empty() && !rest.starts_with('T') {
+        let (num, remainder) = scan_duration_number(rest)?;
+        rest = remainder;
+        if !rest.starts_with('D') {
+            return None;
+        }
+        days += num;
+        rest = &rest[1..];
+    }
+
+    if rest.is_empty() || rest.len() == 1 {
+        // No 'T' section: date-only ("P1D") or a bare "PT".
+        return None;
+    }
+    rest = &rest[1..]; // consume 'T'
+
+    let mut total = days.checked_mul(DAY_SECS)?;
+    while !rest.is_empty() {
+        let (num, remainder) = scan_duration_number(rest)?;
+        rest = remainder;
+        let unit_secs = match rest.as_bytes().first() {
+            Some(b'H') => HOUR_SECS,
+            Some(b'M') => MINUTE_SECS,
+            Some(b'S') => 1,
+            _ => return None,
+        };
+        total = total.checked_add(num.checked_mul(unit_secs)?)?;
+        rest = &rest[1..];
+    }
+
+    Some(Duration::from_secs(total))
+}
+
+/// Read a run of digits off the front of `s`, returning it with the
+/// remainder (parity with onvif-go's `scanDurationNumber`).
+fn scan_duration_number(s: &str) -> Option<(u64, &str)> {
+    let digits = s
+        .bytes()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(s.len());
+    if digits == 0 {
+        return None;
+    }
+    let num: u64 = s[..digits].parse().ok()?;
+    Some((num, &s[digits..]))
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +189,9 @@ pub(crate) fn parse_iso8601_duration(s: &str) -> Option<Duration> {
 /// advertises.
 #[derive(Debug, Clone)]
 struct TopicFilter {
+    /// Kept for parity with onvif-go's topicFilter (and future content
+    /// filters); matching itself is dialect-independent.
+    #[allow(dead_code)]
     dialect: String,
     expression: String,
 }
@@ -148,32 +202,68 @@ impl TopicFilter {
     /// local path segments (`"tns1:VideoSource/MotionAlarm"` matches
     /// `"VideoSource/MotionAlarm"` and any equivalent binding).
     fn matches(&self, topic: &str) -> bool {
-        let _ = topic;
-        false // TODO(red): implement
+        let topic_segs = topic_path_segments(topic);
+        self.expression
+            .split('|')
+            .any(|alternative| match_topic_path(&topic_path_segments(alternative), &topic_segs))
     }
 }
 
 /// Split a topic expression into local-name segments, stripping any
 /// namespace prefix from each segment.
 fn topic_path_segments(expr: &str) -> Vec<String> {
-    let _ = expr;
-    Vec::new() // TODO(red): implement
+    expr.trim()
+        .split('/')
+        .map(|seg| match seg.rsplit_once(':') {
+            Some((_, local)) => local,
+            None => seg,
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 /// Compare a filter path against a topic path; a `"*"` filter segment
 /// matches any single topic segment.
 fn match_topic_path(filter: &[String], topic: &[String]) -> bool {
-    let _ = (filter, topic);
-    false // TODO(red): implement
+    !filter.is_empty()
+        && filter.len() == topic.len()
+        && filter.iter().zip(topic).all(|(f, t)| f == "*" || f == t)
 }
 
 /// Validate the CreatePullPointSubscription filter. An absent filter means
 /// every topic is delivered; an empty dialect defaults to Concrete (the
 /// WS-BaseNotification default); unsupported dialects and empty expressions
 /// are Sender faults instead of being silently ignored.
-fn parse_topic_filter(expr: Option<&TopicExpressionRequest>) -> Result<Option<TopicFilter>, OnvifError> {
-    let _ = expr;
-    Err(OnvifError::Internal("not implemented".into())) // TODO(red): implement
+fn parse_topic_filter(
+    expr: Option<&TopicExpressionRequest>,
+) -> Result<Option<TopicFilter>, OnvifError> {
+    let Some(expr) = expr else {
+        return Ok(None);
+    };
+
+    let value = expr.value.trim().to_string();
+    let dialect = if expr.dialect.is_empty() {
+        DIALECT_CONCRETE.to_string()
+    } else {
+        expr.dialect.clone()
+    };
+
+    if dialect != DIALECT_CONCRETE && dialect != DIALECT_CONCRETE_SET {
+        return Err(OnvifError::SenderFault(format!(
+            "Unsupported TopicExpression dialect: got {dialect:?}, device supports the \
+             mandatory Concrete and ConcreteSet dialects"
+        )));
+    }
+    if value.is_empty() {
+        return Err(OnvifError::SenderFault(
+            "Invalid TopicExpression: filter topic expression must not be empty".to_string(),
+        ));
+    }
+
+    Ok(Some(TopicFilter {
+        dialect,
+        expression: value,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -199,8 +289,10 @@ struct QueuedMessage {
 
 /// One live pull-point subscription.
 struct PullPoint {
-    /// Termination as unix seconds (second-resolution, like the RFC3339
-    /// wire form).
+    /// Termination instant — precise expiry comparisons (the Go twin keeps
+    /// nanosecond `time.Time`; `termination_unix` below is only the
+    /// second-truncated RFC3339 wire form).
+    termination: Instant,
     termination_unix: u64,
     queue: VecDeque<QueuedNotification>,
     /// Cap-1-style wakeup for long-polling PullMessages.
@@ -222,7 +314,10 @@ pub(crate) struct ServiceEndpoint {
 impl ServiceEndpoint {
     /// `http://host:port/onvif/events_service/sub/<id>`
     fn subscription_address(&self, id: &str) -> String {
-        format!("http://{}:{}{SUBSCRIPTION_PATH_PREFIX}{id}", self.host, self.port)
+        format!(
+            "http://{}:{}{SUBSCRIPTION_PATH_PREFIX}{id}",
+            self.host, self.port
+        )
     }
 
     /// The producer reference: the advertised device service endpoint.
@@ -259,8 +354,37 @@ impl EventsService {
     /// subscriber beyond [`MAX_EVENT_QUEUE`] pending messages loses the
     /// oldest first.
     pub fn publish_event(&self, ev: Event) {
-        let _ = ev;
-        // TODO(red): implement
+        let operation = if ev.property_operation.is_empty() {
+            "Changed".to_string()
+        } else {
+            ev.property_operation
+        };
+        let qn = QueuedNotification {
+            topic: ev.topic,
+            message: QueuedMessage {
+                property_operation: operation,
+                utc_time: rfc3339(unix_now()),
+                source: ev.source,
+                key: ev.key,
+                data: ev.data,
+            },
+        };
+
+        let mut subs = lock_subs(&self.subs);
+        prune_expired(&mut subs);
+
+        for pp in subs.values_mut() {
+            if let Some(filter) = &pp.filter {
+                if !filter.matches(&qn.topic) {
+                    continue;
+                }
+            }
+            if pp.queue.len() >= MAX_EVENT_QUEUE {
+                pp.queue.pop_front();
+            }
+            pp.queue.push_back(qn.clone());
+            pp.notify.notify_one();
+        }
     }
 
     /// Whether `action` belongs to the events service endpoint.
@@ -286,7 +410,9 @@ impl EventsService {
     /// Unsubscribe stay open.
     #[must_use]
     pub(crate) fn action_requires_auth(action: &str) -> bool {
-        ["Set", "Remove", "Create", "Go"].iter().any(|p| action.starts_with(p))
+        ["Set", "Remove", "Create", "Go"]
+            .iter()
+            .any(|p| action.starts_with(p))
     }
 
     /// Dispatch a service-endpoint action (router pre-checked membership).
@@ -297,7 +423,9 @@ impl EventsService {
         endpoint: &ServiceEndpoint,
     ) -> Result<String, OnvifError> {
         match action {
-            "GetServiceCapabilities" => Ok(serialize_soap_response(&build_get_service_capabilities())),
+            "GetServiceCapabilities" => {
+                Ok(serialize_soap_response(&build_get_service_capabilities()))
+            }
             "GetEventProperties" => Ok(serialize_soap_response(&build_get_event_properties())),
             "CreatePullPointSubscription" => self
                 .create_subscription(body, endpoint)
@@ -336,8 +464,57 @@ impl EventsService {
         body: &str,
         endpoint: &ServiceEndpoint,
     ) -> Result<String, OnvifError> {
-        let _ = (body, endpoint);
-        Err(OnvifError::Internal("not implemented".into())) // TODO(red): implement
+        let req = parse_create_request(body)?;
+        let filter = parse_topic_filter(req.topic_expression.as_ref())?;
+
+        // Go twin semantics: an absent OR empty InitialTerminationTime
+        // grants the default window; anything else must parse positive and
+        // is clamped to MAX_TERMINATION (no lower clamp).
+        let mut termination = DEFAULT_TERMINATION;
+        match req.initial_termination_time.as_deref() {
+            None | Some("") => {}
+            Some(raw) => {
+                let parsed = parse_iso8601_duration(raw)
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| {
+                        OnvifError::SenderFault(format!(
+                            "Invalid InitialTerminationTime: got {raw:?}, want a positive \
+                             ISO 8601 duration"
+                        ))
+                    })?;
+                termination = parsed.min(MAX_TERMINATION);
+            }
+        }
+
+        let id = random_subscription_id();
+        let now = unix_now();
+
+        {
+            let mut subs = lock_subs(&self.subs);
+            prune_expired(&mut subs);
+            if subs.len() >= DEFAULT_MAX_PULL_POINTS {
+                return Err(OnvifError::SenderFault(format!(
+                    "Too many active pull point subscriptions: device supports at most \
+                     {DEFAULT_MAX_PULL_POINTS} concurrent pull points"
+                )));
+            }
+            subs.insert(
+                id.clone(),
+                PullPoint {
+                    termination: Instant::now() + termination,
+                    termination_unix: now + termination.as_secs(),
+                    queue: VecDeque::new(),
+                    notify: Arc::new(Notify::new()),
+                    filter,
+                },
+            );
+        }
+
+        Ok(build_create_subscription_response(
+            &endpoint.subscription_address(&id),
+            now,
+            now + termination.as_secs(),
+        ))
     }
 
     /// PullMessages: long-poll the subscription addressed by `path`; answer
@@ -350,21 +527,138 @@ impl EventsService {
         body: &str,
         endpoint: &ServiceEndpoint,
     ) -> Result<String, OnvifError> {
-        let _ = (path, body, endpoint);
-        Err(OnvifError::Internal("not implemented".into())) // TODO(red): implement
+        let req = parse_pull_request(body)?;
+
+        if req.message_limit <= 0 {
+            return Err(OnvifError::SenderFault(format!(
+                "Invalid MessageLimit: got {}, want a positive message limit",
+                req.message_limit
+            )));
+        }
+        // PT0S is legal: an immediate, non-blocking poll. Only unparsable
+        // timeouts fault.
+        let wait = parse_iso8601_duration(&req.timeout).ok_or_else(|| {
+            OnvifError::SenderFault(format!(
+                "Invalid Timeout: got {:?}, want an ISO 8601 duration",
+                req.timeout
+            ))
+        })?;
+        let deadline = tokio::time::Instant::now() + wait.min(MAX_PULL_WAIT);
+        let limit = usize::try_from(req.message_limit).unwrap_or(usize::MAX);
+
+        loop {
+            // Register the wakeup BEFORE draining: a publish between the
+            // drain and the await still wakes this poller (Notify keeps a
+            // pending permit when no waiter is registered yet).
+            let (notify, drained, termination) = {
+                let mut subs = lock_subs(&self.subs);
+                let pp = live_pull_point(&mut subs, path)?;
+                let notify = Arc::clone(&pp.notify);
+                let count = limit.min(pp.queue.len());
+                let drained: Vec<QueuedNotification> = pp.queue.drain(..count).collect();
+                (notify, drained, pp.termination_unix)
+            };
+            let notified = notify.notified();
+
+            if !drained.is_empty() || tokio::time::Instant::now() >= deadline {
+                return Ok(serialize_soap_response(&build_pull_messages_response(
+                    unix_now(),
+                    termination,
+                    &drained,
+                    endpoint,
+                )));
+            }
+
+            tokio::select! {
+                () = notified => {}
+                () = tokio::time::sleep_until(deadline) => {}
+            }
+        }
     }
 
     /// Renew: extend the addressed subscription's termination time.
     async fn renew(&self, path: &str, body: &str) -> Result<String, OnvifError> {
-        let _ = (path, body);
-        Err(OnvifError::Internal("not implemented".into())) // TODO(red): implement
+        let req = parse_renew_request(body)?;
+        let duration = parse_iso8601_duration(&req.termination_time)
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| {
+                OnvifError::SenderFault(format!(
+                    "Invalid TerminationTime: got {:?}, want a positive ISO 8601 duration",
+                    req.termination_time
+                ))
+            })?;
+
+        let now = unix_now();
+        let granted = duration.min(MAX_TERMINATION);
+        let mut subs = lock_subs(&self.subs);
+        let pp = live_pull_point(&mut subs, path)?;
+        pp.termination = Instant::now() + granted;
+        pp.termination_unix = now + granted.as_secs();
+        Ok(serialize_soap_response(&build_renew_response(
+            now,
+            pp.termination_unix,
+        )))
     }
 
     /// Unsubscribe: remove the addressed subscription.
     async fn unsubscribe(&self, path: &str) -> Result<String, OnvifError> {
-        let _ = path;
-        Err(OnvifError::Internal("not implemented".into())) // TODO(red): implement
+        let id = subscription_id_from_path(path)?;
+        let mut subs = lock_subs(&self.subs);
+
+        let live = subs
+            .get(&id)
+            .is_some_and(|pp| Instant::now() <= pp.termination);
+        // Expired pull points are pruned and reported like unknown ones —
+        // both are gone from the client's perspective.
+        subs.remove(&id);
+        if !live {
+            return Err(unknown_subscription_fault(&id));
+        }
+        Ok(serialize_soap_response(&build_unsubscribe_response()))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Registry helpers
+// ---------------------------------------------------------------------------
+
+/// Lock the subscription registry (poison-tolerant, like `AuthState`).
+fn lock_subs(
+    subs: &Mutex<HashMap<String, PullPoint>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, PullPoint>> {
+    match subs.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Drop pull points past their termination time (callers hold the lock).
+fn prune_expired(subs: &mut HashMap<String, PullPoint>) {
+    let now = Instant::now();
+    subs.retain(|_, pp| now <= pp.termination);
+}
+
+/// The Sender fault for gone, unknown, or expired pull points.
+fn unknown_subscription_fault(id: &str) -> OnvifError {
+    OnvifError::SenderFault(format!("Unknown subscription: no pull point for id {id}"))
+}
+
+/// Resolve the live pull point addressed by a request URL path. Callers
+/// hold the lock; expired pull points are pruned and reported like unknown
+/// ones (both are gone from the client's perspective).
+fn live_pull_point<'a>(
+    subs: &'a mut HashMap<String, PullPoint>,
+    path: &str,
+) -> Result<&'a mut PullPoint, OnvifError> {
+    let id = subscription_id_from_path(path)?;
+    let expired = subs
+        .get(&id)
+        .is_some_and(|pp| Instant::now() > pp.termination);
+    if expired {
+        subs.remove(&id);
+    }
+    subs.get_mut(&id)
+        .ok_or_else(|| unknown_subscription_fault(&id))
 }
 
 // ---------------------------------------------------------------------------
@@ -400,31 +694,206 @@ struct RenewRequest {
 }
 
 fn parse_create_request(body: &str) -> Result<CreateRequest, OnvifError> {
-    let _ = body;
-    Err(OnvifError::Internal("not implemented".into())) // TODO(red): implement
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut result = CreateRequest::default();
+    #[derive(Default)]
+    struct State {
+        in_filter: bool,
+        in_topic_expression: bool,
+        in_initial_termination_time: bool,
+    }
+    let mut st = State::default();
+    let mut text_acc = crate::types::TextAccumulator::new();
+
+    loop {
+        let event = reader.read_event_into(&mut buf);
+        match event {
+            Ok(XmlEvent::Text(e)) => {
+                let _ = text_acc.push_text(&e);
+            }
+            Ok(XmlEvent::GeneralRef(e)) => {
+                let _ = text_acc.push_ref(&e);
+            }
+            other => {
+                let text = text_acc.flush();
+                match other {
+                    Ok(XmlEvent::Start(e)) => match local_name(e.name().as_ref()) {
+                        "Filter" => st.in_filter = true,
+                        "TopicExpression" if st.in_filter => {
+                            st.in_topic_expression = true;
+                            result.topic_expression = Some(TopicExpressionRequest {
+                                dialect: attribute_by_local_name(&e, "Dialect"),
+                                value: String::new(),
+                            });
+                        }
+                        "InitialTerminationTime" => {
+                            st.in_initial_termination_time = true;
+                            result.initial_termination_time = Some(String::new());
+                        }
+                        _ => {}
+                    },
+                    Ok(XmlEvent::Empty(e)) => match local_name(e.name().as_ref()) {
+                        "TopicExpression" if st.in_filter => {
+                            result.topic_expression = Some(TopicExpressionRequest {
+                                dialect: attribute_by_local_name(&e, "Dialect"),
+                                value: String::new(),
+                            });
+                        }
+                        "InitialTerminationTime" => {
+                            result.initial_termination_time = Some(String::new());
+                        }
+                        _ => {}
+                    },
+                    Ok(XmlEvent::End(e)) => match local_name(e.name().as_ref()) {
+                        "Filter" => st.in_filter = false,
+                        "TopicExpression" if st.in_topic_expression => {
+                            st.in_topic_expression = false;
+                            if let Some(expr) = result.topic_expression.as_mut() {
+                                expr.value = text.clone().unwrap_or_default();
+                            }
+                        }
+                        "InitialTerminationTime" if st.in_initial_termination_time => {
+                            st.in_initial_termination_time = false;
+                            if let Some(itt) = result.initial_termination_time.as_mut() {
+                                *itt = text.clone().unwrap_or_default();
+                            }
+                        }
+                        _ => {}
+                    },
+                    Ok(XmlEvent::Eof) => break,
+                    Err(e) => return Err(OnvifError::InvalidXml(format!("XML parse error: {e}"))),
+                    _ => {}
+                }
+            }
+        }
+        buf.clear();
+    }
+    Ok(result)
 }
 
 fn parse_pull_request(body: &str) -> Result<PullRequest, OnvifError> {
-    let _ = body;
-    Err(OnvifError::Internal("not implemented".into())) // TODO(red): implement
+    let children = direct_child_texts(body)?;
+    let field = |name: &str| {
+        children
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    };
+    let message_limit = match field("MessageLimit") {
+        Some(raw) => raw
+            .parse::<i64>()
+            .map_err(|_| OnvifError::InvalidXml(format!("invalid MessageLimit {raw:?}")))?,
+        None => 0,
+    };
+    Ok(PullRequest {
+        timeout: field("Timeout").unwrap_or_default(),
+        message_limit,
+    })
 }
 
 fn parse_renew_request(body: &str) -> Result<RenewRequest, OnvifError> {
-    let _ = body;
-    Err(OnvifError::Internal("not implemented".into())) // TODO(red): implement
+    let children = direct_child_texts(body)?;
+    let termination_time = children
+        .iter()
+        .find(|(n, _)| n == "TerminationTime")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    Ok(RenewRequest { termination_time })
+}
+
+/// Collect `(local name, text)` for each direct child element of the body's
+/// root (the action element) — the shape of the PullMessages / Renew
+/// request bodies. Namespace-agnostic, entity-resolving.
+fn direct_child_texts(body: &str) -> Result<Vec<(String, String)>, OnvifError> {
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut out = Vec::new();
+    let mut depth: usize = 0;
+    let mut current: Option<String> = None;
+    let mut text_acc = crate::types::TextAccumulator::new();
+
+    loop {
+        let event = reader.read_event_into(&mut buf);
+        match event {
+            Ok(XmlEvent::Text(e)) => {
+                if depth == 2 {
+                    let _ = text_acc.push_text(&e);
+                }
+            }
+            Ok(XmlEvent::GeneralRef(e)) => {
+                if depth == 2 {
+                    let _ = text_acc.push_ref(&e);
+                }
+            }
+            other => {
+                let text = text_acc.flush().unwrap_or_default();
+                match other {
+                    Ok(XmlEvent::Start(e)) => {
+                        depth += 1;
+                        if depth == 2 {
+                            current = Some(local_name(e.name().as_ref()).to_string());
+                        }
+                    }
+                    Ok(XmlEvent::Empty(e)) => {
+                        if depth == 1 {
+                            out.push((local_name(e.name().as_ref()).to_string(), String::new()));
+                        }
+                    }
+                    Ok(XmlEvent::End(_e)) => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 1 {
+                            if let Some(current) = current.take() {
+                                // Named by the opening tag (balanced XML).
+                                out.push((current, text));
+                            }
+                        }
+                    }
+                    Ok(XmlEvent::Eof) => break,
+                    Err(e) => return Err(OnvifError::InvalidXml(format!("XML parse error: {e}"))),
+                    _ => {}
+                }
+            }
+        }
+        buf.clear();
+    }
+    Ok(out)
+}
+
+/// First attribute whose local name matches, decoded as UTF-8 (crate
+/// convention — see imaging's `attr_value_f64`).
+fn attribute_by_local_name(e: &BytesStart<'_>, want: &str) -> String {
+    for attr in e.attributes().flatten() {
+        if local_name(attr.key.as_ref()) == want {
+            return String::from_utf8_lossy(&attr.value).into_owned();
+        }
+    }
+    String::new()
 }
 
 /// Extract the opaque subscription id from a per-subscription request path,
 /// mirroring onvif-go's `subscriptionIDFromRequest`: the remainder after
 /// [`SUBSCRIPTION_PATH_PREFIX`] must be non-empty and slash-free.
 fn subscription_id_from_path(path: &str) -> Result<String, OnvifError> {
-    let _ = path;
-    Err(OnvifError::Internal("not implemented".into())) // TODO(red): implement
+    match path.strip_prefix(SUBSCRIPTION_PATH_PREFIX) {
+        Some(id) if !id.is_empty() && !id.contains('/') => Ok(id.to_string()),
+        _ => Err(OnvifError::SenderFault(format!(
+            "Unknown subscription: not a subscription endpoint: {path}"
+        ))),
+    }
 }
 
-/// Mint an opaque subscription token (16 random bytes, hex).
+/// Mint an opaque subscription token (16 random bytes, hex — parity with
+/// onvif-go's `randomSubscriptionID`).
 fn random_subscription_id() -> String {
-    String::new() // TODO(red): implement
+    use rand::RngCore;
+    let mut buf = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut buf);
+    hex::encode(buf)
 }
 
 /// Unix seconds now (the single time base for terminations and stamps).
@@ -446,36 +915,199 @@ fn rfc3339(unix_secs: u64) -> String {
 // Response builders (pure — byte-golden test targets)
 // ---------------------------------------------------------------------------
 
+/// `<tev:GetServiceCapabilitiesResponse>` — no time fields, fully
+/// deterministic.
 fn build_get_service_capabilities() -> String {
-    String::new() // TODO(red): implement
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("tev:GetServiceCapabilitiesResponse");
+    root.push_attribute(("xmlns:tev", EVENTS_SERVICE));
+    w.write_event(XmlEvent::Start(root)).unwrap_or_default();
+
+    let mut caps = BytesStart::new("tev:Capabilities");
+    caps.push_attribute(("WSPullPointSupport", "true"));
+    let max_pull_points = DEFAULT_MAX_PULL_POINTS.to_string();
+    caps.push_attribute(("MaxPullPoints", max_pull_points.as_str()));
+    w.write_event(XmlEvent::Start(caps)).unwrap_or_default();
+    // Empty Text event keeps the pair inline — the twin's byte form
+    // `<Capabilities ...></Capabilities>` rather than a split close tag.
+    w.write_event(XmlEvent::Text(BytesText::new("")))
+        .unwrap_or_default();
+    w.write_event(XmlEvent::End(BytesEnd::new("tev:Capabilities")))
+        .unwrap_or_default();
+
+    w.write_event(XmlEvent::End(BytesEnd::new(
+        "tev:GetServiceCapabilitiesResponse",
+    )))
+    .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
+/// `<tev:GetEventPropertiesResponse>` — the spec-complete answer: fixed
+/// empty topic set, the two mandatory topic-expression dialects (both
+/// honored by the pull-point filter), the spec-blessed single empty
+/// message-content filter dialect, and the ONVIF namespace/schema
+/// locations.
 fn build_get_event_properties() -> String {
-    String::new() // TODO(red): implement
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("tev:GetEventPropertiesResponse");
+    root.push_attribute(("xmlns:tev", EVENTS_SERVICE));
+    root.push_attribute(("xmlns:wsnt", WS_NOTIFICATION));
+    root.push_attribute(("xmlns:wstop", WS_TOPICS));
+    w.write_event(XmlEvent::Start(root)).unwrap_or_default();
+
+    write_text(
+        &mut w,
+        "tev:TopicNamespaceLocation",
+        TOPIC_NAMESPACE_LOCATION,
+    );
+    write_text(&mut w, "wsnt:FixedTopicSet", "true");
+    write_text(&mut w, "wstop:TopicSet", "");
+    write_text(&mut w, "wsnt:TopicExpressionDialect", DIALECT_CONCRETE);
+    write_text(&mut w, "wsnt:TopicExpressionDialect", DIALECT_CONCRETE_SET);
+    // One empty message-content filter dialect: content filters are not
+    // applied, and the spec prescribes exactly this no-filtering form.
+    write_text(&mut w, "wsnt:MessageContentFilterDialect", "");
+    write_text(
+        &mut w,
+        "tev:MessageContentSchemaLocation",
+        MESSAGE_SCHEMA_LOCATION,
+    );
+
+    w.write_event(XmlEvent::End(BytesEnd::new(
+        "tev:GetEventPropertiesResponse",
+    )))
+    .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
+/// `<tev:CreatePullPointSubscriptionResponse>` — the SubscriptionReference
+/// endpoint plus the granted termination window (RFC3339).
 fn build_create_subscription_response(address: &str, current: u64, termination: u64) -> String {
-    let _ = (address, current, termination);
-    String::new() // TODO(red): implement
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("tev:CreatePullPointSubscriptionResponse");
+    root.push_attribute(("xmlns:tev", EVENTS_SERVICE));
+    root.push_attribute(("xmlns:wsnt", WS_NOTIFICATION));
+    root.push_attribute(("xmlns:wsa", WS_ADDRESSING));
+    w.write_event(XmlEvent::Start(root)).unwrap_or_default();
+
+    open_close(&mut w, "tev:SubscriptionReference", |w| {
+        write_text(w, "wsa:Address", address);
+    });
+    write_text(&mut w, "wsnt:CurrentTime", &rfc3339(current));
+    write_text(&mut w, "wsnt:TerminationTime", &rfc3339(termination));
+
+    w.write_event(XmlEvent::End(BytesEnd::new(
+        "tev:CreatePullPointSubscriptionResponse",
+    )))
+    .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
+/// `<tev:PullMessagesResponse>` — times plus the canonical double-layer
+/// notification payloads. Note the twin's namespace split: CurrentTime /
+/// TerminationTime are `tev` here but `wsnt` in the create/renew responses.
 fn build_pull_messages_response(
     current: u64,
     termination: u64,
     drained: &[QueuedNotification],
     endpoint: &ServiceEndpoint,
 ) -> String {
-    let _ = (current, termination, drained, endpoint);
-    String::new() // TODO(red): implement
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("tev:PullMessagesResponse");
+    root.push_attribute(("xmlns:tev", EVENTS_SERVICE));
+    root.push_attribute(("xmlns:wsnt", WS_NOTIFICATION));
+    if !drained.is_empty() {
+        root.push_attribute(("xmlns:wsa", WS_ADDRESSING));
+        root.push_attribute(("xmlns:tt", SCHEMAS));
+    }
+    w.write_event(XmlEvent::Start(root)).unwrap_or_default();
+
+    write_text(&mut w, "tev:CurrentTime", &rfc3339(current));
+    write_text(&mut w, "tev:TerminationTime", &rfc3339(termination));
+
+    for qn in drained {
+        w.write_event(XmlEvent::Start(BytesStart::new("wsnt:NotificationMessage")))
+            .unwrap_or_default();
+        write_text(&mut w, "wsnt:Topic", &qn.topic);
+        open_close(&mut w, "wsnt:ProducerReference", |w| {
+            write_text(w, "wsa:Address", &endpoint.device_service_address());
+        });
+        open_close(&mut w, "wsnt:Message", |w| {
+            let mut msg = BytesStart::new("tt:Message");
+            msg.push_attribute(("PropertyOperation", qn.message.property_operation.as_str()));
+            msg.push_attribute(("UtcTime", qn.message.utc_time.as_str()));
+            w.write_event(XmlEvent::Start(msg)).unwrap_or_default();
+
+            // Source/Key/Data groups are always present (possibly empty) —
+            // the twin's struct-marshal shape.
+            write_simple_items(w, "tt:Source", &qn.message.source);
+            write_simple_items(w, "tt:Key", &qn.message.key);
+            write_simple_items(w, "tt:Data", &qn.message.data);
+
+            w.write_event(XmlEvent::End(BytesEnd::new("tt:Message")))
+                .unwrap_or_default();
+        });
+        w.write_event(XmlEvent::End(BytesEnd::new("wsnt:NotificationMessage")))
+            .unwrap_or_default();
+    }
+
+    w.write_event(XmlEvent::End(BytesEnd::new("tev:PullMessagesResponse")))
+        .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
+/// One `tt:Source`/`tt:Key`/`tt:Data` SimpleItem group (always emitted,
+/// empty when the group has no items — inline `<tt:Key></tt:Key>`, the
+/// twin's byte form).
+fn write_simple_items(w: &mut Writer<Vec<u8>>, group: &str, items: &[SimpleItem]) {
+    w.write_event(XmlEvent::Start(BytesStart::new(group)))
+        .unwrap_or_default();
+    if items.is_empty() {
+        w.write_event(XmlEvent::Text(BytesText::new("")))
+            .unwrap_or_default();
+    }
+    for item in items {
+        let mut si = BytesStart::new("tt:SimpleItem");
+        si.push_attribute(("Name", item.name.as_str()));
+        si.push_attribute(("Value", item.value.as_str()));
+        w.write_event(XmlEvent::Empty(si)).unwrap_or_default();
+    }
+    w.write_event(XmlEvent::End(BytesEnd::new(group)))
+        .unwrap_or_default();
+}
+
+/// `<wsnt:RenewResponse>` — the extended termination window.
 fn build_renew_response(current: u64, termination: u64) -> String {
-    let _ = (current, termination);
-    String::new() // TODO(red): implement
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("wsnt:RenewResponse");
+    root.push_attribute(("xmlns:wsnt", WS_NOTIFICATION));
+    w.write_event(XmlEvent::Start(root)).unwrap_or_default();
+
+    write_text(&mut w, "wsnt:CurrentTime", &rfc3339(current));
+    write_text(&mut w, "wsnt:TerminationTime", &rfc3339(termination));
+
+    w.write_event(XmlEvent::End(BytesEnd::new("wsnt:RenewResponse")))
+        .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
+/// `<wsnt:UnsubscribeResponse>` — empty acknowledgment.
 fn build_unsubscribe_response() -> String {
-    String::new() // TODO(red): implement
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut root = BytesStart::new("wsnt:UnsubscribeResponse");
+    root.push_attribute(("xmlns:wsnt", WS_NOTIFICATION));
+    w.write_event(XmlEvent::Empty(root)).unwrap_or_default();
+    String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -528,8 +1160,8 @@ mod tests {
     }
 
     // 2026-09-19T12:00:00Z / 13:00:00Z (deterministic golden anchors).
-    const T0: u64 = 1_789_780_800;
-    const T1: u64 = 1_789_784_400;
+    const T0: u64 = 1_789_819_200;
+    const T1: u64 = 1_789_822_800;
 
     // ------------------------------------------------------------------
     // Byte goldens — the wire contract (parity with onvif-go events.go)
@@ -563,7 +1195,8 @@ mod tests {
 
     #[test]
     fn golden_create_subscription_response() {
-        let address = "http://192.0.2.10:8080/onvif/events_service/sub/0123456789abcdef0123456789abcdef";
+        let address =
+            "http://192.0.2.10:8080/onvif/events_service/sub/0123456789abcdef0123456789abcdef";
         assert_eq!(
             build_create_subscription_response(address, T0, T1),
             "<tev:CreatePullPointSubscriptionResponse xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\" xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\" xmlns:wsa=\"http://www.w3.org/2005/08/addressing\">\n  \
@@ -585,7 +1218,10 @@ mod tests {
                 utc_time: "2026-09-19T12:00:00Z".to_string(),
                 source: vec![SimpleItem::new("Source", "CSI")],
                 key: vec![],
-                data: vec![SimpleItem::new("State", "true"), SimpleItem::new("Score", "87")],
+                data: vec![
+                    SimpleItem::new("State", "true"),
+                    SimpleItem::new("Score", "87"),
+                ],
             },
         }];
         assert_eq!(
@@ -850,10 +1486,9 @@ mod tests {
 
     #[test]
     fn parse_pull_request_zero_defaults() {
-        let req = parse_pull_request(
-            r#"<PullMessages xmlns="http://www.onvif.org/ver10/events/wsdl"/>"#,
-        )
-        .unwrap();
+        let req =
+            parse_pull_request(r#"<PullMessages xmlns="http://www.onvif.org/ver10/events/wsdl"/>"#)
+                .unwrap();
         assert_eq!(req.timeout, "");
         assert_eq!(req.message_limit, 0);
     }
@@ -943,19 +1578,18 @@ mod tests {
         if bytes.len() != 20 {
             return 0;
         }
-        let num = |from: usize, to: usize| -> u64 {
-            ts[from..to].parse::<u64>().unwrap_or(0)
-        };
+        let num = |from: usize, to: usize| -> u64 { ts[from..to].parse::<u64>().unwrap_or(0) };
         let (y, mo, d) = (num(0, 4), num(5, 7), num(8, 10));
         let (h, mi, s) = (num(11, 13), num(14, 16), num(17, 19));
-        // days-from-civil (Howard Hinnant)
+        // days-from-civil (Howard Hinnant), u64-only: RFC3339 years here
+        // are always positive, so the negative-era arms drop out.
         let y = if mo <= 2 { y - 1 } else { y };
-        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let era = y / 400;
         let yoe = y - era * 400;
         let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
         let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
         let days = era * 146_097 + doe - 719_468;
-        days as u64 * 86_400 + h * 3600 + mi * 60 + s
+        days * 86_400 + h * 3600 + mi * 60 + s
     }
 
     #[test]
@@ -1091,13 +1725,9 @@ mod tests {
             let ep = endpoint();
 
             let plain = create(&svc, &ep, "PT10M").await;
-            let filtered = create_with_filter(
-                &svc,
-                &ep,
-                DIALECT_CONCRETE,
-                "tns1:VideoSource/MotionAlarm",
-            )
-            .await;
+            let filtered =
+                create_with_filter(&svc, &ep, DIALECT_CONCRETE, "tns1:VideoSource/MotionAlarm")
+                    .await;
 
             svc.publish_event(Event::new("tns1:VideoSource/MotionAlarm"));
             svc.publish_event(Event::new("tns1:Device/HardwareFailure"));
@@ -1123,9 +1753,14 @@ mod tests {
             }
 
             // The oldest events were dropped; the newest MAX_EVENT_QUEUE stay.
-            let fragment = pull(&svc, &sub_path, "PT0S", i64::try_from(MAX_EVENT_QUEUE + 10).unwrap_or(200))
-                .await
-                .unwrap();
+            let fragment = pull(
+                &svc,
+                &sub_path,
+                "PT0S",
+                i64::try_from(MAX_EVENT_QUEUE + 10).unwrap_or(200),
+            )
+            .await
+            .unwrap();
             let count = fragment.matches("<wsnt:NotificationMessage>").count();
             assert_eq!(count, MAX_EVENT_QUEUE);
             // Head of the queue = the event after the dropped ones.
@@ -1240,7 +1875,10 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split('<').next())
             .unwrap_or_default();
-        format!("{SUBSCRIPTION_PATH_PREFIX}{}", address.rsplit('/').next().unwrap_or(""))
+        format!(
+            "{SUBSCRIPTION_PATH_PREFIX}{}",
+            address.rsplit('/').next().unwrap_or("")
+        )
     }
 
     async fn create_with_filter(
@@ -1258,7 +1896,10 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split('<').next())
             .unwrap_or_default();
-        format!("{SUBSCRIPTION_PATH_PREFIX}{}", address.rsplit('/').next().unwrap_or(""))
+        format!(
+            "{SUBSCRIPTION_PATH_PREFIX}{}",
+            address.rsplit('/').next().unwrap_or("")
+        )
     }
 
     async fn pull(

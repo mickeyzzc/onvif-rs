@@ -29,6 +29,24 @@ are released out of band.
   Configuring TLS without the feature fails at `start()` (no silent
   plain-HTTP fallback). Test certificates are generated per-run with
   `rcgen`.
+- `feat(events)` **Events pull-point family** (parity with onvif-go's
+  `SupportEvents` + `provider.PublishEvent`): `enable_events()` /
+  `OnvifConfig::support_events` route `{base}/events_service`
+  (GetServiceCapabilities / GetEventProperties /
+  CreatePullPointSubscription) and the per-subscription
+  `{base}/events_service/sub/<id>` subtree (PullMessages / Renew /
+  Unsubscribe) on the listener the server already owns. Hosts inject
+  property events via the shared `EventsService::publish_event` seam
+  (`Event`/`SimpleItem` re-exported at the crate root) — fan-out to
+  every live subscription with Concrete/ConcreteSet topic filters,
+  ISO8601 InitialTerminationTime clamping, lossy bounded
+  per-subscription queues, a max-pull-points bound with lazy expiry,
+  and long-poll PullMessages (PT0S legal, publish wakes waiters), all in
+  the wsnt double-layer NotificationMessage wire form with byte goldens
+  against the go twin. GetCapabilities and GetServices advertise the
+  service only while enabled; Create* actions sit behind WS-Security
+  while reads stay open; with events disabled the routes answer 404 and
+  the wire is byte-identical to before.
 
 ## [v0.6.0] — 2026-09-09
 
