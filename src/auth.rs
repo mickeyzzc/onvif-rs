@@ -163,6 +163,21 @@ pub fn parse_created_unix(created: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    mod proptests {
+        //! Property tests: `parse_created_unix` parses the untrusted
+        //! Created field of a UsernameToken — arbitrary strings must
+        //! surface as None, never a panic.
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn parse_created_unix_never_panics(input in "\\PC{0,64}") {
+                let _ = parse_created_unix(&input);
+            }
+        }
+    }
+
     use super::*;
 
     // Test vector for digest computation.
