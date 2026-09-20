@@ -730,6 +730,37 @@ pub fn handle_http_probe(server: &DiscoveryServer, body: &str, server_ip: &str) 
 mod tests {
     use super::*;
 
+    mod proptests {
+        //! Property tests: `parse_probe` runs on every untrusted UDP
+        //! datagram the responder reads — arbitrary bytes must surface
+        //! as None, never a panic.
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn parse_probe_never_panics_on_arbitrary_bytes(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
+                let _ = parse_probe(&data);
+            }
+
+            #[test]
+            fn parse_probe_never_panics_on_xml_shaped_garbage(
+                name in "[A-Za-z][A-Za-z0-9]{0,24}",
+                depth in 1usize..8,
+            ) {
+                let mut s = String::from("<?xml version=\"1.0\"?>");
+                for _ in 0..depth {
+                    s.push_str(&format!("<{name} xmlns=\"http://x\">"));
+                }
+                s.push_str("<a:MessageID>urn:uuid:x</a:MessageID>");
+                for _ in 0..depth {
+                    s.push_str(&format!("</{name}>"));
+                }
+                let _ = parse_probe(s.as_bytes());
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // ProbeMatches send retry (issue #22)
     // ------------------------------------------------------------------
