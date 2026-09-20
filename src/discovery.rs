@@ -752,7 +752,7 @@ mod tests {
                 for _ in 0..depth {
                     s.push_str(&format!("<{name} xmlns=\"http://x\">"));
                 }
-                s.push_str(&format!("<a:MessageID>urn:uuid:x</a:MessageID>"));
+                s.push_str("<a:MessageID>urn:uuid:x</a:MessageID>");
                 for _ in 0..depth {
                     s.push_str(&format!("</{name}>"));
                 }
