@@ -64,7 +64,7 @@ jobs:
 
   coverage:
     # Line coverage via cargo-llvm-cov (issue #21, aligned with
-    # gb28181-rs#33), gated at 80% lines (measured baseline ~94%).
+    # gb28181-rs#33), gated at 85% lines (measured baseline ~94%).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,4 +75,4 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Coverage
-        run: cargo llvm-cov --summary-only --fail-under-lines 80
+        run: cargo llvm-cov --summary-only --fail-under-lines 85
