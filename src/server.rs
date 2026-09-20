@@ -53,6 +53,16 @@ pub struct OnvifConfig {
     pub auth_failure_limit: i32,
     /// How long a locked-out source is refused, in seconds. Default 60.
     pub auth_lockout_secs: u64,
+    /// PEM file holding the server certificate chain for HTTPS serving
+    /// (ONVIF Profile T's transport baseline). Empty = plain HTTP.
+    /// **Both-or-neither**: exactly one of `tls_cert_file` /
+    /// `tls_key_file` is a configuration error. Requires the `tls` cargo
+    /// feature; configuring TLS in a build without it fails at `start`.
+    pub tls_cert_file: String,
+    /// PEM file holding the private key matching `tls_cert_file`.
+    /// Read once at `start_on`/`start` — later file changes need a
+    /// restart.
+    pub tls_key_file: String,
 }
 
 impl Default for OnvifConfig {
@@ -67,6 +77,8 @@ impl Default for OnvifConfig {
             replay_window_secs: 300,
             auth_failure_limit: 5,
             auth_lockout_secs: 60,
+            tls_cert_file: String::new(),
+            tls_key_file: String::new(),
         }
     }
 }
@@ -194,11 +206,28 @@ impl OnvifServer {
 
     /// Validate the configuration. Fail-closed: an empty password without an
     /// explicit `allow_no_auth` is a configuration error, not an open server.
+    /// TLS paths are both-or-neither (parity with onvif-go: "TLSCertFile
+    /// and TLSKeyFile must be set together").
     fn validate_config(config: &OnvifConfig) -> Result<(), OnvifError> {
         if config.password.is_empty() && !config.allow_no_auth {
             return Err(OnvifError::NotAuthorized(
                 "OnvifConfig.password is empty — set credentials, or set \
                  allow_no_auth = true to deliberately run an open server"
+                    .to_string(),
+            ));
+        }
+        if config.tls_cert_file.is_empty() != config.tls_key_file.is_empty() {
+            return Err(OnvifError::InvalidConfig(
+                "tls_cert_file and tls_key_file must be set together \
+                 (both empty = plain HTTP)"
+                    .to_string(),
+            ));
+        }
+        #[cfg(not(feature = "tls"))]
+        if !config.tls_cert_file.is_empty() {
+            return Err(OnvifError::InvalidConfig(
+                "TLS configured (tls_cert_file/tls_key_file) but this build \
+                 does not enable the `tls` cargo feature"
                     .to_string(),
             ));
         }
@@ -222,13 +251,21 @@ impl OnvifServer {
     /// bind addresses, or sharing a port with host infrastructure).
     ///
     /// `OnvifConfig::port` is ignored; the listener's own address is used.
+    /// With `tls_cert_file`/`tls_key_file` configured (and the `tls`
+    /// feature enabled) every accepted connection is served over TLS.
     pub async fn start_on(self, listener: TcpListener) -> Result<OnvifServerHandle, OnvifError> {
         Self::validate_config(&self.config)?;
+        #[cfg(feature = "tls")]
+        let tls_acceptor = build_tls_acceptor(&self.config)?;
         let local_addr = listener
             .local_addr()
             .map(|a| a.to_string())
             .unwrap_or_default();
         log::info!("onvif: serving SOAP on {local_addr}");
+        #[cfg(feature = "tls")]
+        if tls_acceptor.is_some() {
+            log::info!("onvif: TLS listener active (https)");
+        }
 
         let handlers = Arc::new(self.handlers);
         let auth_state = Arc::new(AuthState::new(&self.config));
@@ -259,6 +296,8 @@ impl OnvifServer {
                 let anonymous = Arc::clone(&anonymous);
                 let auth_state = Arc::clone(&auth_state);
                 let metrics = Arc::clone(&metrics);
+                #[cfg(feature = "tls")]
+                let tls_acceptor = tls_acceptor.clone();
 
                 tokio::spawn(async move {
                     let client_ip = peer_addr.ip().to_string();
@@ -266,7 +305,53 @@ impl OnvifServer {
                         .local_addr()
                         .map(|a| a.ip().to_string())
                         .unwrap_or_default();
-                    if let Err(e) = handle_connection(
+
+                    // Feature-gated TLS wrap: with the `tls` feature and a
+                    // certificate configured, the plain stream becomes a TLS
+                    // session before the HTTP/SOAP stack sees it. Failed
+                    // handshakes drop the connection (never served).
+                    #[cfg(feature = "tls")]
+                    let result = match tls_acceptor {
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(mut tls_stream) => {
+                                let result = handle_connection(
+                                    &mut tls_stream,
+                                    &client_ip,
+                                    &server_ip,
+                                    &handlers,
+                                    &cfg,
+                                    &anonymous,
+                                    &auth_state,
+                                    &metrics,
+                                )
+                                .await;
+                                // Orderly TLS close (close_notify) — dropping
+                                // a rustls stream without it surfaces as
+                                // "unexpected EOF" on strict clients.
+                                let _ = tls_stream.shutdown().await;
+                                result
+                            }
+                            Err(e) => {
+                                log::warn!("onvif: TLS handshake failed from {client_ip}: {e}");
+                                Ok(())
+                            }
+                        },
+                        None => {
+                            handle_connection(
+                                &mut stream,
+                                &client_ip,
+                                &server_ip,
+                                &handlers,
+                                &cfg,
+                                &anonymous,
+                                &auth_state,
+                                &metrics,
+                            )
+                            .await
+                        }
+                    };
+                    #[cfg(not(feature = "tls"))]
+                    let result = handle_connection(
                         &mut stream,
                         &client_ip,
                         &server_ip,
@@ -276,8 +361,9 @@ impl OnvifServer {
                         &auth_state,
                         &metrics,
                     )
-                    .await
-                    {
+                    .await;
+
+                    if let Err(e) = result {
                         log::error!("onvif: connection error from {client_ip}: {e}");
                     }
                 });
@@ -289,6 +375,59 @@ impl OnvifServer {
             shutdown: shutdown_tx,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// TLS listener (feature `tls`)
+// ---------------------------------------------------------------------------
+
+/// Load the configured certificate/key PEMs into a TLS acceptor.
+///
+/// Returns `Ok(None)` when no TLS paths are configured (plain HTTP).
+/// Failures (missing file, unparseable PEM, unusable key) are
+/// `OnvifError::InvalidConfig` — served at startup, never mid-flight.
+#[cfg(feature = "tls")]
+fn build_tls_acceptor(cfg: &OnvifConfig) -> Result<Option<tokio_rustls::TlsAcceptor>, OnvifError> {
+    use std::io::BufReader;
+
+    if cfg.tls_cert_file.is_empty() && cfg.tls_key_file.is_empty() {
+        return Ok(None);
+    }
+
+    let cert_file = std::fs::File::open(&cfg.tls_cert_file).map_err(|e| {
+        OnvifError::InvalidConfig(format!("open tls_cert_file {}: {e}", cfg.tls_cert_file))
+    })?;
+    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            OnvifError::InvalidConfig(format!(
+                "parse certificates from {}: {e}",
+                cfg.tls_cert_file
+            ))
+        })?;
+    if certs.is_empty() {
+        return Err(OnvifError::InvalidConfig(format!(
+            "no certificates found in {}",
+            cfg.tls_cert_file
+        )));
+    }
+
+    let key_file = std::fs::File::open(&cfg.tls_key_file).map_err(|e| {
+        OnvifError::InvalidConfig(format!("open tls_key_file {}: {e}", cfg.tls_key_file))
+    })?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .map_err(|e| {
+            OnvifError::InvalidConfig(format!("parse key from {}: {e}", cfg.tls_key_file))
+        })?
+        .ok_or_else(|| {
+            OnvifError::InvalidConfig(format!("no private key found in {}", cfg.tls_key_file))
+        })?;
+
+    let tls = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| OnvifError::InvalidConfig(format!("TLS config: {e}")))?;
+    Ok(Some(tokio_rustls::TlsAcceptor::from(Arc::new(tls))))
 }
 
 // ---------------------------------------------------------------------------
@@ -365,8 +504,8 @@ impl AuthState {
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)] // connection-scoped shared state passed as-is
-async fn handle_connection(
-    stream: &mut tokio::net::TcpStream,
+async fn handle_connection<S>(
+    stream: &mut S,
     client_ip: &str,
     server_ip: &str,
     handlers: &HandlerMap,
@@ -374,7 +513,11 @@ async fn handle_connection(
     anonymous: &SharedAnonymous,
     auth_state: &Arc<AuthState>,
     metrics: &Arc<dyn crate::metrics::MetricsHooks>,
-) -> Result<(), OnvifError> {
+) -> Result<(), OnvifError>
+where
+    // Plain TcpStream without the `tls` feature, a TLS session with it.
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // --- Read HTTP request (bounded header, bounded body, read timeout) ---
     let read = read_http_request(stream, cfg);
     let (method, body) = match tokio::time::timeout(cfg.read_timeout, read).await {
@@ -529,10 +672,13 @@ async fn handle_connection(
 /// Read one HTTP request: header section (capped at [`MAX_HEADER_BYTES`],
 /// may span multiple reads), then exactly `Content-Length` body bytes
 /// (capped at `cfg.max_body_bytes`).
-async fn read_http_request(
-    stream: &mut tokio::net::TcpStream,
+async fn read_http_request<S>(
+    stream: &mut S,
     cfg: &OnvifConfig,
-) -> Result<(String, String), OnvifError> {
+) -> Result<(String, String), OnvifError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut data: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
 
@@ -616,7 +762,10 @@ async fn read_http_request(
 
 /// Read and discard pending inbound bytes (bounded) so closing the socket
 /// sends FIN instead of RST while the peer is still writing.
-async fn drain_before_close(stream: &mut tokio::net::TcpStream) {
+async fn drain_before_close<S>(stream: &mut S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut scratch = [0u8; 4096];
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     let mut drained: usize = 0;
@@ -633,11 +782,10 @@ async fn drain_before_close(stream: &mut tokio::net::TcpStream) {
 }
 
 /// Write an HTTP 1.1 response with `Content-Type: application/soap+xml`.
-async fn write_http_response(
-    stream: &mut tokio::net::TcpStream,
-    status: u16,
-    body: &str,
-) -> Result<(), OnvifError> {
+async fn write_http_response<S>(stream: &mut S, status: u16, body: &str) -> Result<(), OnvifError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let status_line = match status {
         200 => "200 OK",
         400 => "400 Bad Request",
@@ -1188,6 +1336,70 @@ mod tests {
         server.register_anonymous_action("GetSystemDateAndTime");
         assert!(server.anonymous_actions.contains("GetSystemDateAndTime"));
         assert!(!server.anonymous_actions.contains("GetCapabilities"));
+    }
+
+    // ------------------------------------------------------------------
+    // TLS listener configuration (parity with onvif-go: both-or-neither)
+    // ------------------------------------------------------------------
+
+    fn tls_test_config() -> OnvifConfig {
+        OnvifConfig {
+            port: 0,
+            username: "admin".into(),
+            password: "pass".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Exactly one of cert/key configured is a configuration error (the
+    /// peer in onvif-go's `Start`: "TLSCertFile and TLSKeyFile must be set
+    /// together").
+    #[tokio::test]
+    async fn tls_half_configured_fails_to_start() {
+        for (cert, key) in [("cert.pem", ""), ("", "key.pem")] {
+            let mut cfg = tls_test_config();
+            cfg.tls_cert_file = cert.to_string();
+            cfg.tls_key_file = key.to_string();
+            let mut server = OnvifServer::new(&cfg);
+            server.register_handler(
+                "GetProfiles",
+                Box::new(TestHandler {
+                    response: "<x/>".into(),
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let err = server
+                .start_on(listener)
+                .await
+                .expect_err("half-configured TLS must fail");
+            assert!(
+                err.to_string().contains("must be set together"),
+                "got: {err}"
+            );
+        }
+    }
+
+    /// With the `tls` cargo feature compiled out, configuring TLS must
+    /// fail loudly instead of silently serving plain HTTP.
+    #[cfg(not(feature = "tls"))]
+    #[tokio::test]
+    async fn tls_config_without_feature_fails_to_start() {
+        let mut cfg = tls_test_config();
+        cfg.tls_cert_file = "cert.pem".to_string();
+        cfg.tls_key_file = "key.pem".to_string();
+        let mut server = OnvifServer::new(&cfg);
+        server.register_handler(
+            "GetProfiles",
+            Box::new(TestHandler {
+                response: "<x/>".into(),
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let err = server
+            .start_on(listener)
+            .await
+            .expect_err("TLS config without the feature must fail");
+        assert!(err.to_string().contains("tls"), "got: {err}");
     }
     // ------------------------------------------------------------------
     // HTTP request parsing

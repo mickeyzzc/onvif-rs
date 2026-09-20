@@ -11,6 +11,25 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(device)` **SystemReboot** — the Device service answers the
+  SystemReboot action with the WSDL `SystemRebootResponse/Message` form
+  (`Message` = "Device rebooting", parity with onvif-go's
+  `HandleSystemReboot`). Protocol answer only: the library never performs
+  the reboot side effect; hosts decide whether to hook a real one.
+- `feat(discovery)` **Hello/Bye announcements** — the responder multicasts
+  a WS-Discovery Hello on `start()` and a Bye when it stops (explicit
+  `shutdown()` or dropping the handle), same envelope family and
+  announcement fields as ProbeMatches (parity with onvif-go's
+  discovery.Responder). Best effort: a lost announcement never stops
+  Probe answering.
+- `feat(server)` **TLS listener** behind the new `tls` cargo feature
+  (off by default — default-feature dependents gain nothing): configure
+  `tls_cert_file` + `tls_key_file` PEM paths (both-or-neither, parity
+  with onvif-go) and the listener serves HTTPS via tokio-rustls.
+  Configuring TLS without the feature fails at `start()` (no silent
+  plain-HTTP fallback). Test certificates are generated per-run with
+  `rcgen`.
+
 ## [v0.6.0] — 2026-09-09
 
 - `feat(discovery)` ProbeMatches sends retry with exponential backoff

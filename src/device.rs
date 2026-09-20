@@ -74,6 +74,8 @@ impl OnvifActionHandler for DeviceHandler {
             svc.build_services(&info.server_ip)
         } else if body.contains("GetScopes") {
             svc.build_scopes()
+        } else if body.contains("SystemReboot") {
+            svc.build_system_reboot()
         } else {
             return Err(OnvifError::ActionNotSupported(
                 "unknown device action".into(),
@@ -247,6 +249,32 @@ impl DeviceServiceHandlers {
 
         w.write_event(Event::End(BytesEnd::new("tds:GetScopesResponse")))
             .unwrap_or_default();
+        String::from_utf8(w.into_inner()).unwrap_or_default()
+    }
+
+    /// Build `<tds:SystemRebootResponse>` body.
+    ///
+    /// **Protocol answer only** — this library never performs the reboot
+    /// side effect. The ONVIF Device service defines SystemReboot as
+    /// "reboot the device"; here it is a byte-stable wire answer (WSDL
+    /// `SystemRebootResponse/Message`, parity with onvif-go's
+    /// `HandleSystemReboot` returning "Device rebooting"). Hosts that want
+    /// a real reboot observe the action in their handler wrapping layer;
+    /// keep this action authenticated (it is not in the anonymous set by
+    /// default), matching onvif-go which treats SystemReboot as a
+    /// write-style credential-protected action.
+    fn build_system_reboot(&self) -> String {
+        let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+        let mut root = BytesStart::new("tds:SystemRebootResponse");
+        root.push_attribute(("xmlns:tds", DEVICE_SERVICE));
+        w.write_event(Event::Start(root)).unwrap_or_default();
+
+        write_text(&mut w, "tds:Message", "Device rebooting");
+
+        w.write_event(Event::End(BytesEnd::new("tds:SystemRebootResponse")))
+            .unwrap_or_default();
+
         String::from_utf8(w.into_inner()).unwrap_or_default()
     }
 }
@@ -486,6 +514,67 @@ mod tests {
         assert!(xml.contains("onvif://www.onvif.org/type/video_encoder"));
         assert!(xml.contains("onvif://www.onvif.org/name/Pi Camera V1"));
         assert!(xml.contains("onvif://www.onvif.org/hardware/OV5647"));
+    }
+
+    // --------------------------------------------------------------
+    // SystemReboot (parity with onvif-go HandleSystemReboot)
+    // --------------------------------------------------------------
+
+    #[test]
+    fn test_build_system_reboot_contains_message() {
+        let h = test_handlers();
+        let xml = h.build_system_reboot();
+
+        assert!(xml.contains("tds:SystemRebootResponse"));
+        assert!(xml.contains("tds:Message"));
+        assert!(xml.contains("Device rebooting"));
+        // WSDL namespace declaration on the response root.
+        assert!(xml.contains("xmlns:tds"));
+        assert!(xml.contains(DEVICE_SERVICE));
+
+        // Verify well-formed XML
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("XML parse error in system_reboot: {e}"),
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_dispatches_system_reboot() {
+        let svc = Arc::new(test_handlers());
+        let handler = DeviceHandler(svc);
+        let ri = test_info("10.0.0.1");
+
+        let body = r#"<SystemReboot xmlns="http://www.onvif.org/ver10/device/wsdl"/>"#;
+        let resp = handler.handle(body, &ri).await.unwrap();
+
+        assert!(resp.contains("soap:Envelope"));
+        assert!(resp.contains("SystemRebootResponse"));
+        assert!(resp.contains("Device rebooting"));
+    }
+
+    /// A SOAP body mentioning SystemReboot inside a *different* action
+    /// element must not be misrouted by the substring dispatch chain.
+    #[tokio::test]
+    async fn test_handler_routes_get_actions_over_system_reboot_substring() {
+        let svc = Arc::new(test_handlers());
+        let handler = DeviceHandler(svc);
+        let ri = test_info("10.0.0.1");
+
+        // GetServices contains "Service", GetSystemDateAndTime contains
+        // "System"… but none of the existing actions contains the exact
+        // "SystemReboot" token; this pins the reverse direction — a body
+        // that IS SystemReboot never matches the earlier arms.
+        let body = r#"<GetDeviceInformation xmlns="http://www.onvif.org/ver10/device/wsdl"/>"#;
+        let resp = handler.handle(body, &ri).await.unwrap();
+        assert!(resp.contains("GetDeviceInformationResponse"));
+        assert!(!resp.contains("SystemRebootResponse"));
     }
 
     // --------------------------------------------------------------

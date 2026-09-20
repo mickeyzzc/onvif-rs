@@ -5,7 +5,7 @@
 [![CI](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
-![Tests](https://img.shields.io/badge/tests-157%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-188%20passing-brightgreen.svg)
 
 **ONVIF 设备端（服务端）Rust 库** —— 通过 SOAP + WS-Discovery 把摄像头或媒体源暴露给 ONVIF 消费方（NVR、视频管理平台）。
 
@@ -13,9 +13,10 @@
 
 ## 功能
 
-- **SOAP HTTP 服务端** —— 按动作注册处理器，覆盖 Device、Media、Imaging 与（虚拟）PTZ 服务
-- **WS-Discovery 应答器** —— UDP 组播 239.255.255.250:3702 Probe/ProbeMatches，按请求回显 XAddr；scopes 与 EndpointReference UUID 均可由宿主配置
+- **SOAP HTTP 服务端** —— 按动作注册处理器，覆盖 Device、Media、Imaging 与（虚拟）PTZ 服务；Device 服务含 **SystemReboot** 应答（仅协议层答复，是否真的重启由宿主决定）
+- **WS-Discovery 应答器** —— UDP 组播 239.255.255.250:3702 Probe/ProbeMatches，按请求回显 XAddr；scopes 与 EndpointReference UUID 均可由宿主配置；**启动即发 Hello、停机即发 Bye** 主动通告（与 ProbeMatches 同族信封）
 - **WS-Security** —— UsernameToken 校验，PasswordText 与 PasswordDigest（SHA-1），常数时间比较，空密码 **fail-closed** 处理
+- **TLS 监听**（可选 `tls` feature，默认关闭）—— 配置证书/私钥 PEM 路径后以 HTTPS 提供 ONVIF 服务（Profile T 传输基线）；两者必须同时设置（both-or-neither）
 - **命名空间无关的请求解析**（客户端可用任意 XML 前缀）与显式前缀序列化（`tds:`/`trt:`/`timg:`/`tt:`），所有插值均做 XML 转义
 - **虚拟 PTZ** —— 纯状态机（`ptz_state`）支撑无云台设备的 PTZ 服务
 - **优雅停机** —— SOAP 服务端与 discovery 应答器均支持
@@ -61,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
         password: "set-a-real-password".to_string(),
         ..Default::default()
     };
+    // TLS（可选 `tls` feature）：再设 tls_cert_file + tls_key_file 两个
+    // PEM 路径，start() 即以 https 提供服务（两者必须同时设置）。
     let mut server = OnvifServer::new(&config);
 
     // Device 服务：身份信息来自 DeviceConfig（宿主提供）。
