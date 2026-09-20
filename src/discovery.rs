@@ -33,6 +33,12 @@ pub const PROBE_ACTION: &str = "http://schemas.xmlsoap.org/ws/2004/09/discovery/
 pub const PROBE_MATCHES_ACTION: &str =
     "http://schemas.xmlsoap.org/ws/2004/09/discovery/ProbeMatches";
 
+/// WS-Discovery Hello action URI (power-on announcement).
+pub const HELLO_ACTION: &str = "http://schemas.xmlsoap.org/ws/2004/09/discovery/Hello";
+
+/// WS-Discovery Bye action URI (shutdown announcement).
+pub const BYE_ACTION: &str = "http://schemas.xmlsoap.org/ws/2004/09/discovery/Bye";
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -437,11 +443,82 @@ impl DiscoveryServer {
         Some(self.build_probe_matches(&message_id, host_ip))
     }
 
+    /// Build the WS-Discovery Hello announcement (power-on).
+    ///
+    /// Same envelope family and announcement fields as
+    /// [`DiscoveryServer::build_probe_matches`] — EndpointReference,
+    /// Types, Scopes, XAddrs, MetadataVersion — but as a one-shot `<d:Hello>`
+    /// body with no `RelatesTo` (parity with onvif-go's
+    /// `wsdiscovery.BuildHello`: a Hello is just a ProbeMatch that nobody
+    /// probed for).
+    pub fn build_hello(&self) -> Vec<u8> {
+        let scopes_str = self.scopes.join(" ");
+        let xaddrs_str = self.xaddrs("").join(" ");
+
+        let mut xml = String::new();
+        xml.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+        xml.push_str(r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" "#);
+        xml.push_str(r#"xmlns:a="http://www.w3.org/2005/08/addressing">"#);
+        xml.push_str("<s:Header>");
+        xml.push_str(&format!(
+            r#"<a:Action s:mustUnderstand="1">{}</a:Action>"#,
+            HELLO_ACTION
+        ));
+        xml.push_str("</s:Header>");
+        xml.push_str("<s:Body>");
+        xml.push_str(&format!(r#"<d:Hello xmlns:d="{}">"#, DISCOVERY_NS));
+        xml.push_str(&format!(
+            r#"<a:EndpointReference xmlns:a="http://www.w3.org/2005/08/addressing"><a:Address>{}</a:Address></a:EndpointReference>"#,
+            xml_escape(&self.uuid)
+        ));
+        xml.push_str("<d:Types>tdn:NetworkVideoTransmitter tdn:Device</d:Types>");
+        xml.push_str(&format!("<d:Scopes>{}</d:Scopes>", xml_escape(&scopes_str)));
+        xml.push_str(&format!("<d:XAddrs>{}</d:XAddrs>", xml_escape(&xaddrs_str)));
+        xml.push_str("<d:MetadataVersion>1</d:MetadataVersion>");
+        xml.push_str("</d:Hello>");
+        xml.push_str("</s:Body>");
+        xml.push_str("</s:Envelope>");
+
+        xml.into_bytes()
+    }
+
+    /// Build the WS-Discovery Bye announcement (shutdown).
+    ///
+    /// Minimal per the WS-Discovery Appendix I Bye form (and onvif-go's
+    /// `wsdiscovery.BuildBye`): only the EndpointReference — the device is
+    /// going away, so there is nothing left to dial.
+    pub fn build_bye(&self) -> Vec<u8> {
+        let mut xml = String::new();
+        xml.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+        xml.push_str(r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" "#);
+        xml.push_str(r#"xmlns:a="http://www.w3.org/2005/08/addressing">"#);
+        xml.push_str("<s:Header>");
+        xml.push_str(&format!(
+            r#"<a:Action s:mustUnderstand="1">{}</a:Action>"#,
+            BYE_ACTION
+        ));
+        xml.push_str("</s:Header>");
+        xml.push_str("<s:Body>");
+        xml.push_str(&format!(r#"<d:Bye xmlns:d="{}">"#, DISCOVERY_NS));
+        xml.push_str(&format!(
+            r#"<a:EndpointReference xmlns:a="http://www.w3.org/2005/08/addressing"><a:Address>{}</a:Address></a:EndpointReference>"#,
+            xml_escape(&self.uuid)
+        ));
+        xml.push_str("</d:Bye>");
+        xml.push_str("</s:Body>");
+        xml.push_str("</s:Envelope>");
+
+        xml.into_bytes()
+    }
+
     /// Start the UDP multicast listener.
     ///
     /// Binds to `0.0.0.0:3702`, joins the `239.255.255.250` multicast group,
-    /// and spawns a background task that reads Probe messages and sends
-    /// ProbeMatches responses.
+    /// multicasts a WS-Discovery **Hello** announcement (parity with
+    /// onvif-go's discovery.Responder), and spawns a background task that
+    /// reads Probe messages and sends ProbeMatches responses. A **Bye**
+    /// announcement is multicast when the listener stops (explicit
+    /// [`DiscoveryHandle::shutdown`] or dropping the handle).
     ///
     /// Returns a [`DiscoveryHandle`] — await it for the listener task's exit
     /// or call [`DiscoveryHandle::shutdown`] to stop it. (Binding and
@@ -474,6 +551,15 @@ impl DiscoveryServer {
         let mut shutdown_listener = shutdown_rx.clone();
 
         let task = tokio::spawn(async move {
+            // Power-on announcement. Best effort: a responder whose Hello is
+            // lost still answers Probes — losing the announcement only costs
+            // proactive discovery, not the protocol.
+            if let Err(e) = socket.send_to(&server.build_hello(), DISCOVERY_ADDR).await {
+                log::warn!("discovery: failed to send Hello: {e}");
+            } else {
+                log::debug!("discovery: Hello announced to {DISCOVERY_ADDR}");
+            }
+
             loop {
                 tokio::select! {
                     result = run_udp_listener_once(&socket, &server, &mut shutdown_listener) => {
@@ -486,6 +572,14 @@ impl DiscoveryServer {
                         break;
                     }
                 }
+            }
+
+            // Shutdown announcement on the way out (also best effort — the
+            // socket may already be failing, which is why we are here).
+            if let Err(e) = socket.send_to(&server.build_bye(), DISCOVERY_ADDR).await {
+                log::warn!("discovery: failed to send Bye: {e}");
+            } else {
+                log::debug!("discovery: Bye announced to {DISCOVERY_ADDR}");
             }
         });
 
@@ -903,6 +997,99 @@ mod tests {
             buf.clear();
         }
         assert!(events > 10, "should have many XML events, got {events}");
+    }
+
+    // ------------------------------------------------------------------
+    // Hello / Bye announcements (parity with onvif-go discovery.Responder)
+    // ------------------------------------------------------------------
+
+    /// Hello mirrors the ProbeMatch announcement (same EndpointReference,
+    /// Types, Scopes, XAddrs, MetadataVersion) in the WS-Discovery Hello
+    /// envelope: Action .../Hello, Body <d:Hello> with the match fields.
+    #[test]
+    fn test_build_hello_contains_announcement() {
+        let server = DiscoveryServer::with_identity("10.0.0.1", 8080, "Gate Cam", "IMX219");
+        let resp = server.build_hello();
+        let xml = String::from_utf8(resp).expect("valid UTF-8");
+
+        assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        assert!(xml.contains("<s:Envelope"));
+        assert!(xml.contains(HELLO_ACTION));
+        assert!(xml.contains("<d:Hello"));
+        assert!(xml.contains("</d:Hello>"));
+        // Hello carries no RelatesTo (nothing to relate to).
+        assert!(!xml.contains("RelatesTo"));
+        // Announcement fields (go twin order: EndpointReference, Types,
+        // Scopes, XAddrs, MetadataVersion).
+        assert!(xml.contains(&format!("<a:Address>{}</a:Address>", server.uuid)));
+        assert!(xml.contains("<d:Types>"));
+        assert!(xml.contains("tdn:NetworkVideoTransmitter"));
+        assert!(xml.contains("<d:Scopes>"));
+        assert!(xml.contains("onvif://www.onvif.org/name/Gate%20Cam"));
+        assert!(xml.contains("<d:XAddrs>"));
+        assert!(xml.contains("http://10.0.0.1:8080/onvif/device_service"));
+        assert!(xml.contains("<d:MetadataVersion>1</d:MetadataVersion>"));
+
+        // Well-formed XML
+        let mut reader = Reader::from_str(&xml);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("Hello is not well-formed XML: {e}"),
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+
+    /// Bye is the minimal shutdown announcement: Action .../Bye, Body
+    /// <d:Bye> carrying only the EndpointReference — no Types/Scopes/
+    /// XAddrs (the device is going away; there is nothing to dial).
+    #[test]
+    fn test_build_bye_contains_endpoint_only() {
+        let server = DiscoveryServer::new("10.0.0.1", 8080);
+        let resp = server.build_bye();
+        let xml = String::from_utf8(resp).expect("valid UTF-8");
+
+        assert!(xml.contains(BYE_ACTION));
+        assert!(xml.contains("<d:Bye"));
+        assert!(xml.contains("</d:Bye>"));
+        assert!(xml.contains(&format!("<a:Address>{}</a:Address>", server.uuid)));
+        assert!(!xml.contains("<d:XAddrs>"));
+        assert!(!xml.contains("<d:Scopes>"));
+        assert!(!xml.contains("RelatesTo"));
+
+        // Well-formed XML
+        let mut reader = Reader::from_str(&xml);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("Bye is not well-formed XML: {e}"),
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+
+    /// Hello and ProbeMatches must agree on identity and reachability —
+    /// consumers keying on EndpointReference must see one device.
+    #[test]
+    fn test_hello_agrees_with_probe_matches() {
+        let server = DiscoveryServer::with_identity("10.0.0.7", 8181, "Cam", "HW");
+        let hello = String::from_utf8(server.build_hello()).expect("utf8");
+        let matches = String::from_utf8(server.build_probe_matches("uuid:x", "")).expect("utf8");
+
+        for needle in [
+            server.uuid.as_str(),
+            "onvif://www.onvif.org/Profile/Streaming",
+            "http://10.0.0.7:8181/onvif/device_service",
+            "tdn:NetworkVideoTransmitter",
+        ] {
+            assert!(hello.contains(needle), "Hello missing {needle}");
+            assert!(matches.contains(needle), "ProbeMatches missing {needle}");
+        }
     }
 
     // ------------------------------------------------------------------
