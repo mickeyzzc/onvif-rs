@@ -11,7 +11,9 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::auth::verify_username_token;
-use crate::events::{EventsService, ServiceEndpoint, EVENTS_SERVICE_PATH, SUBSCRIPTION_PATH_PREFIX};
+use crate::events::{
+    EventsService, ServiceEndpoint, EVENTS_SERVICE_PATH, SUBSCRIPTION_PATH_PREFIX,
+};
 use crate::types::{serialize_soap_fault, AuthResult, OnvifError, RequestInfo, UsernameToken};
 
 // ---------------------------------------------------------------------------
@@ -290,7 +292,10 @@ impl OnvifServer {
     /// `OnvifConfig::port` is ignored; the listener's own address is used.
     /// With `tls_cert_file`/`tls_key_file` configured (and the `tls`
     /// feature enabled) every accepted connection is served over TLS.
-    pub async fn start_on(mut self, listener: TcpListener) -> Result<OnvifServerHandle, OnvifError> {
+    pub async fn start_on(
+        mut self,
+        listener: TcpListener,
+    ) -> Result<OnvifServerHandle, OnvifError> {
         Self::validate_config(&self.config)?;
         #[cfg(feature = "tls")]
         let tls_acceptor = build_tls_acceptor(&self.config)?;
@@ -318,10 +323,7 @@ impl OnvifServer {
         let events = self.events;
         // The listener's actual port (an ephemeral one with `start_on`) —
         // the events service builds SubscriptionReference addresses on it.
-        let server_port = listener
-            .local_addr()
-            .map(|a| a.port())
-            .unwrap_or(cfg.port);
+        let server_port = listener.local_addr().map(|a| a.port()).unwrap_or(cfg.port);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let task = tokio::spawn(async move {
@@ -713,7 +715,13 @@ where
                 server_ip: server_ip.to_string(),
                 auth_result,
             };
-            dispatch_handler(stream, metrics, &parsed.action, handler.handle(&parsed.body_xml, &request_info)).await?;
+            dispatch_handler(
+                stream,
+                metrics,
+                &parsed.action,
+                handler.handle(&parsed.body_xml, &request_info),
+            )
+            .await?;
         }
         RequestRoute::EventsService | RequestRoute::EventsSubscription => {
             let events = match events {
@@ -755,9 +763,11 @@ where
             let future: std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<String, OnvifError>> + Send + '_>,
             > = match route {
-                RequestRoute::EventsService => Box::pin(
-                    events.handle_service_action(&parsed.action, &parsed.body_xml, &endpoint),
-                ),
+                RequestRoute::EventsService => Box::pin(events.handle_service_action(
+                    &parsed.action,
+                    &parsed.body_xml,
+                    &endpoint,
+                )),
                 _ => Box::pin(events.handle_subscription_action(
                     &path,
                     &parsed.action,
