@@ -112,6 +112,11 @@ pub enum OnvifError {
     InvalidConfig(String),
     /// Internal server error.
     Internal(String),
+    /// A client (sender) mistake — serialized as a SOAP **Sender** fault
+    /// with HTTP 400 instead of the default Receiver/500 (parity with
+    /// onvif-go's `SenderFaultError`): unknown subscriptions, invalid
+    /// durations, exceeded limits, and other request-side problems.
+    SenderFault(String),
 }
 
 impl std::fmt::Display for OnvifError {
@@ -122,6 +127,7 @@ impl std::fmt::Display for OnvifError {
             OnvifError::InvalidXml(m) => write!(f, "Invalid XML: {m}"),
             OnvifError::InvalidConfig(m) => write!(f, "Invalid configuration: {m}"),
             OnvifError::Internal(m) => write!(f, "Internal error: {m}"),
+            OnvifError::SenderFault(m) => write!(f, "Sender fault: {m}"),
         }
     }
 }

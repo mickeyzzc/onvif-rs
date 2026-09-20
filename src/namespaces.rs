@@ -28,5 +28,15 @@ pub const PTZ_SERVICE: &str = "http://www.onvif.org/ver20/ptz/wsdl";
 /// ONVIF Imaging Service WSDL namespace.
 pub const IMAGING_SERVICE: &str = "http://www.onvif.org/ver20/imaging/wsdl";
 
+/// ONVIF Events Service WSDL namespace (`tev`).
+pub const EVENTS_SERVICE: &str = "http://www.onvif.org/ver10/events/wsdl";
+
+/// WS-BaseNotification namespace (`wsnt` — Topic, NotificationMessage,
+/// CurrentTime/TerminationTime, Renew/Unsubscribe).
+pub const WS_NOTIFICATION: &str = "http://docs.oasis-open.org/wsn/b-2";
+
+/// WS-Topics namespace (`wstop` — TopicSet).
+pub const WS_TOPICS: &str = "http://docs.oasis-open.org/wsn/t-1";
+
 /// ONVIF Schema namespace (data types common across services).
 pub const SCHEMAS: &str = "http://www.onvif.org/ver10/schema";
