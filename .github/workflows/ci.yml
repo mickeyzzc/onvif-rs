@@ -28,8 +28,15 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      # The `tls` feature gates real code paths (tokio-rustls listener +
+      # rustls-pemfile loading + tests/server_tls.rs) — clippy and test it
+      # in CI or it silently rots uncompiled.
+      - name: Clippy (tls feature)
+        run: cargo clippy --all-targets --features tls -- -D warnings
       - name: Test
         run: cargo test
+      - name: Test (tls feature)
+        run: cargo test --features tls
 
   msrv:
     # The rust-version field is a resolver contract for downstreams —
