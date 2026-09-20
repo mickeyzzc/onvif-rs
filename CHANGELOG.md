@@ -11,6 +11,18 @@ are released out of band.
 
 ## [Unreleased]
 
+## [v0.7.0] — 2026-09-20
+
+Capability parity with onvif-go, plus the quick-xml security upgrade.
+
+- `fix(deps)` **quick-xml 0.36 → 0.41** (#37, RUSTSEC-2026-0194/0195,
+  high 7.5): both advisories are untrusted-XML parse surface — this
+  library's day job. Parsing loops were restructured onto the new event
+  model (`TextAccumulator`: region accumulation, entity resolution,
+  undefined-entity poisoning preserving the old unescape semantics);
+  entity-carrying passwords now accumulate correctly across split text
+  events (the old per-event overwrite dropped them).
+
 - `feat(device)` **SystemReboot** — the Device service answers the
   SystemReboot action with the WSDL `SystemRebootResponse/Message` form
   (`Message` = "Device rebooting", parity with onvif-go's
@@ -47,6 +59,14 @@ are released out of band.
   service only while enabled; Create* actions sit behind WS-Security
   while reads stay open; with events disabled the routes answer 404 and
   the wire is byte-identical to before.
+
+- `ci` coverage gate at **85% lines** (#39 + #43, measured baseline
+  ~94%); the `tls` feature is now compiled, linted, and tested in CI
+  (#40); repo hygiene gate (#35).
+- `test` property arms for the untrusted parse surfaces (#42, #44):
+  the SOAP request parser, discovery Probe datagrams, and UsernameToken
+  Created fields never panic on arbitrary input.
+- `docs` manuals migrated to the documentation hub (#36).
 
 ## [v0.6.0] — 2026-09-09
 
