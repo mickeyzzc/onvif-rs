@@ -17,6 +17,7 @@
 - **WS-Discovery 应答器** —— UDP 组播 239.255.255.250:3702 Probe/ProbeMatches，按请求回显 XAddr；scopes 与 EndpointReference UUID 均可由宿主配置；**启动即发 Hello、停机即发 Bye** 主动通告（与 ProbeMatches 同族信封）
 - **WS-Security** —— UsernameToken 校验，PasswordText 与 PasswordDigest（SHA-1），常数时间比较，空密码 **fail-closed** 处理
 - **TLS 监听**（可选 `tls` feature，默认关闭）—— 配置证书/私钥 PEM 路径后以 HTTPS 提供 ONVIF 服务（Profile T 传输基线）；两者必须同时设置（both-or-neither）
+- **事件 pull-point 服务**（对齐 onvif-go 的 `SupportEvents`）—— `server.enable_events()` 后，服务器在自有监听器上路由 `/onvif/events_service`（GetServiceCapabilities / GetEventProperties / CreatePullPointSubscription）与 `/onvif/events_service/sub/<id>`（PullMessages / Renew / Unsubscribe）；宿主通过返回的 `EventsService::publish_event` 接缝注入事件（扇出到全部在订订阅；Concrete/ConcreteSet 主题过滤、ISO8601 终止时间钳制、长轮询 PT0S 合法）；GetCapabilities/GetServices 仅在启用时通告该服务，Create* 动作走 WS-Security 而读操作开放
 - **命名空间无关的请求解析**（客户端可用任意 XML 前缀）与显式前缀序列化（`tds:`/`trt:`/`timg:`/`tt:`），所有插值均做 XML 转义
 - **虚拟 PTZ** —— 纯状态机（`ptz_state`）支撑无云台设备的 PTZ 服务
 - **优雅停机** —— SOAP 服务端与 discovery 应答器均支持

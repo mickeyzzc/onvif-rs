@@ -11,6 +11,9 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::auth::verify_username_token;
+use crate::events::{
+    EventsService, ServiceEndpoint, EVENTS_SERVICE_PATH, SUBSCRIPTION_PATH_PREFIX,
+};
 use crate::types::{serialize_soap_fault, AuthResult, OnvifError, RequestInfo, UsernameToken};
 
 // ---------------------------------------------------------------------------
@@ -63,6 +66,13 @@ pub struct OnvifConfig {
     /// Read once at `start_on`/`start` — later file changes need a
     /// restart.
     pub tls_key_file: String,
+    /// Serve the ONVIF Events pull-point service (parity with onvif-go's
+    /// `SupportEvents`): routes `{base}/events_service` and the
+    /// per-subscription `{base}/events_service/sub/<id>` subtree on this
+    /// server's listener. Default `false` — no routes, no advertisement
+    /// change. Grab the host publish seam via
+    /// [`OnvifServer::enable_events`] before starting.
+    pub support_events: bool,
 }
 
 impl Default for OnvifConfig {
@@ -79,6 +89,7 @@ impl Default for OnvifConfig {
             auth_lockout_secs: 60,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
+            support_events: false,
         }
     }
 }
@@ -168,6 +179,9 @@ pub struct OnvifServer {
     anonymous_actions: HashSet<String>,
     /// Library-neutral observability hooks (issue #18).
     metrics: Arc<dyn crate::metrics::MetricsHooks>,
+    /// The events pull-point service, when enabled (`support_events` /
+    /// [`OnvifServer::enable_events`]).
+    events: Option<Arc<EventsService>>,
 }
 
 impl OnvifServer {
@@ -178,6 +192,7 @@ impl OnvifServer {
             handlers: HashMap::new(),
             anonymous_actions: HashSet::new(),
             metrics: Arc::new(crate::metrics::NoopMetrics),
+            events: None,
         }
     }
 
@@ -202,6 +217,30 @@ impl OnvifServer {
     /// client can compute the WS-Security digest, so it is exempt from auth.
     pub fn register_anonymous_action(&mut self, action: &str) {
         self.anonymous_actions.insert(action.to_string());
+    }
+
+    /// Enable the events pull-point service (parity with onvif-go's
+    /// `SupportEvents`): the server routes `/onvif/events_service`
+    /// (GetServiceCapabilities / GetEventProperties /
+    /// CreatePullPointSubscription) and `/onvif/events_service/sub/<id>`
+    /// (PullMessages / Renew / Unsubscribe) on the listener it already
+    /// owns. Returns the shared [`EventsService`] handle — the host-side
+    /// publish seam ([`EventsService::publish_event`]); keep it to inject
+    /// events. Call before `start`/`start_on`.
+    pub fn enable_events(&mut self) -> Arc<EventsService> {
+        self.config.support_events = true;
+        self.events
+            .get_or_insert_with(|| Arc::new(EventsService::new()))
+            .clone()
+    }
+
+    /// The events service handle, when enabled (via `enable_events` or
+    /// `OnvifConfig::support_events`); `None` while disabled. The same
+    /// handle the server routes to — publishing through it reaches every
+    /// live pull-point subscription.
+    #[must_use]
+    pub fn events_service(&self) -> Option<Arc<EventsService>> {
+        self.events.clone()
     }
 
     /// Validate the configuration. Fail-closed: an empty password without an
@@ -253,7 +292,10 @@ impl OnvifServer {
     /// `OnvifConfig::port` is ignored; the listener's own address is used.
     /// With `tls_cert_file`/`tls_key_file` configured (and the `tls`
     /// feature enabled) every accepted connection is served over TLS.
-    pub async fn start_on(self, listener: TcpListener) -> Result<OnvifServerHandle, OnvifError> {
+    pub async fn start_on(
+        mut self,
+        listener: TcpListener,
+    ) -> Result<OnvifServerHandle, OnvifError> {
         Self::validate_config(&self.config)?;
         #[cfg(feature = "tls")]
         let tls_acceptor = build_tls_acceptor(&self.config)?;
@@ -272,6 +314,16 @@ impl OnvifServer {
         let cfg = Arc::new(self.config);
         let anonymous = Arc::new(self.anonymous_actions);
         let metrics = self.metrics;
+        // Events pull-point service (created here when enabled purely by
+        // config — hosts that want the publish seam call enable_events
+        // before starting and the same instance is reused).
+        if cfg.support_events && self.events.is_none() {
+            self.events = Some(Arc::new(EventsService::new()));
+        }
+        let events = self.events;
+        // The listener's actual port (an ephemeral one with `start_on`) —
+        // the events service builds SubscriptionReference addresses on it.
+        let server_port = listener.local_addr().map(|a| a.port()).unwrap_or(cfg.port);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let task = tokio::spawn(async move {
@@ -296,6 +348,7 @@ impl OnvifServer {
                 let anonymous = Arc::clone(&anonymous);
                 let auth_state = Arc::clone(&auth_state);
                 let metrics = Arc::clone(&metrics);
+                let events = events.clone();
                 #[cfg(feature = "tls")]
                 let tls_acceptor = tls_acceptor.clone();
 
@@ -318,11 +371,13 @@ impl OnvifServer {
                                     &mut tls_stream,
                                     &client_ip,
                                     &server_ip,
+                                    server_port,
                                     &handlers,
                                     &cfg,
                                     &anonymous,
                                     &auth_state,
                                     &metrics,
+                                    &events,
                                 )
                                 .await;
                                 // Orderly TLS close (close_notify) — dropping
@@ -341,11 +396,13 @@ impl OnvifServer {
                                 &mut stream,
                                 &client_ip,
                                 &server_ip,
+                                server_port,
                                 &handlers,
                                 &cfg,
                                 &anonymous,
                                 &auth_state,
                                 &metrics,
+                                &events,
                             )
                             .await
                         }
@@ -355,11 +412,13 @@ impl OnvifServer {
                         &mut stream,
                         &client_ip,
                         &server_ip,
+                        server_port,
                         &handlers,
                         &cfg,
                         &anonymous,
                         &auth_state,
                         &metrics,
+                        &events,
                     )
                     .await;
 
@@ -508,11 +567,13 @@ async fn handle_connection<S>(
     stream: &mut S,
     client_ip: &str,
     server_ip: &str,
+    server_port: u16,
     handlers: &HandlerMap,
     cfg: &SharedConfig,
     anonymous: &SharedAnonymous,
     auth_state: &Arc<AuthState>,
     metrics: &Arc<dyn crate::metrics::MetricsHooks>,
+    events: &Option<Arc<EventsService>>,
 ) -> Result<(), OnvifError>
 where
     // Plain TcpStream without the `tls` feature, a TLS session with it.
@@ -520,8 +581,8 @@ where
 {
     // --- Read HTTP request (bounded header, bounded body, read timeout) ---
     let read = read_http_request(stream, cfg);
-    let (method, body) = match tokio::time::timeout(cfg.read_timeout, read).await {
-        Ok(Ok(pair)) => pair,
+    let (method, path, body) = match tokio::time::timeout(cfg.read_timeout, read).await {
+        Ok(Ok(triple)) => triple,
         Ok(Err(OnvifError::InvalidXml(m))) if m.starts_with("body too large") => {
             let fault = serialize_soap_fault("soap:Sender", &m);
             write_http_response(stream, 413, &fault).await?;
@@ -607,62 +668,189 @@ where
     }
 
     // --- Dispatch ---
-    let handler = match handlers.get(&parsed.action) {
-        Some(h) => h,
-        None => {
-            let fault = serialize_soap_fault(
-                "soap:Sender",
-                &format!("unsupported action: {}", parsed.action),
-            );
-            write_http_response(stream, 400, &fault).await?;
-            return Ok(());
-        }
-    };
-
-    let is_anonymous = anonymous.contains(&parsed.action);
-    if !is_anonymous && !auth_disabled && !auth_result.authenticated {
-        let fault = serialize_soap_fault(
-            "soap:Sender",
-            &format!("authentication required for action: {}", parsed.action),
-        );
-        write_http_response(stream, 401, &fault).await?;
+    // Events pull-point paths are routed by URL (parity with onvif-go's
+    // mux: the service endpoint + the per-subscription subtree); every
+    // other path keeps the historical action-map dispatch unchanged.
+    let route = classify_request_route(&path, events.as_ref());
+    if route == RequestRoute::NotFound {
+        // No route serves this path — parity with onvif-go's ServeMux 404
+        // for the events subtree when the service is disabled.
+        write_http_response(stream, 404, "404 page not found\n").await?;
         return Ok(());
     }
 
-    let request_info = RequestInfo {
-        client_ip: client_ip.to_string(),
-        server_ip: server_ip.to_string(),
-        auth_result,
+    // The auth gate each route applies before invoking its handler.
+    let route_requires_auth = match route {
+        RequestRoute::Default => !anonymous.contains(&parsed.action),
+        // onvif-go's default policy: write-style actions (Set/Remove/
+        // Create/Go) protected, reads open — for the events actions that
+        // means CreatePullPointSubscription needs credentials, the rest
+        // stay open.
+        _ => EventsService::action_requires_auth(&parsed.action),
     };
 
-    // Handler panics are contained (issue #15): the request gets a 500
-    // and the server keeps serving instead of losing the connection task.
-    metrics.soap_request(&parsed.action);
-    let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-        handler.handle(&parsed.body_xml, &request_info),
-    ))
-    .await;
+    match route {
+        RequestRoute::Default => {
+            let handler = match handlers.get(&parsed.action) {
+                Some(h) => h,
+                None => {
+                    let fault = serialize_soap_fault(
+                        "soap:Sender",
+                        &format!("unsupported action: {}", parsed.action),
+                    );
+                    write_http_response(stream, 400, &fault).await?;
+                    return Ok(());
+                }
+            };
+            if route_requires_auth && !auth_disabled && !auth_result.authenticated {
+                let fault = serialize_soap_fault(
+                    "soap:Sender",
+                    &format!("authentication required for action: {}", parsed.action),
+                );
+                write_http_response(stream, 401, &fault).await?;
+                return Ok(());
+            }
+            let request_info = RequestInfo {
+                client_ip: client_ip.to_string(),
+                server_ip: server_ip.to_string(),
+                auth_result,
+            };
+            dispatch_handler(
+                stream,
+                metrics,
+                &parsed.action,
+                handler.handle(&parsed.body_xml, &request_info),
+            )
+            .await?;
+        }
+        RequestRoute::EventsService | RequestRoute::EventsSubscription => {
+            let events = match events {
+                Some(ev) => Arc::clone(ev),
+                // classify_request_route only returns events routes with
+                // the service enabled; defensive otherwise.
+                None => return Err(OnvifError::Internal("events service unavailable".into())),
+            };
+            let known_action = match route {
+                RequestRoute::EventsService => EventsService::is_service_action(&parsed.action),
+                _ => EventsService::is_subscription_action(&parsed.action),
+            };
+            if !known_action {
+                let fault = serialize_soap_fault(
+                    "soap:Sender",
+                    &format!("unsupported action: {}", parsed.action),
+                );
+                write_http_response(stream, 400, &fault).await?;
+                return Ok(());
+            }
+            if route_requires_auth && !auth_disabled && !auth_result.authenticated {
+                let fault = serialize_soap_fault(
+                    "soap:Sender",
+                    &format!("authentication required for action: {}", parsed.action),
+                );
+                write_http_response(stream, 401, &fault).await?;
+                return Ok(());
+            }
+            let endpoint = ServiceEndpoint {
+                host: if server_ip.is_empty() {
+                    "127.0.0.1".to_string()
+                } else {
+                    server_ip.to_string()
+                },
+                port: server_port,
+            };
+            // Handler panics are contained (issue #15), same as the action
+            // map: the request gets a 500 and the server keeps serving.
+            let future: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<String, OnvifError>> + Send + '_>,
+            > = match route {
+                RequestRoute::EventsService => Box::pin(events.handle_service_action(
+                    &parsed.action,
+                    &parsed.body_xml,
+                    &endpoint,
+                )),
+                _ => Box::pin(events.handle_subscription_action(
+                    &path,
+                    &parsed.action,
+                    &parsed.body_xml,
+                    &endpoint,
+                )),
+            };
+            dispatch_handler(stream, metrics, &parsed.action, future).await?;
+        }
+        RequestRoute::NotFound => unreachable!("handled above"),
+    }
+
+    Ok(())
+}
+
+/// Invoke an already-authenticated handler future with panic containment
+/// (issue #15) and write its outcome: 200 on success, a Sender fault with
+/// HTTP 400 for client mistakes ([`OnvifError::SenderFault`], parity with
+/// onvif-go's SenderFaultError), a Receiver fault with 500 otherwise.
+async fn dispatch_handler<F>(
+    stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    metrics: &Arc<dyn crate::metrics::MetricsHooks>,
+    action: &str,
+    future: F,
+) -> Result<(), OnvifError>
+where
+    F: std::future::Future<Output = Result<String, OnvifError>>,
+{
+    metrics.soap_request(action);
+    let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(future)).await;
     match outcome {
         Ok(Ok(response_xml)) => {
             write_http_response(stream, 200, &response_xml).await?;
         }
+        Ok(Err(OnvifError::SenderFault(reason))) => {
+            metrics.soap_fault(action);
+            let fault = serialize_soap_fault("soap:Sender", &reason);
+            write_http_response(stream, 400, &fault).await?;
+        }
         Ok(Err(e)) => {
-            metrics.soap_fault(&parsed.action);
+            metrics.soap_fault(action);
             let fault = serialize_soap_fault("soap:Receiver", &e.to_string());
             write_http_response(stream, 500, &fault).await?;
         }
         Err(panic_payload) => {
-            metrics.soap_fault(&parsed.action);
-            log::error!(
-                "onvif: handler panicked for action {}: {panic_payload:?}",
-                parsed.action
-            );
+            metrics.soap_fault(action);
+            log::error!("onvif: handler panicked for action {action}: {panic_payload:?}");
             let fault = serialize_soap_fault("soap:Receiver", "internal handler error");
             write_http_response(stream, 500, &fault).await?;
         }
     }
-
     Ok(())
+}
+
+/// How an incoming request path is served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestRoute {
+    /// Historical action-map dispatch — every path outside the events
+    /// subtree, byte-identical to the pre-events router.
+    Default,
+    /// `/onvif/events_service` with the events service enabled.
+    EventsService,
+    /// Under `/onvif/events_service/sub/` with the events service enabled.
+    EventsSubscription,
+    /// An events-service path with no route serving it (the service is
+    /// disabled) — onvif-go's mux would 404.
+    NotFound,
+}
+
+fn classify_request_route(path: &str, events: Option<&Arc<EventsService>>) -> RequestRoute {
+    if path == EVENTS_SERVICE_PATH {
+        match events {
+            Some(_) => RequestRoute::EventsService,
+            None => RequestRoute::NotFound,
+        }
+    } else if path.starts_with(SUBSCRIPTION_PATH_PREFIX) {
+        match events {
+            Some(_) => RequestRoute::EventsSubscription,
+            None => RequestRoute::NotFound,
+        }
+    } else {
+        RequestRoute::Default
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,11 +859,11 @@ where
 
 /// Read one HTTP request: header section (capped at [`MAX_HEADER_BYTES`],
 /// may span multiple reads), then exactly `Content-Length` body bytes
-/// (capped at `cfg.max_body_bytes`).
+/// (capped at `cfg.max_body_bytes`). Returns `(method, path, body)`.
 async fn read_http_request<S>(
     stream: &mut S,
     cfg: &OnvifConfig,
-) -> Result<(String, String), OnvifError>
+) -> Result<(String, String, String), OnvifError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -703,13 +891,11 @@ where
     let header_str = str::from_utf8(&data[..header_end])
         .map_err(|_| OnvifError::InvalidXml("invalid HTTP header encoding".into()))?;
 
-    // Extract method (first token of the first line)
+    // Extract method and path (first two tokens of the first line).
     let first_line = header_str.lines().next().unwrap_or("");
-    let method = first_line
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let mut tokens = first_line.split_whitespace();
+    let method = tokens.next().unwrap_or("").to_string();
+    let path = tokens.next().unwrap_or("/").to_string();
 
     // Extract Content-Length
     let content_length = header_str
@@ -757,7 +943,7 @@ where
     let body_str = String::from_utf8(body)
         .map_err(|_| OnvifError::InvalidXml("request body is not valid UTF-8".into()))?;
 
-    Ok((method, body_str))
+    Ok((method, path, body_str))
 }
 
 /// Read and discard pending inbound bytes (bounded) so closing the socket
@@ -790,6 +976,7 @@ where
         200 => "200 OK",
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
+        404 => "404 Not Found",
         405 => "405 Method Not Allowed",
         413 => "413 Content Too Large",
         500 => "500 Internal Server Error",

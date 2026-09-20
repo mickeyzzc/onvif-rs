@@ -12,7 +12,9 @@ use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use crate::config::DeviceConfig;
-use crate::namespaces::{DEVICE_SERVICE, IMAGING_SERVICE, MEDIA_SERVICE, PTZ_SERVICE, SCHEMAS};
+use crate::namespaces::{
+    DEVICE_SERVICE, EVENTS_SERVICE, IMAGING_SERVICE, MEDIA_SERVICE, PTZ_SERVICE, SCHEMAS,
+};
 use crate::server::OnvifActionHandler;
 use crate::types::{resolve_server_ip, serialize_soap_response, OnvifError, RequestInfo};
 
@@ -25,6 +27,10 @@ pub struct DeviceServiceHandlers {
     device_config: DeviceConfig,
     onvif_port: u16,
     device_ip: String,
+    /// Advertise the Events service in GetCapabilities/GetServices (the
+    /// host must also serve the routes — `OnvifServer::enable_events` on
+    /// the SOAP side; parity with onvif-go's SupportEvents flagging both).
+    support_events: bool,
 }
 
 impl DeviceServiceHandlers {
@@ -43,7 +49,19 @@ impl DeviceServiceHandlers {
             device_config,
             onvif_port,
             device_ip,
+            support_events: false,
         })
+    }
+
+    /// Advertise (or omit) the Events service in GetCapabilities /
+    /// GetServices. Set together with `OnvifServer::enable_events` so the
+    /// advertisement and the served routes agree — with
+    /// `WSPullPointSupport = true`, because the pull-point service really
+    /// serves Create/Pull/Renew/Unsubscribe on the advertised XAddr.
+    #[must_use]
+    pub fn with_events_support(mut self, support: bool) -> Self {
+        self.support_events = support;
+        self
     }
 
     fn base_url(&self, server_ip: &str) -> String {
@@ -173,6 +191,21 @@ impl DeviceServiceHandlers {
         capability_xaddr(&mut w, "tt:Media", &base, "/media_service");
         capability_xaddr(&mut w, "tt:PTZ", &base, "/ptz_service");
         capability_xaddr(&mut w, "tt:Imaging", &base, "/device_service");
+        if self.support_events {
+            // WSPullPointSupport=true: the events service really serves
+            // CreatePullPointSubscription/PullMessages/Renew/Unsubscribe on
+            // the advertised XAddr (parity with onvif-go, including its
+            // spec-divergent WSPausableSubscriptionManagerInterfaceSupport
+            // attribute name — twin wire parity wins over the spec text).
+            let mut events = BytesStart::new("tt:Events");
+            events.push_attribute(("WSSubscriptionPolicySupport", "false"));
+            events.push_attribute(("WSPullPointSupport", "true"));
+            events.push_attribute(("WSPausableSubscriptionManagerInterfaceSupport", "false"));
+            w.write_event(Event::Start(events)).unwrap_or_default();
+            write_text(&mut w, "tt:XAddr", &format!("{base}/events_service"));
+            w.write_event(Event::End(BytesEnd::new("tt:Events")))
+                .unwrap_or_default();
+        }
         w.write_event(Event::End(BytesEnd::new("tds:Capabilities")))
             .unwrap_or_default();
 
@@ -184,12 +217,15 @@ impl DeviceServiceHandlers {
     /// Build `<tds:GetServicesResponse>` body.
     fn build_services(&self, server_ip: &str) -> String {
         let base = self.base_url(server_ip);
-        let services: &[(&str, &str)] = &[
+        let mut services: Vec<(&str, &str)> = vec![
             (DEVICE_SERVICE, "/device_service"),
             (MEDIA_SERVICE, "/media_service"),
             (PTZ_SERVICE, "/ptz_service"),
             (IMAGING_SERVICE, "/device_service"),
         ];
+        if self.support_events {
+            services.push((EVENTS_SERVICE, "/events_service"));
+        }
 
         let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
 
@@ -316,8 +352,9 @@ fn capability_xaddr(w: &mut Writer<Vec<u8>>, tag: &str, base: &str, path: &str) 
 }
 
 /// Convert seconds since UNIX_EPOCH to UTC date/time fields.
-/// Valid for years 1970–2100.
-fn secs_to_utc(secs: u64) -> (i32, i32, i32, i32, i32, i32) {
+/// Valid for years 1970–2100. Crate-visible: the events service reuses it
+/// for RFC3339 timestamps.
+pub(crate) fn secs_to_utc(secs: u64) -> (i32, i32, i32, i32, i32, i32) {
     let days = secs / 86400;
     let rem = secs % 86400;
     let hour = (rem / 3600) as i32;

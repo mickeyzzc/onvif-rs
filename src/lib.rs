@@ -1,9 +1,9 @@
 //! ONVIF Device (server) library for Rust.
 //!
 //! Hand-written SOAP implementation of the ONVIF Device role: Device, Media,
-//! Imaging, and (virtual) PTZ services over HTTP, plus a WS-Discovery UDP
-//! responder and WS-Security UsernameToken verification (PasswordText and
-//! PasswordDigest).
+//! Imaging, (virtual) PTZ, and Events pull-point services over HTTP, plus a
+//! WS-Discovery UDP responder and WS-Security UsernameToken verification
+//! (PasswordText and PasswordDigest).
 //!
 //! Extracted verbatim from the production implementation in
 //! `mibee-eye-raspi-rs`, whose response XML is byte-stable against the
@@ -15,6 +15,8 @@
 //! - [`config::DeviceConfig`] — device identity for GetDeviceInformation
 //! - [`imaging::ImagingParams`] — camera parameter source for the Imaging
 //!   service (implement over your capture pipeline's parameter manager)
+//! - [`events::EventsService`] — the Events pull-point publish seam (inject
+//!   property events; fan-out to live subscriptions)
 //! - [`ptz_state`] — pure virtual-PTZ state machine used by the PTZ service
 //! - Media service handlers take URIs/profiles as plain data at registration
 //!
@@ -57,6 +59,7 @@ pub mod auth;
 pub mod config;
 pub mod device;
 pub mod discovery;
+pub mod events;
 pub mod imaging;
 pub mod media;
 pub mod metrics;
@@ -68,6 +71,7 @@ pub mod types;
 
 pub use config::DeviceConfig;
 pub use discovery::DiscoveryServer;
+pub use events::{Event, EventsService, SimpleItem};
 pub use imaging::ImagingParams;
 pub use ptz_state::{Position, PtzState, Velocity};
 pub use server::{OnvifConfig, OnvifServer, OnvifServerHandle};
