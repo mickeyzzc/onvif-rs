@@ -5,7 +5,7 @@
 [![CI](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
-![Tests](https://img.shields.io/badge/tests-157%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-188%20passing-brightgreen.svg)
 
 ONVIF **Device (server)** library for Rust — expose a camera or media source to ONVIF consumers (NVRs, video management systems) over SOAP + WS-Discovery.
 
@@ -13,9 +13,10 @@ ONVIF **Device (server)** library for Rust — expose a camera or media source t
 
 ## Features
 
-- **SOAP HTTP server** with per-action handler registration — Device, Media, Imaging, and (virtual) PTZ services
-- **WS-Discovery responder** — UDP multicast 239.255.255.250:3702 Probe/ProbeMatches with per-request XAddr echo; scopes and EndpointReference UUID are host-configurable
+- **SOAP HTTP server** with per-action handler registration — Device, Media, Imaging, and (virtual) PTZ services; the Device service answers **SystemReboot** (protocol-level answer only — hooking an actual reboot is the host's decision)
+- **WS-Discovery responder** — UDP multicast 239.255.255.250:3702 Probe/ProbeMatches with per-request XAddr echo; scopes and EndpointReference UUID are host-configurable; announces itself with **Hello on start and Bye on stop** (same envelope family as ProbeMatches)
 - **WS-Security** — UsernameToken verification, PasswordText and PasswordDigest (SHA-1), constant-time comparison, **fail-closed** empty-password handling
+- **TLS listener** (optional `tls` cargo feature, off by default) — serve ONVIF over HTTPS (Profile T's transport baseline) by pointing `tls_cert_file`/`tls_key_file` at PEM files; both-or-neither, no silent plain-HTTP fallback
 - **Namespace-agnostic request parsing** (clients send arbitrary XML prefixes) and explicit-prefix serialization (`tds:`/`trt:`/`timg:`/`tt:`), with XML escaping of all interpolated values
 - **Virtual PTZ** — a pure state machine (`ptz_state`) behind the PTZ service for devices without motors
 - **Graceful shutdown** for both the SOAP server and the discovery responder
@@ -61,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
         password: "set-a-real-password".to_string(),
         ..Default::default()
     };
+    // TLS (optional `tls` feature): also set tls_cert_file + tls_key_file
+    // to PEM file paths and start() serves https instead (both-or-neither).
     let mut server = OnvifServer::new(&config);
 
     // Device service: identity comes from DeviceConfig (host-supplied).
