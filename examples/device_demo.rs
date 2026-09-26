@@ -246,6 +246,7 @@ async fn main() -> Result<()> {
         encoder_token: "enc0".to_string(),
         encoding: VideoEncoding::H264,
         video_source_name: "Video Source".to_string(),
+        extra_profiles: Vec::new(),
     });
     soap.register_handler(
         "GetProfiles",
