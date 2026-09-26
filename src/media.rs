@@ -46,6 +46,61 @@ impl VideoEncoding {
     }
 }
 
+/// One additional media profile advertised by GetProfiles — e.g. a
+/// low-resolution bandwidth-saving substream next to the primary stream.
+///
+/// The primary profile stays the flat [`OnvifMediaConfig`] fields;
+/// extras are listed in [`OnvifMediaConfig::extra_profiles`] in
+/// advertisement order, always after the primary. Profile S consumers
+/// that pick "the first profile" therefore keep getting the primary
+/// stream.
+#[derive(Debug, Clone)]
+pub struct MediaProfileConfig {
+    /// Profile token (`<Profiles token="...">`); matched against the
+    /// `ProfileToken` argument of GetStreamUri.
+    pub token: String,
+    /// Human-readable profile name (`<Name>`); defaults to the token.
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate: u32,
+    /// Advertised video encoder for this profile (default H.264).
+    pub encoding: VideoEncoding,
+    /// Video encoder configuration token; defaults to `<token>_encoder`,
+    /// mirroring the onvif-go twin's derivation.
+    pub encoder_token: String,
+    /// RTSP URL path returned by GetStreamUri when this profile's token
+    /// is requested.
+    pub stream_path: String,
+}
+
+impl MediaProfileConfig {
+    /// Construct with H.264 encoding, `name` = `token`, and the encoder
+    /// token derived as `<token>_encoder`.
+    #[must_use]
+    pub fn new(
+        token: &str,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        stream_path: &str,
+    ) -> Self {
+        Self {
+            token: token.to_string(),
+            name: token.to_string(),
+            width,
+            height,
+            fps,
+            bitrate,
+            encoding: VideoEncoding::H264,
+            encoder_token: format!("{token}_encoder"),
+            stream_path: stream_path.to_string(),
+        }
+    }
+}
+
 /// Camera/media configuration consumed by the ONVIF Media service handlers.
 #[derive(Debug, Clone)]
 pub struct OnvifMediaConfig {
@@ -80,6 +135,12 @@ pub struct OnvifMediaConfig {
     /// Human name of the video source in GetVideoSources (default
     /// `Video Source`). This is host identity, not a product name.
     pub video_source_name: String,
+    /// Additional profiles advertised after the primary one (default
+    /// empty). Each entry pairs its own geometry and RTSP path with a
+    /// token; GetStreamUri resolves the request's `ProfileToken`
+    /// against these, failing open to the primary stream for unknown or
+    /// missing tokens.
+    pub extra_profiles: Vec<MediaProfileConfig>,
 }
 
 impl OnvifMediaConfig {
@@ -109,6 +170,7 @@ impl OnvifMediaConfig {
             encoder_token: "enc0".to_string(),
             encoding: VideoEncoding::H264,
             video_source_name: "Video Source".to_string(),
+            extra_profiles: Vec::new(),
         }
     }
 }
@@ -129,11 +191,94 @@ fn write_text_element(writer: &mut Writer<Vec<u8>>, name: &str, text: &str) {
 // GetProfilesHandler
 // ---------------------------------------------------------------------------
 
+/// Geometry + tokens of one profile as written by [`GetProfilesHandler`].
+struct ProfileWire<'a> {
+    token: &'a str,
+    name: &'a str,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+    encoding: VideoEncoding,
+    encoder_token: &'a str,
+}
+
+fn write_profile(
+    writer: &mut Writer<Vec<u8>>,
+    profile: &ProfileWire<'_>,
+    video_source_token: &str,
+) {
+    // <Profiles token="...">
+    let mut profiles = BytesStart::new("Profiles");
+    profiles.push_attribute(("token", profile.token));
+    writer
+        .write_event(Event::Start(profiles))
+        .unwrap_or_default();
+
+    write_text_element(writer, "Name", profile.name);
+
+    // <VideoSourceConfiguration token="...">
+    let mut vs_cfg = BytesStart::new("VideoSourceConfiguration");
+    vs_cfg.push_attribute(("token", video_source_token));
+    writer.write_event(Event::Start(vs_cfg)).unwrap_or_default();
+    write_text_element(writer, "Name", "VideoSourceConfig");
+    write_text_element(writer, "SourceToken", video_source_token);
+    write_text_element(writer, "UseCount", "1");
+    // <Bounds width="W" height="H"/>
+    let mut bounds = BytesStart::new("Bounds");
+    let w_str = profile.width.to_string();
+    let h_str = profile.height.to_string();
+    bounds.push_attribute(("width", w_str.as_str()));
+    bounds.push_attribute(("height", h_str.as_str()));
+    writer.write_event(Event::Empty(bounds)).unwrap_or_default();
+    writer
+        .write_event(Event::End(BytesEnd::new("VideoSourceConfiguration")))
+        .unwrap_or_default();
+
+    // <VideoEncoderConfiguration token="...">
+    let mut ve_cfg = BytesStart::new("VideoEncoderConfiguration");
+    ve_cfg.push_attribute(("token", profile.encoder_token));
+    writer.write_event(Event::Start(ve_cfg)).unwrap_or_default();
+    write_text_element(writer, "Name", "VideoEncoderConfig");
+    write_text_element(writer, "UseCount", "1");
+    write_text_element(writer, "Encoding", profile.encoding.as_str());
+
+    // <Resolution>
+    writer
+        .write_event(Event::Start(BytesStart::new("Resolution")))
+        .unwrap_or_default();
+    write_text_element(writer, "Width", &profile.width.to_string());
+    write_text_element(writer, "Height", &profile.height.to_string());
+    writer
+        .write_event(Event::End(BytesEnd::new("Resolution")))
+        .unwrap_or_default();
+
+    // <RateControl>
+    writer
+        .write_event(Event::Start(BytesStart::new("RateControl")))
+        .unwrap_or_default();
+    write_text_element(writer, "FrameRateLimit", &profile.fps.to_string());
+    write_text_element(writer, "BitrateLimit", &profile.bitrate.to_string());
+    write_text_element(writer, "EncodingInterval", "1");
+    writer
+        .write_event(Event::End(BytesEnd::new("RateControl")))
+        .unwrap_or_default();
+
+    writer
+        .write_event(Event::End(BytesEnd::new("VideoEncoderConfiguration")))
+        .unwrap_or_default();
+    writer
+        .write_event(Event::End(BytesEnd::new("Profiles")))
+        .unwrap_or_default();
+}
+
 /// Handler for the ONVIF GetProfiles SOAP action.
 ///
-/// Returns a single Profile S compatible profile containing:
-/// - VideoSourceConfiguration (bounds from camera resolution)
-/// - VideoEncoderConfiguration (H.264, rate control from config)
+/// Returns Profile S compatible profiles — the primary one built from the
+/// flat [`OnvifMediaConfig`] fields, followed by any
+/// [`OnvifMediaConfig::extra_profiles`] (e.g. a low-resolution substream):
+/// - VideoSourceConfiguration (bounds from the profile resolution)
+/// - VideoEncoderConfiguration (rate control from the profile)
 pub struct GetProfilesHandler {
     config: Arc<OnvifMediaConfig>,
 }
@@ -147,11 +292,6 @@ impl GetProfilesHandler {
 #[async_trait]
 impl OnvifActionHandler for GetProfilesHandler {
     async fn handle(&self, _body: &str, _request_info: &RequestInfo) -> Result<String, OnvifError> {
-        let w = self.config.camera_width;
-        let h = self.config.camera_height;
-        let fps = self.config.camera_fps;
-        let bitrate = self.config.camera_bitrate;
-
         let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
 
         // <GetProfilesResponse>
@@ -159,76 +299,38 @@ impl OnvifActionHandler for GetProfilesHandler {
             .write_event(Event::Start(BytesStart::new("GetProfilesResponse")))
             .unwrap_or_default();
 
-        // <Profiles token="...">
-        {
-            let mut profiles = BytesStart::new("Profiles");
-            profiles.push_attribute(("token", self.config.profile_token.as_str()));
-            writer
-                .write_event(Event::Start(profiles))
-                .unwrap_or_default();
+        write_profile(
+            &mut writer,
+            &ProfileWire {
+                token: &self.config.profile_token,
+                name: &self.config.profile_token,
+                width: self.config.camera_width,
+                height: self.config.camera_height,
+                fps: self.config.camera_fps,
+                bitrate: self.config.camera_bitrate,
+                encoding: self.config.encoding,
+                encoder_token: &self.config.encoder_token,
+            },
+            &self.config.video_source_token,
+        );
+
+        for extra in &self.config.extra_profiles {
+            write_profile(
+                &mut writer,
+                &ProfileWire {
+                    token: &extra.token,
+                    name: &extra.name,
+                    width: extra.width,
+                    height: extra.height,
+                    fps: extra.fps,
+                    bitrate: extra.bitrate,
+                    encoding: extra.encoding,
+                    encoder_token: &extra.encoder_token,
+                },
+                &self.config.video_source_token,
+            );
         }
 
-        write_text_element(&mut writer, "Name", &self.config.profile_token);
-
-        // <VideoSourceConfiguration token="...">
-        {
-            let mut vs_cfg = BytesStart::new("VideoSourceConfiguration");
-            vs_cfg.push_attribute(("token", self.config.video_source_token.as_str()));
-            writer.write_event(Event::Start(vs_cfg)).unwrap_or_default();
-        }
-        write_text_element(&mut writer, "Name", "VideoSourceConfig");
-        write_text_element(&mut writer, "SourceToken", &self.config.video_source_token);
-        write_text_element(&mut writer, "UseCount", "1");
-        // <Bounds width="W" height="H"/>
-        {
-            let mut bounds = BytesStart::new("Bounds");
-            let w_str = w.to_string();
-            let h_str = h.to_string();
-            bounds.push_attribute(("width", w_str.as_str()));
-            bounds.push_attribute(("height", h_str.as_str()));
-            writer.write_event(Event::Empty(bounds)).unwrap_or_default();
-        }
-        writer
-            .write_event(Event::End(BytesEnd::new("VideoSourceConfiguration")))
-            .unwrap_or_default();
-
-        // <VideoEncoderConfiguration token="...">
-        {
-            let mut ve_cfg = BytesStart::new("VideoEncoderConfiguration");
-            ve_cfg.push_attribute(("token", self.config.encoder_token.as_str()));
-            writer.write_event(Event::Start(ve_cfg)).unwrap_or_default();
-        }
-        write_text_element(&mut writer, "Name", "VideoEncoderConfig");
-        write_text_element(&mut writer, "UseCount", "1");
-        write_text_element(&mut writer, "Encoding", self.config.encoding.as_str());
-
-        // <Resolution>
-        writer
-            .write_event(Event::Start(BytesStart::new("Resolution")))
-            .unwrap_or_default();
-        write_text_element(&mut writer, "Width", &w.to_string());
-        write_text_element(&mut writer, "Height", &h.to_string());
-        writer
-            .write_event(Event::End(BytesEnd::new("Resolution")))
-            .unwrap_or_default();
-
-        // <RateControl>
-        writer
-            .write_event(Event::Start(BytesStart::new("RateControl")))
-            .unwrap_or_default();
-        write_text_element(&mut writer, "FrameRateLimit", &fps.to_string());
-        write_text_element(&mut writer, "BitrateLimit", &bitrate.to_string());
-        write_text_element(&mut writer, "EncodingInterval", "1");
-        writer
-            .write_event(Event::End(BytesEnd::new("RateControl")))
-            .unwrap_or_default();
-
-        writer
-            .write_event(Event::End(BytesEnd::new("VideoEncoderConfiguration")))
-            .unwrap_or_default();
-        writer
-            .write_event(Event::End(BytesEnd::new("Profiles")))
-            .unwrap_or_default();
         writer
             .write_event(Event::End(BytesEnd::new("GetProfilesResponse")))
             .unwrap_or_default();
@@ -243,9 +345,48 @@ impl OnvifActionHandler for GetProfilesHandler {
 // GetStreamUriHandler
 // ---------------------------------------------------------------------------
 
+/// Extract the `ProfileToken` element text from a GetStreamUri SOAP body.
+///
+/// Tolerant by design: namespace prefixes (`tt:ProfileToken`), attributes
+/// on the open tag, surrounding whitespace, and any malformed input are
+/// all accepted — anything unparseable yields `None` so the handler can
+/// fail open to the primary stream. Never panics on arbitrary input.
+fn parse_profile_token(body: &str) -> Option<&str> {
+    let mut rest = body;
+    while let Some(open) = rest.find('<') {
+        let after_open = &rest[open + 1..];
+        let Some(tag_end) = after_open.find(|c: char| c == '>' || c.is_whitespace()) else {
+            break;
+        };
+        let tag = &after_open[..tag_end];
+        // Local name — strip any namespace prefix.
+        let local = tag.rsplit(':').next().unwrap_or(tag);
+        let Some(greater) = after_open.find('>') else {
+            break;
+        };
+        if after_open[..greater].ends_with('/') {
+            // Empty element (`<ProfileToken/>`) — no token text.
+            rest = &after_open[greater..];
+            continue;
+        }
+        if local == "ProfileToken" {
+            let content = &after_open[greater + 1..];
+            let close = content.find('<')?;
+            let token = content[..close].trim();
+            return (!token.is_empty()).then_some(token);
+        }
+        rest = &after_open[tag_end..];
+    }
+    None
+}
+
 /// Handler for the ONVIF GetStreamUri SOAP action.
 ///
-/// Returns an RTSP URL built from the device IP and the configured RTSP port.
+/// Returns an RTSP URL built from the device IP and the configured RTSP
+/// port. When the request carries a `ProfileToken` matching an entry of
+/// [`OnvifMediaConfig::extra_profiles`], that profile's `stream_path` is
+/// advertised; missing or unknown tokens fail open to the primary
+/// `stream_path` (the historical single-profile behavior).
 pub struct GetStreamUriHandler {
     config: Arc<OnvifMediaConfig>,
 }
@@ -258,12 +399,18 @@ impl GetStreamUriHandler {
 
 #[async_trait]
 impl OnvifActionHandler for GetStreamUriHandler {
-    async fn handle(&self, _body: &str, request_info: &RequestInfo) -> Result<String, OnvifError> {
+    async fn handle(&self, body: &str, request_info: &RequestInfo) -> Result<String, OnvifError> {
         let ip = resolve_server_ip(&request_info.server_ip, &self.config.device_ip);
-        let uri = format!(
-            "rtsp://{}:{}{}",
-            ip, self.config.rtsp_port, self.config.stream_path
-        );
+        let stream_path = parse_profile_token(body)
+            .and_then(|token| {
+                self.config
+                    .extra_profiles
+                    .iter()
+                    .find(|p| p.token == token)
+                    .map(|p| p.stream_path.as_str())
+            })
+            .unwrap_or(&self.config.stream_path);
+        let uri = format!("rtsp://{}:{}{}", ip, self.config.rtsp_port, stream_path);
 
         let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
         writer
@@ -426,6 +573,7 @@ mod tests {
             camera_bitrate: 4_000_000,
             rtsp_port: 8554,
             device_ip: "192.168.1.100".to_string(),
+            extra_profiles: Vec::new(),
         })
     }
 
@@ -530,6 +678,7 @@ mod tests {
             camera_bitrate: 2_500_000,
             rtsp_port: 8554,
             device_ip: "192.168.1.10".to_string(),
+            extra_profiles: Vec::new(),
         });
         let handler = GetStreamUriHandler::new(config);
         let result = handler.handle("", &req_info("192.168.1.10")).await.unwrap();
@@ -651,6 +800,166 @@ mod tests {
         assert!(result.contains("Video Source"), "neutral default name");
         assert!(!result.contains("Pi Camera"), "no origin-hardware branding");
         assert!(result.contains("soap:Envelope"));
+    }
+
+    // ------------------------------------------------------------------
+    // Multiple profiles (main + substreams) — GetProfiles advertises the
+    // primary profile first, extras after; GetStreamUri routes by the
+    // request's ProfileToken.
+    // ------------------------------------------------------------------
+
+    fn multi_profile_config() -> Arc<OnvifMediaConfig> {
+        let mut cfg = (*test_config()).clone();
+        cfg.extra_profiles = vec![MediaProfileConfig {
+            token: "sub".to_string(),
+            name: "sub".to_string(),
+            width: 640,
+            height: 360,
+            fps: 15,
+            bitrate: 400_000,
+            encoding: VideoEncoding::H264,
+            encoder_token: "sub_encoder".to_string(),
+            stream_path: "/sub".to_string(),
+        }];
+        Arc::new(cfg)
+    }
+
+    #[tokio::test]
+    async fn test_get_profiles_extra_profiles_advertised_after_primary() {
+        let handler = GetProfilesHandler::new(multi_profile_config());
+        let result = handler.handle("", &req_info("10.0.0.1")).await.unwrap();
+
+        assert!(
+            result.contains(r#"token="main""#) && result.contains(r#"token="sub""#),
+            "both profiles advertised, got: {result}"
+        );
+        let main_at = result.find(r#"token="main""#).unwrap_or_default();
+        let sub_at = result.find(r#"token="sub""#).unwrap_or_default();
+        assert!(
+            main_at < sub_at,
+            "primary profile must come first (Profile S clients pick the first), got: {result}"
+        );
+
+        // The sub profile block carries its own encoder geometry.
+        assert!(
+            result.contains("<Width>640</Width>"),
+            "sub width, got: {result}"
+        );
+        assert!(result.contains("<Height>360</Height>"));
+        assert!(result.contains("<FrameRateLimit>15</FrameRateLimit>"));
+        assert!(result.contains("<BitrateLimit>400000</BitrateLimit>"));
+        assert!(result.contains(r#"token="sub_encoder""#));
+
+        // Exactly two Profiles elements — no duplication of the primary.
+        assert_eq!(
+            result.matches("<Profiles ").count(),
+            2,
+            "expected exactly two Profiles elements, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_profiles_single_profile_shape_unchanged() {
+        // No extra_profiles → exactly one Profiles element, primary geometry.
+        let handler = GetProfilesHandler::new(test_config());
+        let result = handler.handle("", &req_info("10.0.0.1")).await.unwrap();
+        assert_eq!(result.matches("<Profiles ").count(), 1);
+        assert!(!result.contains(r#"token="sub""#));
+    }
+
+    fn stream_uri_body(token: &str) -> String {
+        format!(
+            "<GetStreamUri xmlns=\"http://www.onvif.org/ver10/media/wsdl\">\
+             <ProfileToken>{token}</ProfileToken></GetStreamUri>"
+        )
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_uri_routes_extra_profile_token() {
+        let handler = GetStreamUriHandler::new(multi_profile_config());
+
+        let sub = handler
+            .handle(&stream_uri_body("sub"), &req_info("10.0.0.1"))
+            .await
+            .unwrap();
+        assert!(
+            sub.contains("rtsp://10.0.0.1:8554/sub"),
+            "sub token must map to the sub stream path, got: {sub}"
+        );
+
+        let main = handler
+            .handle(&stream_uri_body("main"), &req_info("10.0.0.1"))
+            .await
+            .unwrap();
+        assert!(main.contains("rtsp://10.0.0.1:8554/stream"));
+
+        // Unknown and missing tokens fail open to the primary stream —
+        // legacy clients that never send a token keep the historical URI.
+        let unknown = handler
+            .handle(&stream_uri_body("profile_7"), &req_info("10.0.0.1"))
+            .await
+            .unwrap();
+        assert!(unknown.contains("rtsp://10.0.0.1:8554/stream"));
+
+        let missing = handler.handle("", &req_info("10.0.0.1")).await.unwrap();
+        assert!(missing.contains("rtsp://10.0.0.1:8554/stream"));
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_uri_token_namespaced_and_attributed() {
+        let handler = GetStreamUriHandler::new(multi_profile_config());
+
+        let namespaced = handler
+            .handle(
+                "<GetStreamUri><tt:ProfileToken>sub</tt:ProfileToken></GetStreamUri>",
+                &req_info("10.0.0.1"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            namespaced.contains("rtsp://10.0.0.1:8554/sub"),
+            "namespace prefixes must not defeat token routing, got: {namespaced}"
+        );
+
+        let attributed = handler
+            .handle(
+                "<GetStreamUri><ProfileToken xmlns=\"http://www.onvif.org/ver10/media/wsdl\">sub</ProfileToken></GetStreamUri>",
+                &req_info("10.0.0.1"),
+            )
+            .await
+            .unwrap();
+        assert!(attributed.contains("rtsp://10.0.0.1:8554/sub"));
+    }
+
+    #[test]
+    fn test_parse_profile_token_forms() {
+        // Plain element.
+        assert_eq!(
+            parse_profile_token("<GetStreamUri><ProfileToken>sub</ProfileToken></GetStreamUri>"),
+            Some("sub")
+        );
+        // Namespaced element.
+        assert_eq!(
+            parse_profile_token("<tt:ProfileToken>sub</tt:ProfileToken>"),
+            Some("sub")
+        );
+        // Attributes on the open tag.
+        assert_eq!(
+            parse_profile_token(r#"<ProfileToken xmlns="x">sub</ProfileToken>"#),
+            Some("sub")
+        );
+        // Whitespace around the token text is trimmed.
+        assert_eq!(
+            parse_profile_token("<ProfileToken>\n  sub  </ProfileToken>"),
+            Some("sub")
+        );
+        // Empty element / empty content / absent / garbage → no token.
+        assert_eq!(parse_profile_token("<ProfileToken/>"), None);
+        assert_eq!(parse_profile_token("<ProfileToken></ProfileToken>"), None);
+        assert_eq!(parse_profile_token("<GetStreamUri/>"), None);
+        assert_eq!(parse_profile_token("not xml at all"), None);
+        assert_eq!(parse_profile_token("<<<<"), None);
+        assert_eq!(parse_profile_token(""), None);
     }
 
     // ------------------------------------------------------------------

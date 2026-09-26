@@ -11,6 +11,18 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(media)` **multiple media profiles (main + substreams)**: new
+  `MediaProfileConfig` type; `OnvifMediaConfig::extra_profiles`
+  (default empty) advertises additional profiles in GetProfiles after
+  the primary one; GetStreamUri now parses the request's
+  `ProfileToken` (namespace- and attribute-tolerant) and maps it to the
+  matching profile's `stream_path`, failing open to the primary stream
+  for unknown/missing tokens. Single-profile hosts and clients see no
+  wire change. `OnvifMediaConfig` gained a public field
+  (`extra_profiles`) — struct literals must add it (minor bump).
+- Version 0.7.0 → 0.8.0 (additive API + new public field on a public
+  struct).
+
 ## [v0.7.0] — 2026-09-20
 
 Capability parity with onvif-go, plus the quick-xml security upgrade.

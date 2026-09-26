@@ -19,6 +19,7 @@
 - **TLS 监听**（可选 `tls` feature，默认关闭）—— 配置证书/私钥 PEM 路径后以 HTTPS 提供 ONVIF 服务（Profile T 传输基线）；两者必须同时设置（both-or-neither）
 - **事件 pull-point 服务**（对齐 onvif-go 的 `SupportEvents`）—— `server.enable_events()` 后，服务器在自有监听器上路由 `/onvif/events_service`（GetServiceCapabilities / GetEventProperties / CreatePullPointSubscription）与 `/onvif/events_service/sub/<id>`（PullMessages / Renew / Unsubscribe）；宿主通过返回的 `EventsService::publish_event` 接缝注入事件（扇出到全部在订订阅；Concrete/ConcreteSet 主题过滤、ISO8601 终止时间钳制、长轮询 PT0S 合法）；GetCapabilities/GetServices 仅在启用时通告该服务，Create* 动作走 WS-Security 而读操作开放
 - **命名空间无关的请求解析**（客户端可用任意 XML 前缀）与显式前缀序列化（`tds:`/`trt:`/`timg:`/`tt:`），所有插值均做 XML 转义
+- **多媒体 Profile**（主码流 + 子码流）—— `OnvifMediaConfig::extra_profiles` 在 GetProfiles 中追加 `MediaProfileConfig` 条目（如 640×360 省流子码流），恒排在主 Profile 之后；GetStreamUri 按请求的 `ProfileToken` 匹配并返回对应 RTSP 路径，未知/缺失 token 一律回落主流——单 Profile 客户端行为不变
 - **虚拟 PTZ** —— 纯状态机（`ptz_state`）支撑无云台设备的 PTZ 服务
 - **优雅停机** —— SOAP 服务端与 discovery 应答器均支持
 
