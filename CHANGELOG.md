@@ -26,6 +26,106 @@ are released out of band.
   infrastructure, not SOAP protocol). New dependency: `md-5`
   (RustCrypto). Historical responses stay byte-stable — the challenge
   header only appears when `http_digest` is enabled.
+- `feat(events)` **basic notification interface** (issue #50):
+  `wsnt:Subscribe` on `/onvif/events_service` registers a push
+  subscription (ConsumerReference `http://` URL only — https consumers
+  are refused; the library carries no TLS client); one sender task per
+  subscription POSTs each matching `publish_event` to the consumer as a
+  `wsnt:Notify` SOAP document (Topic + inner-message writers shared with
+  PullMessages responses; SubscriptionReference named, ProducerReference
+  omitted). Delivery is fire-and-forget (5 s connect/IO timeouts); after
+  three consecutive failures the subscription is auto-unsubscribed
+  (spec-permissible housekeeping). Renew/Unsubscribe operate on the
+  returned SubscriptionReference; PullMessages on a push subscription is
+  a Sender fault; basic subscriptions share the 10-subscription cap.
+  `SetSynchronizationPoint` acks empty on the events endpoint
+  (route-based dispatch — no collision with the media action).
+  GetEventInstances deliberately stays unimplemented (17.06+ feature,
+  zero demand; unknown-action fault answers it). Existing pull-point
+  response bytes are unchanged — GetEventProperties already advertises
+  both mandatory TopicExpressionDialects, so no dialect line was added.
+
+- `feat(media2)` **Media2 service** (ver20/media, `tr2` — the Profile-T
+  entry path, issue #53): `OnvifServer::enable_media2(store,
+  keyframe_hook)` routes `/onvif/media2_service` with its own action
+  dispatch on the listener the server already owns — the Media2 action
+  local names (`GetProfiles`, `GetStreamUri`,
+  `SetSynchronizationPoint`, …) collide with Media1 in the shared action
+  map, so the URL decides which face answers (the events-service routing
+  pattern). Served actions: GetProfiles (optional `Token` filter;
+  `tr2:Profiles`/`tr2:Configurations` wrappers with `tt:` configuration
+  bodies — the namespace split onvif-go's ns-strict decoder test pins),
+  GetStreamUri / GetSnapshotUri (plain `tr2:Uri`; stream tokens resolve
+  per extra-profile with fail-open to the primary; `snapshot_port` = 0
+  faults), GetVideoEncoderConfigurations (optional ConfigurationToken
+  filter) / GetVideoEncoderConfiguration / GetVideoEncoderConfiguration
+  Options / **SetVideoEncoderConfiguration** (Media1 partial-update
+  semantics on the same `SharedMediaConfig` store — visible to both
+  faces; JPEG and unknown encodings fault), GetVideoEncoderInstances
+  (`tr2:Info{tr2:Codec[]{tr2:Encoding,tr2:Number}, tr2:Total}`),
+  SetSynchronizationPoint (fires the same keyframe hook type
+  `register_media_actions` takes), and the Media2 GetServiceCapabilities
+  (SnapshotUri follows `snapshot_port`, MaximumNumberOfProfiles =
+  advertised count, `RTSPStreaming="true"`). Unknown actions on the path
+  are Sender faults; the path 404s while disabled. Auth: write-style
+  prefixes (Set*) behind WS-Security, reads open. Advertisement:
+  `DeviceServiceHandlers::with_media2_support` (default `false`) appends
+  the ver20/media entry to GetServices only — the legacy GetCapabilities
+  has no Media2 slot; default-off keeps every existing byte identical.
+  Deliberately unimplemented: profile mutation (Create/Add/Remove/
+  DeleteProfile — the profile set is host-owned) and multicast streaming
+  (advertised off).
+
+- `feat(media)` **Media service completion** (issue #48): new
+  `register_media_actions(server, Arc<RwLock<OnvifMediaConfig>>,
+  keyframe_hook)` registers the whole service — the four historical
+  actions (now reading through the shared store, bytes unchanged) plus
+  GetVideoEncoderConfigurations / GetVideoEncoderConfiguration (Sender
+  fault on unknown/missing token), GetVideoEncoderConfigurationOptions
+  (H264 codec block from the advertised geometry; quality range only
+  for H265 — ver10 has no element for it),
+  SetVideoEncoderConfiguration (partial updates land in the shared
+  store every reader reflects; JPEG and encoding intervals other than 1
+  fault as unsupported rather than being silently ignored),
+  GetGuaranteedNumberOfVideoEncoderInstances (`TotalNumber` per the
+  WSDL), SetSynchronizationPoint (fires the optional host keyframe
+  hook), the media GetServiceCapabilities (element names per the ver10
+  WSDL; SnapshotUri follows `snapshot_port`), and the empty audio/OSD
+  sets (no audio hardware, no OSD engine — honest empty answers).
+  StartMulticastStreaming/StopMulticastStreaming stay unimplemented and
+  are advertised off. The standalone handler structs keep their
+  immutable `Arc<OnvifMediaConfig>` API; existing responses are
+  byte-stable.
+
+- `feat(device)` **Device service completion** (issue #49): the
+  devicemgmt action set beyond the historical reads — SetSystemDateAndTime
+  (parse + `DeviceHooks::set_date_time`, UTC fields required), mutable
+  scopes (AddScopes/RemoveScopes/SetScopes on a store seeded with the
+  three historical items, so pre-write GetScopes bytes are unchanged;
+  texts escaped on output), GetHostname/SetHostname (default name = the
+  startup device IP), Get/SetDiscoveryMode, a user directory
+  (GetUsers/CreateUsers/DeleteUsers/SetUser — level validation,
+  all-or-nothing semantics, passwords never stored or echoed; the
+  WS-Security layer stays the authentication source; seed via
+  `with_users`), honest network statics (GetDNS, GetNTP,
+  GetNetworkInterfaces — empty, GetNetworkDefaultGateway,
+  GetNetworkProtocols — the HTTP port actually served),
+  GetServiceCapabilities (minimal DeviceServiceCapabilities),
+  GetWsdlUrl, GetEndpointReference (documented placeholder zero UUID),
+  GetSystemLog/GetSystemSupportInformation (text via
+  `DeviceHooks::system_log`/`support_info`), and the protocol-answer-only
+  family SetSystemFactoryDefault (fires `DeviceHooks::factory_default`),
+  UpgradeSystemFirmware, StartSystemRestore, plus SystemReboot now firing
+  `DeviceHooks::reboot` (response bytes unchanged). New
+  `DeviceServiceHandlers::with_hooks` installs the host-side effects.
+  Deliberately excluded (unknown action → ActionNotSupported): the Set*
+  network variants (SetDNS/SetNTP/SetNetworkInterfaces/
+  SetNetworkProtocols/SetNetworkDefaultGateway — a library server does
+  not mutate the host network stack), the certificate family
+  (LoadCertificates/GetCertificates/…), and 802.1X — deferred to future
+  Profile T / TLS-server work. Dispatch keeps full-token substring
+  matching with writes-before-reads ordering within each family; an
+  exhaustive routing test pins every action.
 - `feat(ptz)` **PTZ completion** (issue #51): GetConfigurationOptions
   (six coordinate spaces + PTZTimeout), SetConfiguration (stored and
   reflected by GetConfigurations; default bytes unchanged),
