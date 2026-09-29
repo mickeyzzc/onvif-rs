@@ -76,3 +76,5 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Coverage
         run: cargo llvm-cov --summary-only --fail-under-lines 85
+
+# workflow touch to re-register triggers after the push-event outage
