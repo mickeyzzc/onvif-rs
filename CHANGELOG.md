@@ -11,6 +11,17 @@ are released out of band.
 
 ## [Unreleased]
 
+- `fix(device)` **GetServices/GetScopes WSDL shape** (issues #64/#65,
+  caught live by cross-library interop — the onvif-go client parses zero
+  entries from the old forms): GetServicesResponse now carries its
+  `tds:Service` entries as **direct children** (the WSDL sequence — the
+  old `tds:Services` wrapper element does not exist in the WSDL, and
+  strict stacks read an empty service list); GetScopes answers the WSDL
+  `tt:Scope` form — each scope a `tds:Scopes` element with
+  `tt:ScopeDef` (`Fixed` for the three built-ins, `Configurable` for
+  client-added ones) + `tt:ScopeItem`, replacing the bare
+  `tt:ScopeItem` string list. Both are wire changes (goldens updated) —
+  spec alignment, twinned with onvif-go's server forms.
 - `feat(security)` **Security completion** (issue #54): HTTP Digest
   transport auth (RFC 7616 subset — MD5, `qop="auth"`, opt-in
   `OnvifConfig::http_digest`; coexists with WS-Security, a present
