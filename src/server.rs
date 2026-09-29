@@ -26,6 +26,12 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard cap on the HTTP header section.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
+/// Digest challenge realm (issue #54). Fixed on purpose: the realm is
+/// a scoping/display label for this single-device service.
+const HTTP_DIGEST_REALM: &str = "onvif";
+/// Lifetime of an issued HTTP Digest nonce (issue #54): after this the
+/// nonce answers `stale=TRUE` and the client re-challenges.
+const DIGEST_NONCE_TTL_SECS: u64 = 300;
 
 /// Configuration for the ONVIF SOAP server.
 ///
@@ -66,6 +72,16 @@ pub struct OnvifConfig {
     /// Read once at `start_on`/`start` — later file changes need a
     /// restart.
     pub tls_key_file: String,
+    /// Offer HTTP Digest transport auth (issue #54, RFC 7616 subset:
+    /// MD5, qop="auth") alongside WS-Security — the Profile S route for
+    /// non-TLS deployments. Default `false`. When enabled, token-less
+    /// requests that fail the anonymous check are answered 401 with a
+    /// `WWW-Authenticate: Digest` challenge; a request carrying a valid
+    /// Digest header authenticates without a UsernameToken (a present
+    /// UsernameToken still takes precedence, and both may coexist on
+    /// one connection sequence). Pre-auth anonymous actions (e.g.
+    /// GetSystemDateAndTime) stay open.
+    pub http_digest: bool,
     /// Serve the ONVIF Events pull-point service (parity with onvif-go's
     /// `SupportEvents`): routes `{base}/events_service` and the
     /// per-subscription `{base}/events_service/sub/<id>` subtree on this
@@ -89,6 +105,7 @@ impl Default for OnvifConfig {
             auth_lockout_secs: 60,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
+            http_digest: false,
             support_events: false,
         }
     }
@@ -182,6 +199,11 @@ pub struct OnvifServer {
     /// The events pull-point service, when enabled (`support_events` /
     /// [`OnvifServer::enable_events`]).
     events: Option<Arc<EventsService>>,
+    /// IP address filter (issue #54): enforced per connection before
+    /// any HTTP/SOAP processing. Hosts wire the SAME state installed on
+    /// the device handlers via
+    /// [`crate::device::DeviceServiceHandlers::with_ip_filter`].
+    ip_filter: Option<crate::device::IpFilterState>,
 }
 
 impl OnvifServer {
@@ -193,7 +215,20 @@ impl OnvifServer {
             anonymous_actions: HashSet::new(),
             metrics: Arc::new(crate::metrics::NoopMetrics),
             events: None,
+            ip_filter: None,
         }
+    }
+
+    /// Enforce an IP address filter per connection (issue #54): peers
+    /// the filter refuses get 403 (SOAP fault) before any HTTP/SOAP
+    /// processing. Wire the SAME state you installed via
+    /// [`crate::device::DeviceServiceHandlers::with_ip_filter`] so the
+    /// Get/Set/Add/RemoveIPAddressFilter SOAP ops and this connection
+    /// gate share one store.
+    #[must_use]
+    pub fn with_ip_filter(mut self, state: crate::device::IpFilterState) -> Self {
+        self.ip_filter = Some(state);
+        self
     }
 
     /// Install observability hooks (issue #18): request counts, fault
@@ -323,6 +358,7 @@ impl OnvifServer {
         let cfg = Arc::new(self.config);
         let anonymous = Arc::new(self.anonymous_actions);
         let metrics = self.metrics;
+        let ip_filter = self.ip_filter;
         // Events pull-point service (created here when enabled purely by
         // config — hosts that want the publish seam call enable_events
         // before starting and the same instance is reused).
@@ -358,6 +394,7 @@ impl OnvifServer {
                 let auth_state = Arc::clone(&auth_state);
                 let metrics = Arc::clone(&metrics);
                 let events = events.clone();
+                let ip_filter = ip_filter.clone();
                 #[cfg(feature = "tls")]
                 let tls_acceptor = tls_acceptor.clone();
 
@@ -387,6 +424,7 @@ impl OnvifServer {
                                     &auth_state,
                                     &metrics,
                                     &events,
+                                    &ip_filter,
                                 )
                                 .await;
                                 // Orderly TLS close (close_notify) — dropping
@@ -412,6 +450,7 @@ impl OnvifServer {
                                 &auth_state,
                                 &metrics,
                                 &events,
+                                &ip_filter,
                             )
                             .await
                         }
@@ -428,6 +467,7 @@ impl OnvifServer {
                         &auth_state,
                         &metrics,
                         &events,
+                        &ip_filter,
                     )
                     .await;
 
@@ -507,11 +547,13 @@ type HandlerMap = Arc<HashMap<String, Box<dyn OnvifActionHandler>>>;
 type SharedConfig = Arc<OnvifConfig>;
 type SharedAnonymous = Arc<HashSet<String>>;
 
-/// Cross-connection auth state: UsernameToken replay guard plus the
-/// per-source failure lockout (issue #16).
+/// Cross-connection auth state: UsernameToken replay guard, the HTTP
+/// Digest nonce store (issue #54), plus the per-source failure lockout
+/// (issue #16).
 #[derive(Default)]
 struct AuthState {
     replay: Option<crate::auth::ReplayGuard>,
+    digest_nonces: crate::auth::NonceGuard,
     failures: Mutex<HashMap<String, AuthFailEntry>>,
 }
 
@@ -525,6 +567,7 @@ impl AuthState {
     fn new(cfg: &OnvifConfig) -> Self {
         Self {
             replay: Some(crate::auth::ReplayGuard::new(cfg.replay_window_secs)),
+            digest_nonces: crate::auth::NonceGuard::new(DIGEST_NONCE_TTL_SECS),
             failures: Mutex::new(HashMap::new()),
         }
     }
@@ -583,6 +626,7 @@ async fn handle_connection<S>(
     auth_state: &Arc<AuthState>,
     metrics: &Arc<dyn crate::metrics::MetricsHooks>,
     events: &Option<Arc<EventsService>>,
+    ip_filter: &Option<crate::device::IpFilterState>,
 ) -> Result<(), OnvifError>
 where
     // Plain TcpStream without the `tls` feature, a TLS session with it.
@@ -590,22 +634,42 @@ where
 {
     // --- Read HTTP request (bounded header, bounded body, read timeout) ---
     let read = read_http_request(stream, cfg);
-    let (method, path, body) = match tokio::time::timeout(cfg.read_timeout, read).await {
-        Ok(Ok(triple)) => triple,
-        Ok(Err(OnvifError::InvalidXml(m))) if m.starts_with("body too large") => {
-            let fault = serialize_soap_fault("soap:Sender", &m);
-            write_http_response(stream, 413, &fault).await?;
-            // Drain the in-flight body before closing so the client sees the
-            // 413 instead of a connection reset (RFC 7230 §6.6 politeness).
-            drain_before_close(stream).await;
+    let (method, path, body, authorization) =
+        match tokio::time::timeout(cfg.read_timeout, read).await {
+            Ok(Ok(triple)) => triple,
+            Ok(Err(OnvifError::InvalidXml(m))) if m.starts_with("body too large") => {
+                let fault = serialize_soap_fault("soap:Sender", &m);
+                write_http_response(stream, 413, &fault).await?;
+                // Drain the in-flight body before closing so the client sees the
+                // 413 instead of a connection reset (RFC 7230 §6.6 politeness).
+                drain_before_close(stream).await;
+                return Ok(());
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                log::warn!("onvif: read timeout from {client_ip}");
+                return Ok(());
+            }
+        };
+
+    // --- IP address filter (issue #54): refuse blocked peers before
+    // any HTTP/SOAP processing. Unparseable/IPv6 peers fail open (see
+    // IpFilter::allows_client_ip). ---
+    if let Some(state) = ip_filter {
+        let allowed = {
+            let filter = match state.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            filter.allows_client_ip(client_ip)
+        };
+        if !allowed {
+            log::warn!("onvif: refusing connection from {client_ip} (IP filter)");
+            let fault = serialize_soap_fault("soap:Sender", "client address refused by IP filter");
+            write_http_response(stream, 403, &fault).await?;
             return Ok(());
         }
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            log::warn!("onvif: read timeout from {client_ip}");
-            return Ok(());
-        }
-    };
+    }
 
     if method != "POST" {
         let fault = serialize_soap_fault("soap:Sender", "only POST method is supported");
@@ -631,10 +695,24 @@ where
         metrics.auth_lockout();
         log::warn!("onvif: auth lockout active for {client_ip}");
         let fault = serialize_soap_fault("soap:Sender", "too many authentication failures");
-        write_http_response(stream, 401, &fault).await?;
+        if cfg.http_digest {
+            let challenge = digest_challenge_value(auth_state, false);
+            write_http_response_with_headers(
+                stream,
+                401,
+                &fault,
+                &[("WWW-Authenticate", challenge)],
+            )
+            .await?;
+        } else {
+            write_http_response(stream, 401, &fault).await?;
+        }
         return Ok(());
     }
     let mut token_ok = true;
+    // Set when the Digest verdict was Stale (unknown/expired nonce) so
+    // the re-challenge carries stale=TRUE (issue #54).
+    let mut digest_stale = false;
     let auth_result = if let Some(ref token) = parsed.username_token {
         let mut ok = verify_username_token(token, &cfg.username, &cfg.password);
         if ok {
@@ -663,6 +741,46 @@ where
         AuthResult {
             username: token.username.clone(),
             authenticated: ok,
+        }
+    } else if cfg.http_digest && authorization.is_some() {
+        // HTTP Digest transport auth (issue #54): token-less requests
+        // may authenticate via RFC 7616 instead. A present
+        // UsernameToken takes precedence (handled above); the two
+        // mechanisms coexist across a connection sequence. Any
+        // Authorization header counts as an attempt — a non-Digest
+        // scheme (e.g. Basic) fails verification honestly.
+        let header = authorization.as_deref().unwrap_or_default();
+        let verdict = crate::auth::verify_http_digest(
+            header,
+            &method,
+            &path,
+            HTTP_DIGEST_REALM,
+            &cfg.username,
+            &cfg.password,
+            &auth_state.digest_nonces,
+        );
+        match verdict {
+            crate::auth::DigestResult::Ok => {
+                auth_state.record_success(client_ip);
+                AuthResult {
+                    username: cfg.username.clone(),
+                    authenticated: true,
+                }
+            }
+            crate::auth::DigestResult::Stale => {
+                digest_stale = true;
+                AuthResult::default()
+            }
+            crate::auth::DigestResult::Invalid => {
+                log::warn!("onvif: HTTP Digest rejected from {client_ip}");
+                metrics.auth_fail();
+                auth_state.record_failure(
+                    client_ip,
+                    cfg.auth_failure_limit,
+                    Duration::from_secs(cfg.auth_lockout_secs),
+                );
+                AuthResult::default()
+            }
         }
     } else {
         AuthResult::default()
@@ -712,11 +830,8 @@ where
                 }
             };
             if route_requires_auth && !auth_disabled && !auth_result.authenticated {
-                let fault = serialize_soap_fault(
-                    "soap:Sender",
-                    &format!("authentication required for action: {}", parsed.action),
-                );
-                write_http_response(stream, 401, &fault).await?;
+                write_401_auth_required(stream, cfg, auth_state, digest_stale, &parsed.action)
+                    .await?;
                 return Ok(());
             }
             let request_info = RequestInfo {
@@ -752,11 +867,8 @@ where
                 return Ok(());
             }
             if route_requires_auth && !auth_disabled && !auth_result.authenticated {
-                let fault = serialize_soap_fault(
-                    "soap:Sender",
-                    &format!("authentication required for action: {}", parsed.action),
-                );
-                write_http_response(stream, 401, &fault).await?;
+                write_401_auth_required(stream, cfg, auth_state, digest_stale, &parsed.action)
+                    .await?;
                 return Ok(());
             }
             let endpoint = ServiceEndpoint {
@@ -868,11 +980,13 @@ fn classify_request_route(path: &str, events: Option<&Arc<EventsService>>) -> Re
 
 /// Read one HTTP request: header section (capped at [`MAX_HEADER_BYTES`],
 /// may span multiple reads), then exactly `Content-Length` body bytes
-/// (capped at `cfg.max_body_bytes`). Returns `(method, path, body)`.
+/// (capped at `cfg.max_body_bytes`). Returns
+/// `(method, path, body, authorization)` — `authorization` is the value
+/// of the `Authorization` header when present (issue #54: HTTP Digest).
 async fn read_http_request<S>(
     stream: &mut S,
     cfg: &OnvifConfig,
-) -> Result<(String, String, String), OnvifError>
+) -> Result<(String, String, String, Option<String>), OnvifError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -923,6 +1037,20 @@ where
         })
         .unwrap_or(0);
 
+    // Extract Authorization (case-insensitive; first occurrence wins).
+    let authorization = header_str.lines().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("authorization:") {
+            Some(
+                line.split_once(':')
+                    .map(|(_, v)| v.trim().to_string())
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        }
+    });
+
     if content_length > cfg.max_body_bytes {
         return Err(OnvifError::InvalidXml(format!(
             "body too large: {content_length} bytes exceeds limit {}",
@@ -952,7 +1080,7 @@ where
     let body_str = String::from_utf8(body)
         .map_err(|_| OnvifError::InvalidXml("request body is not valid UTF-8".into()))?;
 
-    Ok((method, path, body_str))
+    Ok((method, path, body_str, authorization))
 }
 
 /// Read and discard pending inbound bytes (bounded) so closing the socket
@@ -981,10 +1109,26 @@ async fn write_http_response<S>(stream: &mut S, status: u16, body: &str) -> Resu
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    write_http_response_with_headers(stream, status, body, &[]).await
+}
+
+/// [`write_http_response`] with optional extra headers (issue #54: the
+/// `WWW-Authenticate` challenge on 401s when HTTP Digest is enabled).
+/// Zero extra headers is byte-identical to the historical writer.
+async fn write_http_response_with_headers<S>(
+    stream: &mut S,
+    status: u16,
+    body: &str,
+    extra_headers: &[(&str, String)],
+) -> Result<(), OnvifError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let status_line = match status {
         200 => "200 OK",
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
+        403 => "403 Forbidden",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
         413 => "413 Content Too Large",
@@ -992,14 +1136,17 @@ where
         _ => "500 Internal Server Error",
     };
 
-    let header = format!(
+    let mut header = format!(
         "HTTP/1.1 {status_line}\r\n\
          Content-Type: application/soap+xml; charset=utf-8\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
+         Connection: close\r\n",
         body.len()
     );
+    for (name, value) in extra_headers {
+        header.push_str(&format!("{name}: {value}\r\n"));
+    }
+    header.push_str("\r\n");
 
     stream
         .write_all(header.as_bytes())
@@ -1011,6 +1158,46 @@ where
         .map_err(|e| OnvifError::Internal(format!("write response body: {e}")))?;
 
     Ok(())
+}
+
+/// A fresh `WWW-Authenticate: Digest` challenge value for a 401 (issue
+/// #54): server-generated nonce + opaque; `stale=TRUE` re-challenges a
+/// client whose nonce is unknown/expired.
+fn digest_challenge_value(auth_state: &AuthState, stale: bool) -> String {
+    use rand::RngCore;
+
+    let nonce = auth_state.digest_nonces.generate();
+    let mut opaque_bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut opaque_bytes);
+    let opaque = hex::encode(opaque_bytes);
+    crate::auth::HttpDigestChallenge::new(HTTP_DIGEST_REALM, &nonce, &opaque, stale)
+        .to_header_value()
+}
+
+/// 401 for an unauthenticated request: SOAP Sender fault, plus a Digest
+/// challenge when HTTP Digest is enabled (issue #54). Byte-identical to
+/// the historical 401 when Digest is off.
+async fn write_401_auth_required<S>(
+    stream: &mut S,
+    cfg: &OnvifConfig,
+    auth_state: &AuthState,
+    digest_stale: bool,
+    action: &str,
+) -> Result<(), OnvifError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let fault = serialize_soap_fault(
+        "soap:Sender",
+        &format!("authentication required for action: {action}"),
+    );
+    if cfg.http_digest {
+        let challenge = digest_challenge_value(auth_state, digest_stale);
+        write_http_response_with_headers(stream, 401, &fault, &[("WWW-Authenticate", challenge)])
+            .await
+    } else {
+        write_http_response(stream, 401, &fault).await
+    }
 }
 
 // ---------------------------------------------------------------------------

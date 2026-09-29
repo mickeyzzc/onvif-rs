@@ -40,6 +40,16 @@ pub struct DeviceServiceHandlers {
     /// host must also serve the routes — `OnvifServer::enable_events` on the
     /// SOAP side; parity with onvif-go's SupportEvents flagging both).
     support_events: bool,
+    /// IP address filter seam (issue #54): the shared store behind the
+    /// Get/Set/Add/RemoveIPAddressFilter ops. `None` (default) — Get
+    /// answers a disabled filter, mutations are refused. Wire the same
+    /// state into [`crate::server::OnvifServer::with_ip_filter`] for
+    /// per-connection enforcement.
+    ip_filter: Option<IpFilterState>,
+    /// AccessPolicy seam (issue #54): opaque Base64-backed policy blob
+    /// (Get/SetAccessPolicy). `None` (default) — Get answers an empty
+    /// policy, Set is refused.
+    access_policy: Option<AccessPolicyState>,
 }
 
 impl DeviceServiceHandlers {
@@ -62,6 +72,8 @@ impl DeviceServiceHandlers {
             support_ptz: true,
             support_imaging: true,
             support_events: false,
+            ip_filter: None,
+            access_policy: None,
         })
     }
 
@@ -132,6 +144,18 @@ impl OnvifActionHandler for DeviceHandler {
             svc.build_scopes()
         } else if body.contains("SystemReboot") {
             svc.build_system_reboot()
+        } else if body.contains("GetIPAddressFilter") {
+            svc.sec_build_get_ip_address_filter()
+        } else if body.contains("SetIPAddressFilter") {
+            svc.sec_apply_set_ip_address_filter(body)?
+        } else if body.contains("AddIPAddressFilter") {
+            svc.sec_apply_add_ip_address_filter(body)?
+        } else if body.contains("RemoveIPAddressFilter") {
+            svc.sec_apply_remove_ip_address_filter(body)?
+        } else if body.contains("GetAccessPolicy") {
+            svc.sec_build_get_access_policy()
+        } else if body.contains("SetAccessPolicy") {
+            svc.sec_apply_set_access_policy(body)?
         } else {
             return Err(OnvifError::ActionNotSupported(
                 "unknown device action".into(),
@@ -443,6 +467,506 @@ pub(crate) fn secs_to_utc(secs: u64) -> (i32, i32, i32, i32, i32, i32) {
 
 fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+// ---------------------------------------------------------------------------
+// Security ops (issue #54): IP address filter + AccessPolicy
+//
+// Self-contained section — `sec_`-prefixed helpers only, nothing shared
+// with the response builders above, so the section stays merge-friendly
+// against independent changes to the rest of this file.
+//
+// 802.1X (GetDot1XConfiguration/SetDot1XConfiguration &c.) is
+// deliberately NOT implemented: an EAP supplicant is host
+// infrastructure, not SOAP device protocol — those actions stay
+// unregistered and answer the generic unsupported-action fault.
+// ---------------------------------------------------------------------------
+
+/// Mode of the ONVIF IP address filter (`tt:IPAddressFilter/Type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpFilterMode {
+    Allow,
+    Deny,
+}
+
+impl IpFilterMode {
+    fn as_wire(&self) -> &'static str {
+        match self {
+            Self::Allow => "Allow",
+            Self::Deny => "Deny",
+        }
+    }
+
+    fn from_wire(s: &str) -> Option<Self> {
+        match s.trim() {
+            "Allow" => Some(Self::Allow),
+            "Deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+/// One IPv4 filter entry: dotted-quad network address + prefix length
+/// 0–32 (`tt:PrefixedIPv4Address` on the wire).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpEntry {
+    pub ipv4: String,
+    pub prefix_len: u8,
+}
+
+/// The ONVIF IP address filter state — host-mutable config seam shared
+/// between the SOAP ops and [`crate::server::OnvifServer::with_ip_filter`].
+/// `enabled = false` filters nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpFilter {
+    pub enabled: bool,
+    pub mode: IpFilterMode,
+    pub entries: Vec<IpEntry>,
+}
+
+impl Default for IpFilter {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: IpFilterMode::Allow,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl IpFilter {
+    /// A filter that admits everyone (`enabled = false`).
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// Whether a client IP passes the filter.
+    ///
+    /// Unparseable or IPv6 client addresses fail OPEN (allowed): a
+    /// malformed peer address must not brick the SOAP listener — the
+    /// caller logs a warning. Entries whose address does not parse
+    /// never match. Enforcement notes: prefix 0 matches everything,
+    /// 32 matches one host; Allow mode admits only matching peers,
+    /// Deny mode refuses only matching peers.
+    pub fn allows_client_ip(&self, client_ip: &str) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let Some(ip) = client_ip.trim().parse::<std::net::Ipv4Addr>().ok() else {
+            // IPv6 peer or unparseable address: fail open (documented) —
+            // a malformed peer address must not brick the listener.
+            log::warn!("onvif: IP filter cannot parse client address {client_ip:?} — allowing");
+            return true;
+        };
+        let client = u32::from(ip);
+        let matched = self
+            .entries
+            .iter()
+            .any(|e| match e.ipv4.parse::<std::net::Ipv4Addr>() {
+                Ok(net) => sec_ipv4_prefix_matches(client, u32::from(net), e.prefix_len),
+                Err(_) => false, // malformed stored entry never matches
+            });
+        match self.mode {
+            IpFilterMode::Allow => matched,
+            IpFilterMode::Deny => !matched,
+        }
+    }
+}
+
+/// Shared IP filter state (install via
+/// [`DeviceServiceHandlers::with_ip_filter`]).
+pub type IpFilterState = Arc<std::sync::RwLock<IpFilter>>;
+/// Shared AccessPolicy blob state (install via
+/// [`DeviceServiceHandlers::with_access_policy`]). The library stores
+/// and returns the bytes verbatim — interpreting (enforcing) the policy
+/// is host-side.
+pub type AccessPolicyState = Arc<std::sync::RwLock<Vec<u8>>>;
+
+/// Poison-tolerant read guard (the established crate pattern, kept
+/// local to this section under a `sec_` name).
+fn sec_read<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    match lock.read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Poison-tolerant write guard.
+fn sec_write<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    match lock.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Whether two IPv4 addresses (as `u32`) share the first `prefix` bits.
+fn sec_ipv4_prefix_matches(a: u32, b: u32, prefix: u8) -> bool {
+    if prefix > 32 {
+        return false;
+    }
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    (a & mask) == (b & mask)
+}
+
+impl DeviceServiceHandlers {
+    /// Install the IP filter config seam (issue #54). Wire the SAME
+    /// state into [`crate::server::OnvifServer::with_ip_filter`] so the
+    /// SOAP Get/Set/Add/RemoveIPAddressFilter ops and the
+    /// per-connection gate share one store.
+    #[must_use]
+    pub fn with_ip_filter(mut self, state: IpFilterState) -> Self {
+        self.ip_filter = Some(state);
+        self
+    }
+
+    /// The installed IP filter state, when present (hand this to
+    /// [`crate::server::OnvifServer::with_ip_filter`]).
+    #[must_use]
+    pub fn ip_filter_state(&self) -> Option<IpFilterState> {
+        self.ip_filter.clone()
+    }
+
+    /// Install the AccessPolicy config seam (issue #54): Get/Set carry
+    /// an opaque Base64 blob; this library does not interpret it.
+    #[must_use]
+    pub fn with_access_policy(mut self, state: AccessPolicyState) -> Self {
+        self.access_policy = Some(state);
+        self
+    }
+
+    /// The installed AccessPolicy state, when present.
+    #[must_use]
+    pub fn access_policy_state(&self) -> Option<AccessPolicyState> {
+        self.access_policy.clone()
+    }
+
+    /// `<tds:GetIPAddressFilterResponse>` — the current filter; without
+    /// an installed state, a disabled (allow-all) filter.
+    fn sec_build_get_ip_address_filter(&self) -> String {
+        let filter = match &self.ip_filter {
+            Some(state) => sec_read(state).clone(),
+            None => IpFilter::disabled(),
+        };
+        let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+        let mut root = BytesStart::new("tds:GetIPAddressFilterResponse");
+        root.push_attribute(("xmlns:tds", DEVICE_SERVICE));
+        root.push_attribute(("xmlns:tt", SCHEMAS));
+        w.write_event(Event::Start(root)).unwrap_or_default();
+        w.write_event(Event::Start(BytesStart::new("tds:IPAddressFilter")))
+            .unwrap_or_default();
+        sec_write_text(&mut w, "tt:Type", filter.mode.as_wire());
+        for e in &filter.entries {
+            sec_write_entry(&mut w, e);
+        }
+        w.write_event(Event::End(BytesEnd::new("tds:IPAddressFilter")))
+            .unwrap_or_default();
+        w.write_event(Event::End(BytesEnd::new("tds:GetIPAddressFilterResponse")))
+            .unwrap_or_default();
+        String::from_utf8(w.into_inner()).unwrap_or_default()
+    }
+
+    /// `SetIPAddressFilter` — replace mode + entries wholesale.
+    fn sec_apply_set_ip_address_filter(&self, body: &str) -> Result<String, OnvifError> {
+        let Some(state) = &self.ip_filter else {
+            return Err(OnvifError::SenderFault(
+                "IP address filter is not configured on this device".into(),
+            ));
+        };
+        let parsed = sec_parse_ip_filter(body)?;
+        let mut f = sec_write(state);
+        f.enabled = true;
+        f.mode = parsed.mode;
+        f.entries = parsed.entries;
+        Ok(sec_empty_ack("tds:SetIPAddressFilterResponse"))
+    }
+
+    /// `AddIPAddressFilter` — set the mode and append entries not
+    /// already present.
+    fn sec_apply_add_ip_address_filter(&self, body: &str) -> Result<String, OnvifError> {
+        let Some(state) = &self.ip_filter else {
+            return Err(OnvifError::SenderFault(
+                "IP address filter is not configured on this device".into(),
+            ));
+        };
+        let parsed = sec_parse_ip_filter(body)?;
+        let mut f = sec_write(state);
+        f.enabled = true;
+        f.mode = parsed.mode;
+        for e in parsed.entries {
+            if !f.entries.contains(&e) {
+                f.entries.push(e);
+            }
+        }
+        Ok(sec_empty_ack("tds:AddIPAddressFilterResponse"))
+    }
+
+    /// `RemoveIPAddressFilter` — remove entries matching the request
+    /// (address + prefix); the mode is kept. Idempotent: removing an
+    /// absent entry still acks.
+    fn sec_apply_remove_ip_address_filter(&self, body: &str) -> Result<String, OnvifError> {
+        let Some(state) = &self.ip_filter else {
+            return Err(OnvifError::SenderFault(
+                "IP address filter is not configured on this device".into(),
+            ));
+        };
+        let parsed = sec_parse_ip_filter(body)?;
+        let mut f = sec_write(state);
+        f.entries.retain(|e| !parsed.entries.contains(e));
+        Ok(sec_empty_ack("tds:RemoveIPAddressFilterResponse"))
+    }
+
+    /// `<tds:GetAccessPolicyResponse>` — the stored policy blob
+    /// (Base64), empty when none installed.
+    fn sec_build_get_access_policy(&self) -> String {
+        use base64::Engine as _;
+
+        let blob = match &self.access_policy {
+            Some(state) => sec_read(state).clone(),
+            None => Vec::new(),
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+        let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+        let mut root = BytesStart::new("tds:GetAccessPolicyResponse");
+        root.push_attribute(("xmlns:tds", DEVICE_SERVICE));
+        root.push_attribute(("xmlns:tt", SCHEMAS));
+        w.write_event(Event::Start(root)).unwrap_or_default();
+        w.write_event(Event::Start(BytesStart::new("tds:PolicyFile")))
+            .unwrap_or_default();
+        sec_write_text(&mut w, "tt:Data", &b64);
+        w.write_event(Event::End(BytesEnd::new("tds:PolicyFile")))
+            .unwrap_or_default();
+        w.write_event(Event::End(BytesEnd::new("tds:GetAccessPolicyResponse")))
+            .unwrap_or_default();
+        String::from_utf8(w.into_inner()).unwrap_or_default()
+    }
+
+    /// `SetAccessPolicy` — decode the Base64 PolicyFile/Data into the
+    /// store.
+    fn sec_apply_set_access_policy(&self, body: &str) -> Result<String, OnvifError> {
+        use base64::Engine as _;
+
+        let Some(state) = &self.access_policy else {
+            return Err(OnvifError::SenderFault(
+                "access policy is not configured on this device".into(),
+            ));
+        };
+        let b64 = sec_extract_policy_data(body).ok_or_else(|| {
+            OnvifError::SenderFault("SetAccessPolicy requires a PolicyFile/Data payload".into())
+        })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .map_err(|_| OnvifError::SenderFault("PolicyFile Data is not valid base64".into()))?;
+        *sec_write(state) = bytes;
+        Ok(sec_empty_ack("tds:SetAccessPolicyResponse"))
+    }
+}
+
+/// Serialize one `<tt:Address>`/`<tt:PrefixLength>` pair inside an open
+/// `tt:IPv4Address` element.
+fn sec_write_entry(w: &mut Writer<Vec<u8>>, entry: &IpEntry) {
+    w.write_event(Event::Start(BytesStart::new("tt:IPv4Address")))
+        .unwrap_or_default();
+    sec_write_text(w, "tt:Address", &entry.ipv4);
+    sec_write_text(w, "tt:PrefixLength", &entry.prefix_len.to_string());
+    w.write_event(Event::End(BytesEnd::new("tt:IPv4Address")))
+        .unwrap_or_default();
+}
+
+/// Text-element writer for this section (independent of `write_text`).
+fn sec_write_text(w: &mut Writer<Vec<u8>>, name: &str, text: &str) {
+    w.write_event(Event::Start(BytesStart::new(name)))
+        .unwrap_or_default();
+    w.write_event(Event::Text(BytesText::new(text)))
+        .unwrap_or_default();
+    w.write_event(Event::End(BytesEnd::new(name)))
+        .unwrap_or_default();
+}
+
+/// An empty (ack-only) `<tds:XxxResponse>` fragment.
+fn sec_empty_ack(response_local_name: &str) -> String {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut root = BytesStart::new(response_local_name);
+    root.push_attribute(("xmlns:tds", DEVICE_SERVICE));
+    w.write_event(Event::Start(root)).unwrap_or_default();
+    w.write_event(Event::End(BytesEnd::new(response_local_name)))
+        .unwrap_or_default();
+    String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+/// Local name of a QName (`tt:Address` → `Address`).
+fn sec_local_name(name: quick_xml::name::QName<'_>) -> String {
+    let qname = std::str::from_utf8(name.as_ref()).unwrap_or("");
+    qname.rsplit(':').next().unwrap_or(qname).to_string()
+}
+
+/// Parse the `IPAddressFilter` payload of Set/Add/Remove (tolerant of
+/// `tt:`-prefixed or default-namespace forms). Requires a valid Type
+/// and complete IPv4 entries; IPv6 entries are refused (IPv4-only
+/// state, honestly reported rather than silently dropped).
+fn sec_parse_ip_filter(body: &str) -> Result<IpFilter, OnvifError> {
+    let mut reader = quick_xml::Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut mode: Option<IpFilterMode> = None;
+    let mut entries: Vec<IpEntry> = Vec::new();
+    let mut saw_ipv6 = false;
+    // State inside one <IPv4Address> element.
+    let mut in_v4 = false;
+    let mut addr: Option<String> = None;
+    let mut plen: Option<u8> = None;
+    let mut field = String::new();
+    let mut text_acc = crate::types::TextAccumulator::new();
+
+    loop {
+        let event = reader.read_event_into(&mut buf);
+        match event {
+            Ok(Event::Text(e)) => {
+                let _ = text_acc.push_text(&e);
+            }
+            Ok(Event::GeneralRef(e)) => {
+                let _ = text_acc.push_ref(&e);
+            }
+            other => {
+                if let Some(text) = text_acc.flush() {
+                    if !text.is_empty() {
+                        match field.as_str() {
+                            "Type" => {
+                                if mode.is_none() {
+                                    mode = IpFilterMode::from_wire(&text);
+                                }
+                            }
+                            "Address" if in_v4 => addr = Some(text),
+                            "PrefixLength" if in_v4 => {
+                                plen = text.parse::<u8>().ok().filter(|p| *p <= 32)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                match other {
+                    Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                        match sec_local_name(e.name()).as_str() {
+                            "Type" => field = "Type".into(),
+                            "IPv4Address" => {
+                                in_v4 = true;
+                                addr = None;
+                                plen = None;
+                                field.clear();
+                            }
+                            "IPv6Address" => saw_ipv6 = true,
+                            "Address" if in_v4 => field = "Address".into(),
+                            "PrefixLength" if in_v4 => field = "PrefixLength".into(),
+                            _ => field.clear(),
+                        }
+                    }
+                    Ok(Event::End(e)) => {
+                        let local = sec_local_name(e.name());
+                        if local == "IPv4Address" && in_v4 {
+                            let a = addr
+                                .as_deref()
+                                .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok())
+                                .map(|ip| ip.to_string());
+                            match (a, plen) {
+                                (Some(address), Some(prefix_len)) => {
+                                    entries.push(IpEntry {
+                                        ipv4: address,
+                                        prefix_len,
+                                    });
+                                }
+                                (None, _) => {
+                                    return Err(OnvifError::SenderFault(
+                                        "IPv4 filter entry requires a valid dotted-quad Address"
+                                            .into(),
+                                    ));
+                                }
+                                (_, None) => {
+                                    return Err(OnvifError::SenderFault(
+                                        "IPv4 filter entry requires a PrefixLength (0-32)".into(),
+                                    ));
+                                }
+                            }
+                            in_v4 = false;
+                        }
+                        if local == "Type" || local == "Address" || local == "PrefixLength" {
+                            field.clear();
+                        }
+                    }
+                    Ok(Event::Eof) => break,
+                    Err(e) => {
+                        return Err(OnvifError::InvalidXml(format!("XML parse error: {e}")));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        buf.clear();
+    }
+
+    if saw_ipv6 {
+        return Err(OnvifError::SenderFault(
+            "IPv6 filter entries are not supported (IPv4 only)".into(),
+        ));
+    }
+    let Some(mode) = mode else {
+        return Err(OnvifError::SenderFault(
+            "IPAddressFilter requires a Type of Allow or Deny".into(),
+        ));
+    };
+    Ok(IpFilter {
+        enabled: true,
+        mode,
+        entries,
+    })
+}
+
+/// Extract the Base64 text of `PolicyFile/Data` from a SetAccessPolicy
+/// body (tolerant of prefixes). `None` when no Data element is found.
+fn sec_extract_policy_data(body: &str) -> Option<String> {
+    let mut reader = quick_xml::Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+
+    let mut in_data = false;
+    let mut out: Option<String> = None;
+    let mut text_acc = crate::types::TextAccumulator::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Text(e)) => {
+                let _ = text_acc.push_text(&e);
+            }
+            Ok(Event::GeneralRef(e)) => {
+                let _ = text_acc.push_ref(&e);
+            }
+            Ok(Event::Start(e)) => {
+                let _ = text_acc.flush();
+                if sec_local_name(e.name()) == "Data" {
+                    in_data = true;
+                }
+            }
+            Ok(Event::Empty(_)) => {
+                let _ = text_acc.flush();
+            }
+            Ok(Event::End(e)) => {
+                let flushed = text_acc.flush();
+                let local = sec_local_name(e.name());
+                if in_data && local == "Data" {
+                    in_data = false;
+                    out = flushed; // schema has exactly one Data
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -821,5 +1345,471 @@ mod tests {
             }
             buf.clear();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Security ops tests (issue #54)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod security_ops_tests {
+    use super::*;
+    use crate::types::AuthResult;
+
+    fn handlers() -> DeviceServiceHandlers {
+        DeviceServiceHandlers::new(
+            DeviceConfig {
+                name: "Sec Cam".into(),
+                manufacturer: "Vendor".into(),
+                model: "Model".into(),
+                firmware: "1.0.0".into(),
+                hardware_id: "HW".into(),
+                serial_number: "SN".into(),
+            },
+            8080,
+            "10.1.1.1".to_string(),
+        )
+        .unwrap()
+    }
+
+    fn info() -> RequestInfo {
+        RequestInfo {
+            client_ip: "10.0.0.1".to_string(),
+            server_ip: "10.0.0.5".to_string(),
+            auth_result: AuthResult {
+                username: "admin".into(),
+                authenticated: true,
+            },
+        }
+    }
+
+    fn filter_state(f: IpFilter) -> IpFilterState {
+        Arc::new(std::sync::RwLock::new(f))
+    }
+
+    fn entry(ip: &str, plen: u8) -> IpEntry {
+        IpEntry {
+            ipv4: ip.to_string(),
+            prefix_len: plen,
+        }
+    }
+
+    fn assert_well_formed(xml: &str) {
+        let mut reader = quick_xml::Reader::from_str(xml);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("XML parse error: {e} in\n{xml}"),
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Filter matching
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ip_filter_disabled_allows_everything() {
+        assert!(IpFilter::disabled().allows_client_ip("10.0.0.1"));
+        // Entries present but disabled: still no enforcement.
+        let f = IpFilter {
+            enabled: false,
+            mode: IpFilterMode::Deny,
+            entries: vec![entry("10.0.0.1", 32)],
+        };
+        assert!(f.allows_client_ip("10.0.0.1"));
+    }
+
+    #[test]
+    fn ip_filter_allow_mode_admits_only_matches() {
+        let f = IpFilter {
+            enabled: true,
+            mode: IpFilterMode::Allow,
+            entries: vec![entry("192.168.1.0", 24)],
+        };
+        assert!(f.allows_client_ip("192.168.1.77"));
+        assert!(!f.allows_client_ip("192.168.2.1"));
+        assert!(!f.allows_client_ip("10.0.0.1"));
+    }
+
+    #[test]
+    fn ip_filter_deny_mode_refuses_only_matches() {
+        let f = IpFilter {
+            enabled: true,
+            mode: IpFilterMode::Deny,
+            entries: vec![entry("10.9.9.5", 32)],
+        };
+        assert!(!f.allows_client_ip("10.9.9.5"));
+        assert!(f.allows_client_ip("10.9.9.6"));
+    }
+
+    #[test]
+    fn ip_filter_prefix_bounds() {
+        let all = IpFilter {
+            enabled: true,
+            mode: IpFilterMode::Allow,
+            entries: vec![entry("0.0.0.0", 0)],
+        };
+        assert!(all.allows_client_ip("203.0.113.9"));
+
+        let host = IpFilter {
+            enabled: true,
+            mode: IpFilterMode::Allow,
+            entries: vec![entry("198.51.100.7", 32)],
+        };
+        assert!(host.allows_client_ip("198.51.100.7"));
+        assert!(!host.allows_client_ip("198.51.100.8"));
+    }
+
+    /// IPv6 / unparseable peer addresses fail OPEN (documented): a
+    /// malformed address must not brick the listener.
+    #[test]
+    fn ip_filter_ipv6_and_garbage_fail_open() {
+        let deny_all_v4 = IpFilter {
+            enabled: true,
+            mode: IpFilterMode::Deny,
+            entries: vec![entry("0.0.0.0", 0)],
+        };
+        assert!(!deny_all_v4.allows_client_ip("10.0.0.1"), "IPv4 is denied");
+        assert!(deny_all_v4.allows_client_ip("::1"));
+        assert!(deny_all_v4.allows_client_ip("not-an-ip"));
+    }
+
+    #[test]
+    fn ip_filter_invalid_entries_never_match() {
+        let f = IpFilter {
+            enabled: true,
+            mode: IpFilterMode::Allow,
+            entries: vec![entry("garbage", 24), entry("10.0.0.0", 40)],
+        };
+        assert!(!f.allows_client_ip("192.168.0.1"));
+        assert!(!f.allows_client_ip("10.0.0.1"));
+    }
+
+    // ------------------------------------------------------------------
+    // GetIPAddressFilter wire shape
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn get_ip_filter_without_state_reports_disabled() {
+        let xml = handlers().sec_build_get_ip_address_filter();
+        assert!(xml.contains("tds:GetIPAddressFilterResponse"), "{xml}");
+        assert!(xml.contains("<tds:IPAddressFilter>"), "{xml}");
+        assert!(xml.contains("<tt:Type>Allow</tt:Type>"), "{xml}");
+        assert!(!xml.contains("tt:IPv4Address"), "{xml}");
+        assert_well_formed(&xml);
+    }
+
+    #[test]
+    fn get_ip_filter_serializes_entries() {
+        let state = filter_state(IpFilter {
+            enabled: true,
+            mode: IpFilterMode::Deny,
+            entries: vec![entry("192.168.0.0", 16), entry("10.1.2.3", 32)],
+        });
+        let xml = handlers()
+            .with_ip_filter(state)
+            .sec_build_get_ip_address_filter();
+        assert!(xml.contains("<tt:Type>Deny</tt:Type>"), "{xml}");
+        assert!(
+            xml.contains("<tt:Address>192.168.0.0</tt:Address>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<tt:PrefixLength>16</tt:PrefixLength>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<tt:Address>10.1.2.3</tt:Address>"), "{xml}");
+        assert!(
+            xml.contains("<tt:PrefixLength>32</tt:PrefixLength>"),
+            "{xml}"
+        );
+        assert_eq!(xml.matches("tt:IPv4Address").count(), 4, "{xml}"); // open+close per entry
+        assert_well_formed(&xml);
+    }
+
+    // ------------------------------------------------------------------
+    // Request parsing
+    // ------------------------------------------------------------------
+
+    fn set_filter_body(mode: &str, entries: &[(&str, &str)], prefixed: bool) -> String {
+        let (pt, pv, pe, pp) = if prefixed {
+            ("tt:Type", "tt:IPv4Address", "tt:Address", "tt:PrefixLength")
+        } else {
+            ("Type", "IPv4Address", "Address", "PrefixLength")
+        };
+        let mut x = format!(
+            "<SetIPAddressFilter xmlns=\"http://www.onvif.org/ver10/device/wsdl\">\
+             <IPAddressFilter><{pt}>{mode}</{pt}>"
+        );
+        for (addr, plen) in entries {
+            x.push_str(&format!(
+                "<{pv}><{pe}>{addr}</{pe}><{pp}>{plen}</{pp}></{pv}>"
+            ));
+        }
+        x.push_str("</IPAddressFilter></SetIPAddressFilter>");
+        x
+    }
+
+    #[test]
+    fn parse_ip_filter_tolerates_tt_prefixes() {
+        let f = sec_parse_ip_filter(&set_filter_body("Deny", &[("192.168.0.0", "16")], true))
+            .expect("prefixed body must parse");
+        assert_eq!(f.mode, IpFilterMode::Deny);
+        assert_eq!(f.entries, vec![entry("192.168.0.0", 16)]);
+    }
+
+    #[test]
+    fn parse_ip_filter_tolerates_default_namespace() {
+        let f = sec_parse_ip_filter(&set_filter_body("Allow", &[("10.0.0.0", "8")], false))
+            .expect("unprefixed body must parse");
+        assert_eq!(f.mode, IpFilterMode::Allow);
+        assert_eq!(f.entries, vec![entry("10.0.0.0", 8)]);
+    }
+
+    #[test]
+    fn parse_ip_filter_rejects_bad_type() {
+        let err = sec_parse_ip_filter(&set_filter_body("Maybe", &[], false)).unwrap_err();
+        assert!(err.to_string().contains("Type"), "{err}");
+    }
+
+    #[test]
+    fn parse_ip_filter_rejects_ipv6_entries() {
+        let body = "<SetIPAddressFilter><IPAddressFilter><Type>Allow</Type>\
+                    <IPv6Address><Address>fe80::1</Address><PrefixLength>10</PrefixLength></IPv6Address>\
+                    </IPAddressFilter></SetIPAddressFilter>";
+        let err = sec_parse_ip_filter(body).unwrap_err();
+        assert!(err.to_string().contains("IPv6"), "{err}");
+    }
+
+    #[test]
+    fn parse_ip_filter_rejects_incomplete_entry() {
+        let body = "<SetIPAddressFilter><IPAddressFilter><Type>Allow</Type>\
+                    <IPv4Address><Address>10.0.0.0</Address></IPv4Address>\
+                    </IPAddressFilter></SetIPAddressFilter>";
+        let err = sec_parse_ip_filter(body).unwrap_err();
+        assert!(err.to_string().contains("PrefixLength"), "{err}");
+    }
+
+    #[test]
+    fn parse_ip_filter_rejects_bad_address() {
+        let err = sec_parse_ip_filter(&set_filter_body("Allow", &[("300.1.2.3", "24")], false))
+            .unwrap_err();
+        assert!(err.to_string().contains("Address"), "{err}");
+    }
+
+    #[test]
+    fn parse_ip_filter_rejects_prefix_over_32() {
+        let err = sec_parse_ip_filter(&set_filter_body("Allow", &[("10.0.0.0", "33")], false))
+            .unwrap_err();
+        assert!(err.to_string().contains("PrefixLength"), "{err}");
+    }
+
+    // ------------------------------------------------------------------
+    // Handler dispatch round-trips (Set/Add/Remove/Get over the store)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn set_then_get_ip_filter_roundtrip() {
+        let state = filter_state(IpFilter::disabled());
+        let svc = Arc::new(handlers().with_ip_filter(state.clone()));
+        let handler = DeviceHandler(svc);
+        let ri = info();
+
+        let resp = handler
+            .handle(
+                &set_filter_body("Allow", &[("172.16.0.0", "12")], false),
+                &ri,
+            )
+            .await
+            .unwrap();
+        assert!(resp.contains("tds:SetIPAddressFilterResponse"), "{resp}");
+
+        // Mutations mark the filter enabled in the shared state.
+        assert!(state.read().unwrap().enabled);
+
+        let get = handler
+            .handle(
+                "<GetIPAddressFilter xmlns=\"http://www.onvif.org/ver10/device/wsdl\"/>",
+                &ri,
+            )
+            .await
+            .unwrap();
+        assert!(get.contains("<tt:Type>Allow</tt:Type>"), "{get}");
+        assert!(get.contains("<tt:Address>172.16.0.0</tt:Address>"), "{get}");
+        assert!(
+            get.contains("<tt:PrefixLength>12</tt:PrefixLength>"),
+            "{get}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_appends_then_set_replaces() {
+        let state = filter_state(IpFilter::disabled());
+        let svc = Arc::new(handlers().with_ip_filter(state));
+        let handler = DeviceHandler(svc);
+        let ri = info();
+
+        handler
+            .handle(&set_filter_body("Allow", &[("10.0.0.0", "8")], false), &ri)
+            .await
+            .unwrap();
+        let resp = handler
+            .handle(
+                "<AddIPAddressFilter xmlns=\"http://www.onvif.org/ver10/device/wsdl\">\
+                 <IPAddressFilter><Type>Allow</Type>\
+                 <IPv4Address><Address>192.168.0.0</Address><PrefixLength>16</PrefixLength></IPv4Address>\
+                 </IPAddressFilter></AddIPAddressFilter>",
+                &ri,
+            )
+            .await
+            .unwrap();
+        assert!(resp.contains("tds:AddIPAddressFilterResponse"), "{resp}");
+
+        let get = handler.handle("<GetIPAddressFilter/>", &ri).await.unwrap();
+        assert!(
+            get.contains("10.0.0.0") && get.contains("192.168.0.0"),
+            "{get}"
+        );
+
+        // Set replaces wholesale.
+        handler
+            .handle(&set_filter_body("Deny", &[("10.9.0.0", "16")], false), &ri)
+            .await
+            .unwrap();
+        let get = handler.handle("<GetIPAddressFilter/>", &ri).await.unwrap();
+        assert!(get.contains("<tt:Type>Deny</tt:Type>"), "{get}");
+        assert!(get.contains("10.9.0.0"), "{get}");
+        assert!(!get.contains("192.168.0.0"), "{get}");
+    }
+
+    #[tokio::test]
+    async fn remove_removes_matching_entry() {
+        let state = filter_state(IpFilter::disabled());
+        let svc = Arc::new(handlers().with_ip_filter(state));
+        let handler = DeviceHandler(svc);
+        let ri = info();
+
+        handler
+            .handle(
+                &set_filter_body("Deny", &[("10.1.0.0", "16"), ("10.2.0.0", "16")], false),
+                &ri,
+            )
+            .await
+            .unwrap();
+        let resp = handler
+            .handle(
+                "<RemoveIPAddressFilter xmlns=\"http://www.onvif.org/ver10/device/wsdl\">\
+                 <IPAddressFilter><Type>Deny</Type>\
+                 <IPv4Address><Address>10.1.0.0</Address><PrefixLength>16</PrefixLength></IPv4Address>\
+                 </IPAddressFilter></RemoveIPAddressFilter>",
+                &ri,
+            )
+            .await
+            .unwrap();
+        assert!(resp.contains("tds:RemoveIPAddressFilterResponse"), "{resp}");
+
+        let get = handler.handle("<GetIPAddressFilter/>", &ri).await.unwrap();
+        assert!(get.contains("10.2.0.0"), "{get}");
+        assert!(!get.contains("10.1.0.0"), "{get}");
+        // Mode is kept on remove.
+        assert!(get.contains("<tt:Type>Deny</tt:Type>"), "{get}");
+    }
+
+    #[tokio::test]
+    async fn set_ip_filter_without_state_refused() {
+        let handler = DeviceHandler(Arc::new(handlers()));
+        let result = handler
+            .handle(
+                &set_filter_body("Allow", &[("10.0.0.0", "8")], false),
+                &info(),
+            )
+            .await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not configured"), "{err}");
+    }
+
+    // ------------------------------------------------------------------
+    // AccessPolicy
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn get_access_policy_default_empty() {
+        let xml = handlers().sec_build_get_access_policy();
+        assert!(xml.contains("tds:GetAccessPolicyResponse"), "{xml}");
+        assert!(xml.contains("tds:PolicyFile"), "{xml}");
+        assert!(xml.contains("tt:Data"), "{xml}");
+        assert_well_formed(&xml);
+    }
+
+    #[tokio::test]
+    async fn access_policy_roundtrip() {
+        use base64::Engine as _;
+
+        let state: AccessPolicyState = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let svc = Arc::new(handlers().with_access_policy(state));
+        let handler = DeviceHandler(svc);
+        let ri = info();
+
+        let blob = b"<policy>allow admin</policy>".as_slice();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(blob);
+        let set_body = format!(
+            "<SetAccessPolicy xmlns=\"http://www.onvif.org/ver10/device/wsdl\">\
+             <PolicyFile><Data>{b64}</Data></PolicyFile></SetAccessPolicy>"
+        );
+        let resp = handler.handle(&set_body, &ri).await.unwrap();
+        assert!(resp.contains("tds:SetAccessPolicyResponse"), "{resp}");
+
+        let get = handler
+            .handle(
+                "<GetAccessPolicy xmlns=\"http://www.onvif.org/ver10/device/wsdl\"/>",
+                &ri,
+            )
+            .await
+            .unwrap();
+        assert!(get.contains(&format!("<tt:Data>{b64}</tt:Data>")), "{get}");
+    }
+
+    #[tokio::test]
+    async fn set_access_policy_invalid_base64_refused() {
+        let state: AccessPolicyState = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let handler = DeviceHandler(Arc::new(handlers().with_access_policy(state)));
+        let body = "<SetAccessPolicy><PolicyFile><Data>!!not-base64!!</Data></PolicyFile></SetAccessPolicy>";
+        let err = handler.handle(body, &info()).await.unwrap_err();
+        assert!(err.to_string().contains("base64"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn set_access_policy_without_state_refused() {
+        let handler = DeviceHandler(Arc::new(handlers()));
+        let body = "<SetAccessPolicy><PolicyFile><Data>AAAA</Data></PolicyFile></SetAccessPolicy>";
+        let err = handler.handle(body, &info()).await.unwrap_err();
+        assert!(err.to_string().contains("not configured"), "{err}");
+    }
+
+    // ------------------------------------------------------------------
+    // Builder seam
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn with_ip_filter_exposes_the_same_state() {
+        let state = filter_state(IpFilter::disabled());
+        let h = handlers().with_ip_filter(state.clone());
+        let exposed = h.ip_filter_state().expect("state must be exposed");
+        assert!(Arc::ptr_eq(&exposed, &state));
+        assert!(handlers().ip_filter_state().is_none());
+    }
+
+    #[test]
+    fn with_access_policy_exposes_the_same_state() {
+        let state: AccessPolicyState = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let h = handlers().with_access_policy(state.clone());
+        let exposed = h.access_policy_state().expect("state must be exposed");
+        assert!(Arc::ptr_eq(&exposed, &state));
+        assert!(handlers().access_policy_state().is_none());
     }
 }
