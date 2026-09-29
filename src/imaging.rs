@@ -59,6 +59,11 @@ pub trait ImagingParams: Send + Sync {
     fn get_param(&self, name: &str) -> Result<f64, ImagingParamError>;
     /// Set a parameter by ONVIF name to a normalized `[0.0, 1.0]` value.
     fn set_param(&self, name: &str, value: f64) -> Result<(), ImagingParamError>;
+    /// Handle a focus Move command (issue #52). Default: acknowledge
+    /// without acting — hosts with a focus motor override this.
+    fn focus_move(&self, _cmd: FocusMoveCmd) -> Result<(), ImagingParamError> {
+        Ok(())
+    }
     /// Exposure mode reported by GetImagingSettings (`"AUTO"` or
     /// `"MANUAL"`). Default: `"AUTO"` (not backed by host state).
     fn exposure_mode(&self) -> String {
@@ -71,6 +76,23 @@ pub trait ImagingParams: Send + Sync {
     }
 }
 
+/// One focus movement parsed from a Move request (issue #52).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FocusMoveCmd {
+    pub kind: FocusMoveKind,
+    /// Absolute target position ([0,1]) or relative distance.
+    pub position: f64,
+    pub speed: f64,
+}
+
+/// The focus movement flavor of a Move request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusMoveKind {
+    Absolute,
+    Relative,
+    Continuous,
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -81,6 +103,7 @@ pub trait ImagingParams: Send + Sync {
 pub fn register_imaging_actions(server: &mut OnvifServer, pm: Arc<dyn ImagingParams>) {
     let pm2 = pm.clone();
     let pm3 = pm.clone();
+    let pm4 = pm.clone();
 
     server.register_handler(
         "GetImagingSettings",
@@ -91,6 +114,30 @@ pub fn register_imaging_actions(server: &mut OnvifServer, pm: Arc<dyn ImagingPar
         Box::new(SetImagingSettingsHandler { pm: pm2 }),
     );
     server.register_handler("GetOptions", Box::new(GetOptionsHandler { pm: pm3 }));
+    server.register_handler("Move", Box::new(MoveHandler { pm: pm4 }));
+    server.register_handler("GetMoveOptions", Box::new(GetMoveOptionsHandler));
+
+    // Action names shared with the PTZ family: take over the slot and
+    // route by request shape — imaging requests carry VideoSourceToken
+    // (or a timg: prefix); anything else falls back to the previously
+    // registered handler (issue #52).
+    for (action, kind) in [
+        ("GetStatus", SharedImagingAction::GetStatus),
+        ("Stop", SharedImagingAction::Stop),
+        (
+            "GetServiceCapabilities",
+            SharedImagingAction::GetServiceCapabilities,
+        ),
+    ] {
+        let previous = server.take_handler(action);
+        server.register_handler(
+            action,
+            Box::new(SharedActionRouter {
+                imaging_kind: kind,
+                previous,
+            }),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -848,5 +895,394 @@ mod tests {
             buf.clear();
         }
         assert!(xml.contains("GetOptionsResponse"));
+    }
+
+    // --------------------------------------------------------------
+    // Issue #52: Move / Stop / GetMoveOptions / GetStatus /
+    // GetServiceCapabilities (+ shared-action routing)
+    // --------------------------------------------------------------
+
+    /// Records focus-move commands for assertion (issue #52 tests).
+    #[derive(Default)]
+    struct RecordingParams {
+        last_focus_move: std::sync::Mutex<Option<FocusMoveCmd>>,
+    }
+
+    impl ImagingParams for RecordingParams {
+        fn get_param(&self, _name: &str) -> Result<f64, ImagingParamError> {
+            Ok(0.5)
+        }
+        fn set_param(&self, _name: &str, _value: f64) -> Result<(), ImagingParamError> {
+            Ok(())
+        }
+        fn focus_move(&self, cmd: FocusMoveCmd) -> Result<(), ImagingParamError> {
+            *self.last_focus_move.lock().unwrap() = Some(cmd);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_move_parses_focus_command_and_acks() {
+        let recorder = Arc::new(RecordingParams::default());
+        let handler = MoveHandler {
+            pm: Arc::clone(&recorder) as Arc<dyn ImagingParams>,
+        };
+        let body = r#"<Move xmlns="http://www.onvif.org/ver20/imaging/wsdl">
+            <VideoSourceToken>src0</VideoSourceToken>
+            <Focus>
+                <AbsoluteFocus>
+                    <Position>0.8</Position>
+                    <Speed>0.5</Speed>
+                </AbsoluteFocus>
+            </Focus>
+        </Move>"#;
+        let resp = handler.handle(body, &test_info()).await.unwrap();
+        assert!(resp.contains("MoveResponse"), "{resp}");
+        let recorded = *recorder.last_focus_move.lock().unwrap();
+        assert_eq!(
+            recorded,
+            Some(FocusMoveCmd {
+                kind: FocusMoveKind::Absolute,
+                position: 0.8,
+                speed: 0.5,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_acks_focus_stop() {
+        let handler = ImagingStopHandler;
+        let resp = handler
+            .handle(
+                r#"<Stop><VideoSourceToken>src0</VideoSourceToken></Stop>"#,
+                &test_info(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.contains("StopResponse"), "{resp}");
+    }
+
+    #[test]
+    fn test_get_move_options_ranges() {
+        let xml = build_get_move_options();
+        assert!(xml.contains("MoveOptions"), "{xml}");
+        assert!(xml.contains("AbsoluteFocusOptions"));
+        assert!(xml.contains("RelativeFocusOptions"));
+        assert!(xml.contains("ContinuousFocusOptions"));
+        assert!(xml.contains("<tt:Min>0</tt:Min>"));
+        assert!(xml.contains("<tt:Max>1</tt:Max>"));
+    }
+
+    #[test]
+    fn test_get_status_shape() {
+        let xml = build_imaging_status();
+        assert!(xml.contains("ImagingStatus"), "{xml}");
+        assert!(xml.contains("FocusStatus"));
+        assert!(xml.contains("<tt:Position>0</tt:Position>"));
+        assert!(xml.contains("<tt:MoveStatus>IDLE</tt:MoveStatus>"));
+        assert!(xml.contains("<tt:Error>NoError</tt:Error>"));
+    }
+
+    #[test]
+    fn test_imaging_service_capabilities_all_off() {
+        let xml = build_imaging_service_capabilities();
+        assert!(xml.contains("GetServiceCapabilitiesResponse"), "{xml}");
+        assert!(xml.contains(r#"ImageStabilization="false""#));
+        assert!(xml.contains(r#"Presets="false""#));
+        assert!(xml.contains(r#"AdaptablePreset="false""#));
+    }
+
+    // -- shared-action routing ------------------------------------------
+
+    #[tokio::test]
+    async fn test_shared_get_status_routes_imaging_vs_fallback() {
+        let pm = Arc::new(RecordingParams::default());
+        let _pm = pm;
+        let router = SharedActionRouter {
+            imaging_kind: SharedImagingAction::GetStatus,
+            previous: Some(Box::new(crate::ptz::PtzHandler(Arc::new(
+                crate::ptz_state::PtzState::new(),
+            )))),
+        };
+
+        // Imaging shape: VideoSourceToken → imaging status.
+        let imaging = router
+            .handle(
+                r#"<GetStatus><VideoSourceToken>src0</VideoSourceToken></GetStatus>"#,
+                &test_info(),
+            )
+            .await
+            .unwrap();
+        assert!(imaging.contains("ImagingStatus"), "{imaging}");
+
+        // PTZ shape: ProfileToken → the previous (PTZ) handler.
+        let ptz = router
+            .handle(
+                r#"<GetStatus><ProfileToken>main</ProfileToken></GetStatus>"#,
+                &test_info(),
+            )
+            .await
+            .unwrap();
+        assert!(ptz.contains("PTZStatus"), "{ptz}");
+    }
+
+    #[tokio::test]
+    async fn test_shared_get_status_without_fallback_rejects_ptz_shape() {
+        let router = SharedActionRouter {
+            imaging_kind: SharedImagingAction::GetStatus,
+            previous: None,
+        };
+        let result = router
+            .handle(
+                r#"<GetStatus><ProfileToken>main</ProfileToken></GetStatus>"#,
+                &test_info(),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    fn test_info() -> RequestInfo {
+        RequestInfo {
+            client_ip: "10.0.0.1".to_string(),
+            server_ip: "192.168.1.100".to_string(),
+            auth_result: crate::types::AuthResult {
+                username: "admin".into(),
+                authenticated: true,
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Move / Stop / GetMoveOptions / GetStatus / GetServiceCapabilities (#52)
+// ---------------------------------------------------------------------------
+
+/// Handler for the imaging Move action (focus control).
+pub struct MoveHandler {
+    pm: Arc<dyn ImagingParams>,
+}
+
+/// Parse one focus command out of a Move body: the first of
+/// AbsoluteFocus/RelativeFocus/ContinuousFocus wins.
+fn parse_focus_move(body: &str) -> Option<FocusMoveCmd> {
+    let (kind, tag) = if body.contains("AbsoluteFocus") {
+        (FocusMoveKind::Absolute, "AbsoluteFocus")
+    } else if body.contains("RelativeFocus") {
+        (FocusMoveKind::Relative, "RelativeFocus")
+    } else if body.contains("ContinuousFocus") {
+        (FocusMoveKind::Continuous, "ContinuousFocus")
+    } else {
+        return None;
+    };
+    // The child element names are unique per kind (Position belongs to
+    // AbsoluteFocus, Distance to RelativeFocus), so a whole-body scan
+    // cannot pick up sibling values.
+    let _ = tag;
+    let position = parse_float_text(body, "Position").unwrap_or(0.0);
+    let speed = parse_float_text(body, "Speed").unwrap_or(0.0);
+    Some(FocusMoveCmd {
+        kind,
+        position,
+        speed,
+    })
+}
+
+/// Extract the float text of `<tag>value</tag>` near the start of `s`.
+fn parse_float_text(s: &str, tag: &str) -> Option<f64> {
+    let open = format!("<{tag}>");
+    let start = s.find(&open)? + open.len();
+    let rest = &s[start..];
+    let end = rest.find('<')?;
+    rest[..end].trim().parse::<f64>().ok()
+}
+
+#[async_trait]
+impl OnvifActionHandler for MoveHandler {
+    async fn handle(&self, body: &str, _info: &RequestInfo) -> Result<String, OnvifError> {
+        if let Some(cmd) = parse_focus_move(body) {
+            self.pm
+                .focus_move(cmd)
+                .map_err(|e| OnvifError::Internal(format!("focus move: {e}")))?;
+        }
+        let body_xml = empty_imaging_response("Move");
+        Ok(serialize_soap_response(&body_xml))
+    }
+}
+
+/// Handler for the imaging Stop action — ver20 imaging defines exactly
+/// one Stop (focus movement); hosts with a motor stop it in `focus_move`
+/// terms, so this is the protocol acknowledgment.
+pub struct ImagingStopHandler;
+
+#[async_trait]
+impl OnvifActionHandler for ImagingStopHandler {
+    async fn handle(&self, _body: &str, _info: &RequestInfo) -> Result<String, OnvifError> {
+        Ok(serialize_soap_response(&empty_imaging_response("Stop")))
+    }
+}
+
+/// Handler for GetMoveOptions — the focus ranges a control UI renders.
+pub struct GetMoveOptionsHandler;
+
+#[async_trait]
+impl OnvifActionHandler for GetMoveOptionsHandler {
+    async fn handle(&self, _body: &str, _info: &RequestInfo) -> Result<String, OnvifError> {
+        Ok(serialize_soap_response(&build_get_move_options()))
+    }
+}
+
+fn empty_imaging_response(action: &str) -> String {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let name = format!("timg:{action}Response");
+    let mut root = BytesStart::new(&name);
+    root.push_attribute(("xmlns:timg", IMAGING_SERVICE));
+    w.write_event(Event::Empty(root)).unwrap_or_default();
+    String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+/// Build `<timg:GetMoveOptionsResponse>` — position/speed ranges in
+/// [0,1] (the normalized parameter space of the [`ImagingParams`] seam).
+fn build_get_move_options() -> String {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("timg:GetMoveOptionsResponse");
+    root.push_attribute(("xmlns:timg", IMAGING_SERVICE));
+    root.push_attribute(("xmlns:tt", SCHEMAS));
+    w.write_event(Event::Start(root)).unwrap_or_default();
+
+    w.write_event(Event::Start(BytesStart::new("timg:MoveOptions")))
+        .unwrap_or_default();
+
+    open_close_imaging(&mut w, "tt:AbsoluteFocusOptions", |w| {
+        range_attr_block(w, "tt:Position", 0.0, 1.0);
+        range_attr_block(w, "tt:Speed", 0.0, 1.0);
+    });
+    open_close_imaging(&mut w, "tt:RelativeFocusOptions", |w| {
+        range_attr_block(w, "tt:Distance", -1.0, 1.0);
+        range_attr_block(w, "tt:Speed", 0.0, 1.0);
+    });
+    open_close_imaging(&mut w, "tt:ContinuousFocusOptions", |w| {
+        range_attr_block(w, "tt:Speed", -1.0, 1.0);
+    });
+
+    w.write_event(Event::End(BytesEnd::new("timg:MoveOptions")))
+        .unwrap_or_default();
+    w.write_event(Event::End(BytesEnd::new("timg:GetMoveOptionsResponse")))
+        .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+fn open_close_imaging<F>(w: &mut Writer<Vec<u8>>, name: &str, f: F)
+where
+    F: FnOnce(&mut Writer<Vec<u8>>),
+{
+    w.write_event(Event::Start(BytesStart::new(name)))
+        .unwrap_or_default();
+    f(w);
+    w.write_event(Event::End(BytesEnd::new(name)))
+        .unwrap_or_default();
+}
+
+/// `<tt:X><tt:Min>..</tt:Min><tt:Max>..</tt:Max></tt:X>`
+fn range_attr_block(w: &mut Writer<Vec<u8>>, name: &str, min: f64, max: f64) {
+    open_close_imaging(w, name, |w| {
+        write_text(w, "tt:Min", &min.to_string());
+        write_text(w, "tt:Max", &max.to_string());
+    });
+}
+
+/// Build the `<timg:GetStatusResponse>` fragment — a stationary virtual
+/// focus (IDLE, centred, no error).
+fn build_imaging_status() -> String {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("timg:GetStatusResponse");
+    root.push_attribute(("xmlns:timg", IMAGING_SERVICE));
+    root.push_attribute(("xmlns:tt", SCHEMAS));
+    w.write_event(Event::Start(root)).unwrap_or_default();
+
+    w.write_event(Event::Start(BytesStart::new("timg:ImagingStatus")))
+        .unwrap_or_default();
+    open_close_imaging(&mut w, "tt:FocusStatus", |w| {
+        write_text(w, "tt:Position", "0");
+        write_text(w, "tt:MoveStatus", "IDLE");
+        write_text(w, "tt:Error", "NoError");
+    });
+    w.write_event(Event::End(BytesEnd::new("timg:ImagingStatus")))
+        .unwrap_or_default();
+    w.write_event(Event::End(BytesEnd::new("timg:GetStatusResponse")))
+        .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+/// Build the `<timg:GetServiceCapabilitiesResponse>` fragment — no
+/// image stabilization, no imaging presets (18.12 optional; not
+/// implemented, honestly advertised off).
+fn build_imaging_service_capabilities() -> String {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("timg:GetServiceCapabilitiesResponse");
+    root.push_attribute(("xmlns:timg", IMAGING_SERVICE));
+    w.write_event(Event::Start(root)).unwrap_or_default();
+
+    let mut caps = BytesStart::new("timg:Capabilities");
+    caps.push_attribute(("ImageStabilization", "false"));
+    caps.push_attribute(("Presets", "false"));
+    caps.push_attribute(("AdaptablePreset", "false"));
+    w.write_event(Event::Empty(caps)).unwrap_or_default();
+
+    w.write_event(Event::End(BytesEnd::new(
+        "timg:GetServiceCapabilitiesResponse",
+    )))
+    .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Shared-action routing (issue #52)
+// ---------------------------------------------------------------------------
+
+/// The imaging actions whose local names collide with the PTZ family in
+/// the shared action map.
+#[derive(Debug, Clone, Copy)]
+enum SharedImagingAction {
+    GetStatus,
+    Stop,
+    GetServiceCapabilities,
+}
+
+/// Routes a shared action name between the imaging family and whatever
+/// handler occupied the slot before imaging registered (typically the
+/// PTZ family). Imaging requests carry `VideoSourceToken` or a `timg:`
+/// prefix; everything else goes to the previous handler.
+struct SharedActionRouter {
+    imaging_kind: SharedImagingAction,
+    previous: Option<Box<dyn OnvifActionHandler>>,
+}
+
+fn looks_like_imaging_request(body: &str) -> bool {
+    body.contains("VideoSourceToken") || body.contains("timg:")
+}
+
+#[async_trait]
+impl OnvifActionHandler for SharedActionRouter {
+    async fn handle(&self, body: &str, info: &RequestInfo) -> Result<String, OnvifError> {
+        if looks_like_imaging_request(body) {
+            let fragment = match self.imaging_kind {
+                SharedImagingAction::GetStatus => build_imaging_status(),
+                SharedImagingAction::Stop => empty_imaging_response("Stop"),
+                SharedImagingAction::GetServiceCapabilities => build_imaging_service_capabilities(),
+            };
+            return Ok(serialize_soap_response(&fragment));
+        }
+        match &self.previous {
+            Some(prev) => prev.handle(body, info).await,
+            None => Err(OnvifError::ActionNotSupported(
+                "action registered for imaging only".into(),
+            )),
+        }
     }
 }

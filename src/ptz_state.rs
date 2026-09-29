@@ -95,6 +95,21 @@ pub struct PtzState {
     moving: std::sync::RwLock<bool>,
     presets: std::sync::RwLock<HashMap<String, Preset>>,
     mode: std::sync::RwLock<MoveMode>,
+    /// Home position for GotoHomePosition (`None` until SetHomePosition).
+    home: std::sync::RwLock<Option<Position>>,
+    /// Configuration set through SetConfiguration (`None` = the built-in
+    /// default; GetConfigurations reflects it once set).
+    config: std::sync::RwLock<Option<StoredConfig>>,
+}
+
+/// The part of a PTZ configuration a virtual PTZ can honestly store:
+/// the display name, the node binding, and the default movement speed
+/// (issue #51).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredConfig {
+    pub name: String,
+    pub node_token: String,
+    pub default_speed: Velocity,
 }
 
 impl PtzState {
@@ -106,6 +121,8 @@ impl PtzState {
             moving: std::sync::RwLock::new(false),
             presets: std::sync::RwLock::new(HashMap::new()),
             mode: std::sync::RwLock::new(MoveMode::Idle),
+            home: std::sync::RwLock::new(None),
+            config: std::sync::RwLock::new(None),
         }
     }
 
@@ -292,6 +309,36 @@ impl PtzState {
     }
 
     /// List all presets with full details.
+    /// Store the current position as the home position (SetHomePosition).
+    pub fn set_home_position(&self) {
+        let pos = *self.position.read().unwrap_or_else(poison);
+        *self.home.write().unwrap_or_else(poison) = Some(pos);
+    }
+
+    /// The stored home position, if SetHomePosition has been called.
+    #[must_use]
+    pub fn home_position(&self) -> Option<Position> {
+        *self.home.read().unwrap_or_else(poison)
+    }
+
+    /// Move to the stored home position (GotoHomePosition); without a
+    /// stored home this targets the centre (0, 0, full wide).
+    pub fn goto_home_position(&self) {
+        let target = self.home_position().unwrap_or_default();
+        self.absolute_move(target);
+    }
+
+    /// Store a configuration set through SetConfiguration.
+    pub fn set_config(&self, cfg: StoredConfig) {
+        *self.config.write().unwrap_or_else(poison) = Some(cfg);
+    }
+
+    /// The stored configuration, if SetConfiguration has been called.
+    #[must_use]
+    pub fn stored_config(&self) -> Option<StoredConfig> {
+        self.config.read().unwrap_or_else(poison).clone()
+    }
+
     pub fn list_presets(&self) -> Vec<Preset> {
         presets_read(&self.presets).values().cloned().collect()
     }

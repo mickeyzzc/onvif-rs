@@ -61,10 +61,22 @@ impl OnvifActionHandler for PtzHandler {
             build_goto_preset(body, state)?
         } else if body.contains("RemovePreset") {
             build_remove_preset(body, state)?
+        } else if body.contains("GetConfigurationOptions") {
+            build_get_configuration_options()
+        } else if body.contains("SetConfiguration") {
+            build_set_configuration(body, state)
+        } else if body.contains("GotoHomePosition") {
+            build_goto_home(state)
+        } else if body.contains("SetHomePosition") {
+            build_set_home(state)
+        } else if body.contains("SendAuxiliaryCommand") {
+            build_send_auxiliary(body)
+        } else if body.contains("GetServiceCapabilities") {
+            build_ptz_service_capabilities()
         } else if body.contains("GetNodes") {
             build_get_nodes()
         } else if body.contains("GetConfigurations") {
-            build_get_configurations()
+            build_get_configurations_for(state)
         } else {
             return Err(OnvifError::ActionNotSupported("unknown ptz action".into()));
         };
@@ -300,8 +312,35 @@ fn build_get_nodes() -> String {
     String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
-/// Build `<tptz:GetConfigurationsResponse>` — returns a single default config.
-fn build_get_configurations() -> String {
+/// The configuration fields GetConfigurations writes — either the
+/// built-in default or the values stored by SetConfiguration.
+struct ConfigWire {
+    name: String,
+    node_token: String,
+    speed: Velocity,
+}
+
+/// Build `<tptz:GetConfigurationsResponse>` — one configuration: the
+/// built-in default, or the values stored by SetConfiguration (issue
+/// #51; with nothing stored the historical bytes are unchanged).
+fn build_get_configurations_for(state: &PtzState) -> String {
+    let cfg = state.stored_config().map_or(
+        ConfigWire {
+            name: "Default PTZ Configuration".to_string(),
+            node_token: "PTZNode_01".to_string(),
+            speed: Velocity {
+                x: 1.0,
+                y: 1.0,
+                zoom: 1.0,
+            },
+        },
+        |stored| ConfigWire {
+            name: stored.name,
+            node_token: stored.node_token,
+            speed: stored.default_speed,
+        },
+    );
+
     let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
 
     let mut root = BytesStart::new("tptz:GetConfigurationsResponse");
@@ -311,20 +350,166 @@ fn build_get_configurations() -> String {
 
     w.write_event(Event::Start(BytesStart::new("tptz:PTZConfiguration")))
         .unwrap_or_default();
-    write_text(&mut w, "tt:Name", "Default PTZ Configuration");
+    write_text(&mut w, "tt:Name", &cfg.name);
     write_text(&mut w, "tt:UseCount", "1");
-    write_text(&mut w, "tt:NodeToken", "PTZNode_01");
+    write_text(&mut w, "tt:NodeToken", &cfg.node_token);
     // DefaultPTZSpeed
     w.write_event(Event::Start(BytesStart::new("tt:DefaultPTZSpeed")))
         .unwrap_or_default();
-    write_pan_tilt(&mut w, 1.0, 1.0, PAN_TILT_SPEED_SPACE);
-    write_zoom(&mut w, 1.0, ZOOM_SPEED_SPACE);
+    write_pan_tilt(&mut w, cfg.speed.x, cfg.speed.y, PAN_TILT_SPEED_SPACE);
+    write_zoom(&mut w, cfg.speed.zoom, ZOOM_SPEED_SPACE);
     w.write_event(Event::End(BytesEnd::new("tt:DefaultPTZSpeed")))
         .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new("tptz:PTZConfiguration")))
         .unwrap_or_default();
     w.write_event(Event::End(BytesEnd::new("tptz:GetConfigurationsResponse")))
         .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+/// Build `<tptz:GetConfigurationOptionsResponse>` — the coordinate
+/// spaces and timeout a PTZ control UI needs (issue #51). The spaces
+/// mirror GetNodes' SupportedPTZSpaces.
+fn build_get_configuration_options() -> String {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("tptz:GetConfigurationOptionsResponse");
+    root.push_attribute(("xmlns:tptz", PTZ_SERVICE));
+    root.push_attribute(("xmlns:tt", SCHEMAS));
+    w.write_event(Event::Start(root)).unwrap_or_default();
+
+    w.write_event(Event::Start(BytesStart::new(
+        "tptz:PTZConfigurationOptions",
+    )))
+    .unwrap_or_default();
+
+    w.write_event(Event::Start(BytesStart::new("tt:Spaces")))
+        .unwrap_or_default();
+    write_pan_tilt_space(
+        &mut w,
+        "tt:AbsolutePanTiltPositionSpace",
+        PAN_TILT_POSITION_SPACE,
+        -1.0,
+        1.0,
+        -1.0,
+        1.0,
+    );
+    write_zoom_space(
+        &mut w,
+        "tt:AbsoluteZoomPositionSpace",
+        ZOOM_POSITION_SPACE,
+        0.0,
+        1.0,
+    );
+    write_pan_tilt_space(
+        &mut w,
+        "tt:RelativePanTiltTranslationSpace",
+        PAN_TILT_TRANSLATION_SPACE,
+        -1.0,
+        1.0,
+        -1.0,
+        1.0,
+    );
+    write_zoom_space(
+        &mut w,
+        "tt:RelativeZoomTranslationSpace",
+        ZOOM_TRANSLATION_SPACE,
+        -1.0,
+        1.0,
+    );
+    write_pan_tilt_space(
+        &mut w,
+        "tt:ContinuousPanTiltVelocitySpace",
+        PAN_TILT_SPEED_SPACE,
+        -1.0,
+        1.0,
+        -1.0,
+        1.0,
+    );
+    write_zoom_space(
+        &mut w,
+        "tt:ContinuousZoomVelocitySpace",
+        ZOOM_SPEED_SPACE,
+        -1.0,
+        1.0,
+    );
+    w.write_event(Event::End(BytesEnd::new("tt:Spaces")))
+        .unwrap_or_default();
+
+    write_text(&mut w, "tptz:PTZTimeout", "PT5S");
+    w.write_event(Event::End(BytesEnd::new("tptz:PTZConfigurationOptions")))
+        .unwrap_or_default();
+    w.write_event(Event::End(BytesEnd::new(
+        "tptz:GetConfigurationOptionsResponse",
+    )))
+    .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+/// SetConfiguration: store the name / node / default speed a virtual PTZ
+/// can honor (issue #51) and ack.
+fn build_set_configuration(body: &str, state: &PtzState) -> String {
+    // parse_velocity grabs the first PanTilt/Zoom pair — inside
+    // DefaultPTZSpeed for this action's shape.
+    let speed = parse_velocity(body);
+    state.set_config(crate::ptz_state::StoredConfig {
+        name: parse_text_content(body, "Name").unwrap_or_else(|| "PTZ Configuration".into()),
+        node_token: parse_text_content(body, "NodeToken").unwrap_or_else(|| "PTZNode_01".into()),
+        default_speed: speed,
+    });
+    empty_response("SetConfiguration")
+}
+
+/// GotoHomePosition: aim at the stored home (centre when none set).
+fn build_goto_home(state: &PtzState) -> String {
+    state.goto_home_position();
+    empty_response("GotoHomePosition")
+}
+
+/// SetHomePosition: remember the current position as home.
+fn build_set_home(state: &PtzState) -> String {
+    state.set_home_position();
+    empty_response("SetHomePosition")
+}
+
+/// SendAuxiliaryCommand: acknowledge and echo the command data as the
+/// device's reply (wipers / heaters / IR lamps; a virtual PTZ performs
+/// no physical action).
+fn build_send_auxiliary(body: &str) -> String {
+    let data = parse_text_content(body, "AuxiliaryData").unwrap_or_default();
+
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut root = BytesStart::new("tptz:AuxiliaryCommandResponse");
+    root.push_attribute(("xmlns:tptz", PTZ_SERVICE));
+    root.push_attribute(("xmlns:tt", SCHEMAS));
+    w.write_event(Event::Start(root)).unwrap_or_default();
+    write_text(&mut w, "tptz:AuxiliaryData", &data);
+    w.write_event(Event::End(BytesEnd::new("tptz:AuxiliaryCommandResponse")))
+        .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+/// GetPTZServiceCapabilities (issue #51).
+fn build_ptz_service_capabilities() -> String {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("tptz:GetServiceCapabilitiesResponse");
+    root.push_attribute(("xmlns:tptz", PTZ_SERVICE));
+    w.write_event(Event::Start(root)).unwrap_or_default();
+
+    let mut caps = BytesStart::new("tptz:Capabilities");
+    caps.push_attribute(("EFlip", "false"));
+    caps.push_attribute(("Reverse", "false"));
+    caps.push_attribute(("GetCompatibleConfigurations", "true"));
+    w.write_event(Event::Empty(caps)).unwrap_or_default();
+
+    w.write_event(Event::End(BytesEnd::new(
+        "tptz:GetServiceCapabilitiesResponse",
+    )))
+    .unwrap_or_default();
 
     String::from_utf8(w.into_inner()).unwrap_or_default()
 }
@@ -819,5 +1004,176 @@ mod tests {
         let presets = state.list_presets();
         assert_eq!(presets.len(), 1);
         assert_eq!(presets[0].name, "gate", "PresetName must be honored");
+    }
+
+    // --------------------------------------------------------------
+    // Issue #51: GetConfigurationOptions / SetConfiguration /
+    // GotoHomePosition / SetHomePosition / SendAuxiliaryCommand /
+    // GetPTZServiceCapabilities
+    // --------------------------------------------------------------
+
+    #[test]
+    fn test_get_configuration_options_lists_all_six_spaces() {
+        let xml = build_get_configuration_options();
+        for space in [
+            "AbsolutePanTiltPositionSpace",
+            "AbsoluteZoomPositionSpace",
+            "RelativePanTiltTranslationSpace",
+            "RelativeZoomTranslationSpace",
+            "ContinuousPanTiltVelocitySpace",
+            "ContinuousZoomVelocitySpace",
+        ] {
+            assert!(xml.contains(space), "missing {space}: {xml}");
+        }
+        assert!(xml.contains("PTZConfigurationOptions"));
+        assert!(xml.contains("<tptz:PTZTimeout>PT5S</tptz:PTZTimeout>"));
+        // Well-formed.
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("XML parse error: {e}"),
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_configuration_stores_and_get_configurations_reflects() {
+        let state = test_state();
+        let body = r#"<SetConfiguration xmlns="http://www.onvif.org/ver20/ptz/wsdl">
+            <PTZConfiguration token="ptz-conf-1">
+                <Name>Custom PTZ</Name>
+                <NodeToken>PTZNode_01</NodeToken>
+                <DefaultPTZSpeed>
+                    <PanTilt x="0.5" y="0.25"/>
+                    <Zoom x="0.75"/>
+                </DefaultPTZSpeed>
+            </PTZConfiguration>
+            <ForcePersistence>true</ForcePersistence>
+        </SetConfiguration>"#;
+
+        let resp = PtzHandler(Arc::clone(&state))
+            .handle(body, &test_info())
+            .await
+            .unwrap();
+        assert!(resp.contains("SetConfigurationResponse"));
+
+        let stored = state.stored_config().expect("config must be stored");
+        assert_eq!(stored.name, "Custom PTZ");
+        assert_eq!(stored.node_token, "PTZNode_01");
+        assert!((stored.default_speed.x - 0.5).abs() < f64::EPSILON);
+        assert!((stored.default_speed.zoom - 0.75).abs() < f64::EPSILON);
+
+        // GetConfigurations reflects the stored configuration.
+        let listed = PtzHandler(Arc::clone(&state))
+            .handle("<GetConfigurations/>", &test_info())
+            .await
+            .unwrap();
+        assert!(
+            listed.contains("Custom PTZ"),
+            "stored name visible: {listed}"
+        );
+        assert!(
+            listed.contains(r#"<tptz:x>0.5</tptz:x>"#) || listed.contains("0.5"),
+            "stored default speed visible: {listed}"
+        );
+    }
+
+    #[test]
+    fn test_get_configurations_default_bytes_without_set() {
+        // Byte stability: with no SetConfiguration, the historical
+        // default response is unchanged.
+        let xml = build_get_configurations_for(&PtzState::new());
+        assert!(xml.contains("Default PTZ Configuration"));
+        assert!(!xml.contains("Custom"));
+    }
+
+    #[tokio::test]
+    async fn test_home_position_roundtrip() {
+        let state = test_state();
+        state.absolute_move(Position {
+            x: 0.8,
+            y: -0.4,
+            zoom: 0.6,
+        });
+        // absolute_move eases toward the target; let it settle first.
+        for _ in 0..25 {
+            state.tick(50);
+        }
+
+        let resp = PtzHandler(Arc::clone(&state))
+            .handle("<SetHomePosition/>", &test_info())
+            .await
+            .unwrap();
+        assert!(resp.contains("SetHomePositionResponse"));
+        assert_eq!(
+            state.home_position(),
+            Some(Position {
+                x: 0.8,
+                y: -0.4,
+                zoom: 0.6
+            })
+        );
+
+        // Move away, then GotoHome returns to the stored position.
+        state.absolute_move(Position::default());
+        let resp = PtzHandler(Arc::clone(&state))
+            .handle(
+                r#"<GotoHomePosition><Speed><PanTilt x="0.5" y="0.5"/></Speed></GotoHomePosition>"#,
+                &test_info(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.contains("GotoHomePositionResponse"));
+        for _ in 0..25 {
+            state.tick(50);
+        }
+        let pos = state.get_position();
+        assert!((pos.x - 0.8).abs() < 0.01, "pan back home: {pos:?}");
+        assert!((pos.zoom - 0.6).abs() < 0.01, "zoom back home: {pos:?}");
+    }
+
+    #[tokio::test]
+    async fn test_send_auxiliary_command_echoes_data() {
+        let state = test_state();
+        let resp = PtzHandler(Arc::clone(&state))
+            .handle(
+                "<SendAuxiliaryCommand><ProfileToken>main</ProfileToken><AuxiliaryData>wiper:on</AuxiliaryData></SendAuxiliaryCommand>",
+                &test_info(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.contains("AuxiliaryCommandResponse"));
+        assert!(
+            resp.contains("wiper:on"),
+            "device reply data echoed: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_ptz_service_capabilities() {
+        let state = test_state();
+        let resp = PtzHandler(Arc::clone(&state))
+            .handle("<GetServiceCapabilities/>", &test_info())
+            .await
+            .unwrap();
+        assert!(resp.contains("GetServiceCapabilitiesResponse"));
+        assert!(resp.contains(r#"EFlip="false""#));
+        assert!(resp.contains(r#"GetCompatibleConfigurations="true""#));
+    }
+
+    #[tokio::test]
+    async fn test_new_ptz_actions_dispatch() {
+        let state = test_state();
+        let handler = PtzHandler(state);
+        for (body, marker) in [
+            ("<GetConfigurationOptions><PTZConfigurationToken>c</PTZConfigurationToken></GetConfigurationOptions>", "GetConfigurationOptionsResponse"),
+        ] {
+            let resp = handler.handle(body, &test_info()).await.unwrap();
+            assert!(resp.contains(marker), "{marker} missing: {resp}");
+        }
     }
 }

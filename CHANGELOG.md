@@ -11,6 +11,18 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(ptz)` **PTZ completion** (issue #51): GetConfigurationOptions
+  (six coordinate spaces + PTZTimeout), SetConfiguration (stored and
+  reflected by GetConfigurations; default bytes unchanged),
+  GotoHomePosition/SetHomePosition on the state machine,
+  SendAuxiliaryCommand (ack + data echo), GetPTZServiceCapabilities.
+  Preset tours stay out (spec-optional; recorded in the issue).
+- `feat(imaging)` **Imaging completion** (issue #52): Move (focus via the
+  new `ImagingParams::focus_move` seam), Stop, GetMoveOptions,
+  GetStatus, GetServiceCapabilities; shared action names route by
+  request shape (imaging carries VideoSourceToken / a `timg:` prefix)
+  with the previously registered handler as fallback.
+
 - `feat(device)` **per-service advertisement flags** (issue #47):
   `DeviceServiceHandlers` gained `with_media_support` /
   `with_ptz_support` / `with_imaging_support` (default `true`); GetServices
