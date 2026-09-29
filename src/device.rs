@@ -71,6 +71,37 @@ pub trait DeviceHooks: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Holds device-level configuration needed by all device service handlers.
+/// One scope in the mutable store (issue #65): the WSDL `tt:Scope` pair
+/// — the item text plus whether the client may remove it (`Configurable`
+/// scopes come from AddScopes/SetScopes; the built-ins report `Fixed`).
+#[derive(Debug, Clone)]
+struct ScopeEntry {
+    item: String,
+    configurable: bool,
+}
+
+impl ScopeEntry {
+    fn fixed(item: &str) -> Self {
+        Self {
+            item: item.to_string(),
+            configurable: false,
+        }
+    }
+    fn configurable(item: &str) -> Self {
+        Self {
+            item: item.to_string(),
+            configurable: true,
+        }
+    }
+    fn scope_def(&self) -> &'static str {
+        if self.configurable {
+            "Configurable"
+        } else {
+            "Fixed"
+        }
+    }
+}
+
 pub struct DeviceServiceHandlers {
     device_config: DeviceConfig,
     onvif_port: u16,
@@ -108,9 +139,10 @@ pub struct DeviceServiceHandlers {
     /// hook is a no-op.
     host: Option<Arc<dyn DeviceHooks>>,
     /// Mutable scope directory (AddScopes/RemoveScopes/SetScopes; issue
-    /// #49). Initialized with the three historical GetScopes items so the
-    /// pre-write wire bytes are unchanged.
-    scopes: RwLock<Vec<String>>,
+    /// #49). Initialized with the three historical GetScopes items
+    /// (`Fixed`); client-written entries report `Configurable` (issue
+    /// #65: GetScopes answers the WSDL tt:Scope form).
+    scopes: RwLock<Vec<ScopeEntry>>,
     /// Hostname set via SetHostname; `None` = report the startup-detected
     /// `device_ip` as the name (issue #49).
     hostname: RwLock<Option<String>>,
@@ -137,12 +169,15 @@ impl DeviceServiceHandlers {
             .validate()
             .map_err(OnvifError::InvalidConfig)?;
         let scopes = vec![
-            "onvif://www.onvif.org/type/video_encoder".to_string(),
-            format!("onvif://www.onvif.org/name/{}", device_config.name),
-            format!(
+            ScopeEntry::fixed("onvif://www.onvif.org/type/video_encoder"),
+            ScopeEntry::fixed(&format!(
+                "onvif://www.onvif.org/name/{}",
+                device_config.name
+            )),
+            ScopeEntry::fixed(&format!(
                 "onvif://www.onvif.org/hardware/{}",
                 device_config.hardware_id
-            ),
+            )),
         ];
         Ok(Self {
             device_config,
@@ -515,9 +550,6 @@ impl DeviceServiceHandlers {
         root.push_attribute(("xmlns:tt", SCHEMAS));
         w.write_event(Event::Start(root)).unwrap_or_default();
 
-        w.write_event(Event::Start(BytesStart::new("tds:Services")))
-            .unwrap_or_default();
-
         for (ns, path) in services {
             w.write_event(Event::Start(BytesStart::new("tds:Service")))
                 .unwrap_or_default();
@@ -531,8 +563,6 @@ impl DeviceServiceHandlers {
                 .unwrap_or_default();
         }
 
-        w.write_event(Event::End(BytesEnd::new("tds:Services")))
-            .unwrap_or_default();
         w.write_event(Event::End(BytesEnd::new("tds:GetServicesResponse")))
             .unwrap_or_default();
         String::from_utf8(w.into_inner()).unwrap_or_default()
@@ -552,9 +582,15 @@ impl DeviceServiceHandlers {
         w.write_event(Event::Start(root)).unwrap_or_default();
 
         // `write_text` escapes via BytesText::new — client-added scope
-        // texts cannot break the XML.
-        for item in store_read(&self.scopes).iter() {
-            write_text(&mut w, "tt:ScopeItem", item);
+        // texts cannot break the XML. WSDL form (issue #65): each scope
+        // is a tds:Scopes element of type tt:Scope (ScopeDef + ScopeItem).
+        for entry in store_read(&self.scopes).iter() {
+            w.write_event(Event::Start(BytesStart::new("tds:Scopes")))
+                .unwrap_or_default();
+            write_text(&mut w, "tt:ScopeDef", entry.scope_def());
+            write_text(&mut w, "tt:ScopeItem", &entry.item);
+            w.write_event(Event::End(BytesEnd::new("tds:Scopes")))
+                .unwrap_or_default();
         }
 
         w.write_event(Event::End(BytesEnd::new("tds:GetScopesResponse")))
@@ -626,7 +662,7 @@ impl DeviceServiceHandlers {
                 "SetScopes requires at least one scope".into(),
             ));
         }
-        *store_write(&self.scopes) = items;
+        *store_write(&self.scopes) = items.iter().map(|i| ScopeEntry::configurable(i)).collect();
         Ok(build_empty_response("tds:SetScopesResponse"))
     }
 
@@ -642,8 +678,8 @@ impl DeviceServiceHandlers {
         }
         let mut store = store_write(&self.scopes);
         for item in items {
-            if !store.contains(&item) {
-                store.push(item);
+            if !store.iter().any(|e| e.item == item) {
+                store.push(ScopeEntry::configurable(&item));
             }
         }
         Ok(build_empty_response("tds:AddScopesResponse"))
@@ -663,7 +699,7 @@ impl DeviceServiceHandlers {
                 "RemoveScopes requires at least one ScopeItem".into(),
             ));
         }
-        store_write(&self.scopes).retain(|s| !items.contains(s));
+        store_write(&self.scopes).retain(|e| !items.contains(&e.item));
         Ok(build_empty_response("tds:RemoveScopesResponse"))
     }
 
@@ -2149,6 +2185,23 @@ mod tests {
         assert!(xml.contains("tt:Imaging"));
     }
 
+    /// WSDL (devicemgmt.xsd): GetServicesResponse carries `Service`
+    /// elements as DIRECT children — no wrapper. Strict clients (issue
+    /// #64: the onvif-go client) parse zero services from a wrapped list.
+    #[test]
+    fn test_get_services_direct_children_no_wrapper() {
+        let h = test_handlers();
+        let xml = h.build_services("10.0.0.5");
+        assert!(
+            !xml.contains("tds:Services"),
+            "no tds:Services wrapper may exist: {xml}"
+        );
+        // Direct children: every Service element sits exactly one indent
+        // level under the response root.
+        assert!(xml.contains(">\n  <tds:Service>"));
+        assert!(xml.contains("\n  </tds:Service>\n</tds:GetServicesResponse>"));
+    }
+
     #[test]
     fn test_get_services_contains_service_entries() {
         let h = test_handlers();
@@ -2168,6 +2221,21 @@ mod tests {
         assert!(xml.contains(MEDIA_SERVICE));
         assert!(xml.contains(PTZ_SERVICE));
         assert!(xml.contains(IMAGING_SERVICE));
+    }
+
+    /// WSDL: each scope is a `tds:Scopes` element of type tt:Scope with
+    /// `tt:ScopeDef` (Fixed|Configurable) + `tt:ScopeItem` children (issue
+    /// #65) — bare tt:ScopeItem strings parse as zero scopes on strict
+    /// clients.
+    #[test]
+    fn test_get_scopes_wsd_scope_shape() {
+        let h = test_handlers();
+        let xml = h.build_scopes();
+        assert!(xml.contains("<tds:Scopes>"));
+        assert!(xml.contains("<tt:ScopeDef>Fixed</tt:ScopeDef>"));
+        assert!(!xml.contains("<tt:ScopeDef>Configurable</tt:ScopeDef>"));
+        assert_eq!(xml.matches("<tds:Scopes>").count(), 3);
+        assert_eq!(xml.matches("<tt:ScopeDef>Fixed</tt:ScopeDef>").count(), 3);
     }
 
     #[test]
@@ -2636,7 +2704,7 @@ mod tests {
     /// The initial GetScopes bytes are a contract (NVR raw matching) —
     /// pin them exactly, not just by containment.
     #[test]
-    fn test_get_scopes_bytes_stable_before_any_write() {
+    fn test_get_scopes_wsd_golden_before_any_write() {
         let h = test_handlers();
         assert_eq!(
             h.build_scopes(),
@@ -2644,9 +2712,18 @@ mod tests {
                 "<tds:GetScopesResponse ",
                 "xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" ",
                 "xmlns:tt=\"http://www.onvif.org/ver10/schema\">\n",
-                "  <tt:ScopeItem>onvif://www.onvif.org/type/video_encoder</tt:ScopeItem>\n",
-                "  <tt:ScopeItem>onvif://www.onvif.org/name/Test Cam</tt:ScopeItem>\n",
-                "  <tt:ScopeItem>onvif://www.onvif.org/hardware/HW-1</tt:ScopeItem>\n",
+                "  <tds:Scopes>\n",
+                "    <tt:ScopeDef>Fixed</tt:ScopeDef>\n",
+                "    <tt:ScopeItem>onvif://www.onvif.org/type/video_encoder</tt:ScopeItem>\n",
+                "  </tds:Scopes>\n",
+                "  <tds:Scopes>\n",
+                "    <tt:ScopeDef>Fixed</tt:ScopeDef>\n",
+                "    <tt:ScopeItem>onvif://www.onvif.org/name/Test Cam</tt:ScopeItem>\n",
+                "  </tds:Scopes>\n",
+                "  <tds:Scopes>\n",
+                "    <tt:ScopeDef>Fixed</tt:ScopeDef>\n",
+                "    <tt:ScopeItem>onvif://www.onvif.org/hardware/HW-1</tt:ScopeItem>\n",
+                "  </tds:Scopes>\n",
                 "</tds:GetScopesResponse>"
             )
         );
@@ -2740,6 +2817,14 @@ mod tests {
             4,
             "built-ins + one new (duplicate not re-added): {get}"
         );
+        // WSDL tt:Scope (issue #65): client-added scopes are Configurable,
+        // the built-ins stay Fixed.
+        assert_eq!(
+            get.matches("<tt:ScopeDef>Configurable</tt:ScopeDef>")
+                .count(),
+            1
+        );
+        assert_eq!(get.matches("<tt:ScopeDef>Fixed</tt:ScopeDef>").count(), 3);
     }
 
     #[tokio::test]
