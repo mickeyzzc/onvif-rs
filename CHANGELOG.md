@@ -11,6 +11,24 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(events)` **basic notification interface** (issue #50):
+  `wsnt:Subscribe` on `/onvif/events_service` registers a push
+  subscription (ConsumerReference `http://` URL only — https consumers
+  are refused; the library carries no TLS client); one sender task per
+  subscription POSTs each matching `publish_event` to the consumer as a
+  `wsnt:Notify` SOAP document (Topic + inner-message writers shared with
+  PullMessages responses; SubscriptionReference named, ProducerReference
+  omitted). Delivery is fire-and-forget (5 s connect/IO timeouts); after
+  three consecutive failures the subscription is auto-unsubscribed
+  (spec-permissible housekeeping). Renew/Unsubscribe operate on the
+  returned SubscriptionReference; PullMessages on a push subscription is
+  a Sender fault; basic subscriptions share the 10-subscription cap.
+  `SetSynchronizationPoint` acks empty on the events endpoint
+  (route-based dispatch — no collision with the media action).
+  GetEventInstances deliberately stays unimplemented (17.06+ feature,
+  zero demand; unknown-action fault answers it). Existing pull-point
+  response bytes are unchanged — GetEventProperties already advertises
+  both mandatory TopicExpressionDialects, so no dialect line was added.
 - `feat(ptz)` **PTZ completion** (issue #51): GetConfigurationOptions
   (six coordinate spaces + PTZTimeout), SetConfiguration (stored and
   reflected by GetConfigurations; default bytes unchanged),
