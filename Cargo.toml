@@ -15,6 +15,7 @@ base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 log = "0.4"
+md-5 = "0.10"
 quick-xml = "0.41"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +28,9 @@ rustls-pemfile = { version = "2", optional = true }
 [dev-dependencies]
 proptest = "1.4"
 base64 = "0.22"
+# Same crate as [dependencies] (listed here so tests/ can build a Digest
+# client); not an additional dependency.
+md-5 = "0.10"
 anyhow = "1"
 tempfile = "3"
 toml = "0.8"

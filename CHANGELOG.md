@@ -11,6 +11,21 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(security)` **Security completion** (issue #54): HTTP Digest
+  transport auth (RFC 7616 subset — MD5, `qop="auth"`, opt-in
+  `OnvifConfig::http_digest`; coexists with WS-Security, a present
+  UsernameToken takes precedence; bounded nonce store with 300 s expiry
+  and per-nonce nc advancement — captured `Authorization` headers are
+  not replayable); IP address filter (Get/Set/Add/RemoveIPAddressFilter
+  over a shared `IpFilterState`, plus per-connection 403 enforcement
+  via `OnvifServer::with_ip_filter`; IPv4 prefix entries, Allow/Deny
+  modes, unparseable/IPv6 peers fail open with a warning); and
+  Get/SetAccessPolicy (opaque Base64 `PolicyFile` blob via
+  `with_access_policy` — interpretation is host-side). 802.1X is
+  deliberately out of scope (documented: an EAP supplicant is host
+  infrastructure, not SOAP protocol). New dependency: `md-5`
+  (RustCrypto). Historical responses stay byte-stable — the challenge
+  header only appears when `http_digest` is enabled.
 - `feat(events)` **basic notification interface** (issue #50):
   `wsnt:Subscribe` on `/onvif/events_service` registers a push
   subscription (ConsumerReference `http://` URL only — https consumers
