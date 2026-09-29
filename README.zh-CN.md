@@ -13,7 +13,7 @@
 
 ## 功能
 
-- **SOAP HTTP 服务端** —— 按动作注册处理器，覆盖 Device、Media、Imaging 与（虚拟）PTZ 服务；Device 服务含 **SystemReboot** 应答（仅协议层答复，是否真的重启由宿主决定）；GetServices/GetCapabilities 只枚举宿主真正提供的服务 —— Media/PTZ/Imaging 由 `with_media_support`/`with_ptz_support`/`with_imaging_support` 开关控制（默认开），Events 由 `with_events_support` 控制
+- **SOAP HTTP 服务端** —— 按动作注册处理器，覆盖 Device、Media、Imaging 与（虚拟）PTZ 服务；Device 服务补齐 devicemgmt 读写全表面：**SetSystemDateAndTime**、可变 **scopes**（Add/Remove/Set —— 写前 GetScopes 保持历史字节不变）、**Get/SetHostname**、**Get/SetDiscoveryMode**、**用户目录**（Get/Create/Delete/SetUser —— 仅目录，认证真源仍是 WS-Security 层；经 `with_users` 播种）、诚实的网络静态应答（GetDNS/GetNTP/GetNetworkInterfaces/GetNetworkDefaultGateway/GetNetworkProtocols）、GetServiceCapabilities/GetWsdlUrl/GetEndpointReference、**GetSystemLog/GetSystemSupportInformation**，以及"仅协议答复"家族（**SystemReboot**、SetSystemFactoryDefault、UpgradeSystemFirmware、StartSystemRestore）——真实副作用归宿主，经 `DeviceHooks` 接缝（`with_hooks`）注入；Set* 网络族、证书与 802.1X 刻意未实现；GetServices/GetCapabilities 只枚举宿主真正提供的服务 —— Media/PTZ/Imaging 由 `with_media_support`/`with_ptz_support`/`with_imaging_support` 开关控制（默认开），Events 由 `with_events_support` 控制
 - **WS-Discovery 应答器** —— UDP 组播 239.255.255.250:3702 Probe/ProbeMatches，按请求回显 XAddr；scopes 与 EndpointReference UUID 均可由宿主配置；**启动即发 Hello、停机即发 Bye** 主动通告（与 ProbeMatches 同族信封）
 - **WS-Security** —— UsernameToken 校验，PasswordText 与 PasswordDigest（SHA-1），常数时间比较，空密码 **fail-closed** 处理
 - **TLS 监听**（可选 `tls` feature，默认关闭）—— 配置证书/私钥 PEM 路径后以 HTTPS 提供 ONVIF 服务（Profile T 传输基线）；两者必须同时设置（both-or-neither）
@@ -22,6 +22,8 @@
 - **成像对焦控制** —— Move（经 `ImagingParams::focus_move` 接缝的绝对/相对/连续对焦）、Stop、GetMoveOptions、GetStatus、GetServiceCapabilities；共享动作名（`GetStatus`/`Stop`/`GetServiceCapabilities`）按请求形状路由，未命中回落先前注册的 handler（PTZ）
 - **命名空间无关的请求解析**（客户端可用任意 XML 前缀）与显式前缀序列化（`tds:`/`trt:`/`timg:`/`tt:`），所有插值均做 XML 转义
 - **多媒体 Profile**（主码流 + 子码流）—— `OnvifMediaConfig::extra_profiles` 在 GetProfiles 中追加 `MediaProfileConfig` 条目（如 640×360 省流子码流），恒排在主 Profile 之后；GetStreamUri 按请求的 `ProfileToken` 匹配并返回对应 RTSP 路径，未知/缺失 token 一律回落主流——单 Profile 客户端行为不变
+- **Media 服务补全** —— `register_media_actions(server, Arc<RwLock<OnvifMediaConfig>>, keyframe_hook)` 一次注册整个服务：视频编码器配置族（GetVideoEncoderConfigurations / GetVideoEncoderConfiguration / GetVideoEncoderConfigurationOptions / **SetVideoEncoderConfiguration**——写入落入共享存储，GetProfiles 等全部读取方立即可见）、GetGuaranteedNumberOfVideoEncoderInstances、**SetSynchronizationPoint**（触发宿主的关键帧/IDR 钩子）、Media GetServiceCapabilities（SnapshotUri 跟随 `snapshot_port`）、以及音频/OSD 空集应答（无音频硬件、无 OSD 引擎——诚实的空答复而非Fault）；组播流媒体刻意不实现并在能力中如实关闭（`RTPMulticast="false"`）
+- **Media2 服务（ver20/media，`tr2`）** —— Profile T 入口路径（对齐 onvif-go 的 `SupportMedia2`）：`server.enable_media2(store, keyframe_hook)` 在自有监听器上以**独立分发**路由 `/onvif/media2_service`（与 Media1 同名动作在共享动作表里冲突，由 URL 决定哪个面应答）；GetProfiles（可选 Token 过滤，`tr2:Profiles`/`tr2:Configurations` 外层 + `tt:` 配置体）、GetStreamUri/GetSnapshotUri（纯 `tr2:Uri` 形态）、视频编码器配置族与选项（tr2 元素形态、子元素式分辨率表）、GetVideoEncoderInstances、**SetSynchronizationPoint**（同一关键帧钩子）、Media2 GetServiceCapabilities（RTSPStreaming=true）；读写同一个 `SharedMediaConfig` 存储——经任一面 SetVideoEncoderConfiguration 两侧立即可见；Set* 动作走 WS-Security、读操作开放；GetServices 通告由 `with_media2_support` 控制（默认关，旧字节不变；GetCapabilities 传统枚举无 Media2 槽位，不涉及）
 - **虚拟 PTZ** —— 纯状态机（`ptz_state`）支撑无云台设备的 PTZ 服务：转动、预置位、**Home 位**（Set/Goto）、配置存储（**SetConfiguration** 由 GetConfigurations 反射）、**GetConfigurationOptions**（坐标空间 + 超时）、**SendAuxiliaryCommand**（应答 + 回显）、**GetPTZServiceCapabilities**
 - **优雅停机** —— SOAP 服务端与 discovery 应答器均支持
 

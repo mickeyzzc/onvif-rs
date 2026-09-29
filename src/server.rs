@@ -14,6 +14,7 @@ use crate::auth::verify_username_token;
 use crate::events::{
     EventsService, ServiceEndpoint, EVENTS_SERVICE_PATH, SUBSCRIPTION_PATH_PREFIX,
 };
+use crate::media2::{Media2Service, MEDIA2_SERVICE_PATH};
 use crate::types::{serialize_soap_fault, AuthResult, OnvifError, RequestInfo, UsernameToken};
 
 // ---------------------------------------------------------------------------
@@ -73,6 +74,15 @@ pub struct OnvifConfig {
     /// change. Grab the host publish seam via
     /// [`OnvifServer::enable_events`] before starting.
     pub support_events: bool,
+    /// Serve the ONVIF Media2 service (ver20/media, parity with
+    /// onvif-go's `SupportMedia2`): routes `{base}/media2_service` with
+    /// its own action dispatch — the Media2 action local names collide
+    /// with Media1 in the shared action map, so the URL decides which
+    /// face answers. Default `false` — no route, no advertisement
+    /// change. Setting the flag alone does not mount anything (the
+    /// service needs a media store): call [`OnvifServer::enable_media2`]
+    /// before starting, which sets this flag.
+    pub support_media2: bool,
 }
 
 impl Default for OnvifConfig {
@@ -90,6 +100,7 @@ impl Default for OnvifConfig {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             support_events: false,
+            support_media2: false,
         }
     }
 }
@@ -182,6 +193,8 @@ pub struct OnvifServer {
     /// The events pull-point service, when enabled (`support_events` /
     /// [`OnvifServer::enable_events`]).
     events: Option<Arc<EventsService>>,
+    /// The Media2 service, when enabled ([`OnvifServer::enable_media2`]).
+    media2: Option<Arc<Media2Service>>,
 }
 
 impl OnvifServer {
@@ -193,6 +206,7 @@ impl OnvifServer {
             anonymous_actions: HashSet::new(),
             metrics: Arc::new(crate::metrics::NoopMetrics),
             events: None,
+            media2: None,
         }
     }
 
@@ -250,6 +264,35 @@ impl OnvifServer {
     #[must_use]
     pub fn events_service(&self) -> Option<Arc<EventsService>> {
         self.events.clone()
+    }
+
+    /// Enable the Media2 service (ver20/media, parity with onvif-go's
+    /// `SupportMedia2`, issue #53): the server routes
+    /// `/onvif/media2_service` (GetProfiles / GetStreamUri /
+    /// GetSnapshotUri / the video-encoder configuration family /
+    /// GetVideoEncoderInstances / SetSynchronizationPoint /
+    /// GetServiceCapabilities) on the listener it already owns, with its
+    /// own dispatch — the action local names collide with Media1 in the
+    /// shared action map, so the URL decides which face answers.
+    ///
+    /// The service reads (and SetVideoEncoderConfiguration writes) the
+    /// SAME [`SharedMediaConfig`](crate::media::SharedMediaConfig) store
+    /// as the Media1 face — pass the store `register_media_actions`
+    /// uses so both faces observe one configuration. `keyframe_hook`
+    /// fires on every SetSynchronizationPoint request (the host's
+    /// "force an IDR frame now" seam); `None` acknowledges only. Call
+    /// before `start`/`start_on`, and pair with
+    /// [`crate::device::DeviceServiceHandlers::with_media2_support`] so
+    /// the GetServices advertisement matches the served route.
+    pub fn enable_media2(
+        &mut self,
+        config: crate::media::SharedMediaConfig,
+        keyframe_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Arc<Media2Service> {
+        self.config.support_media2 = true;
+        self.media2
+            .get_or_insert_with(|| Arc::new(Media2Service::new(config, keyframe_hook)))
+            .clone()
     }
 
     /// Validate the configuration. Fail-closed: an empty password without an
@@ -330,6 +373,16 @@ impl OnvifServer {
             self.events = Some(Arc::new(EventsService::new()));
         }
         let events = self.events;
+        // Media2 cannot be created from the flag alone (it needs a media
+        // store); a flag without enable_media2 gets a visible warning
+        // instead of a silently-absent route.
+        if cfg.support_media2 && self.media2.is_none() {
+            log::warn!(
+                "onvif: support_media2 is set but enable_media2 was never called — \
+                 no media2 store, the /onvif/media2_service route stays unmounted"
+            );
+        }
+        let media2 = self.media2;
         // The listener's actual port (an ephemeral one with `start_on`) —
         // the events service builds SubscriptionReference addresses on it.
         let server_port = listener.local_addr().map(|a| a.port()).unwrap_or(cfg.port);
@@ -358,6 +411,7 @@ impl OnvifServer {
                 let auth_state = Arc::clone(&auth_state);
                 let metrics = Arc::clone(&metrics);
                 let events = events.clone();
+                let media2 = media2.clone();
                 #[cfg(feature = "tls")]
                 let tls_acceptor = tls_acceptor.clone();
 
@@ -387,6 +441,7 @@ impl OnvifServer {
                                     &auth_state,
                                     &metrics,
                                     &events,
+                                    &media2,
                                 )
                                 .await;
                                 // Orderly TLS close (close_notify) — dropping
@@ -412,6 +467,7 @@ impl OnvifServer {
                                 &auth_state,
                                 &metrics,
                                 &events,
+                                &media2,
                             )
                             .await
                         }
@@ -428,6 +484,7 @@ impl OnvifServer {
                         &auth_state,
                         &metrics,
                         &events,
+                        &media2,
                     )
                     .await;
 
@@ -583,6 +640,7 @@ async fn handle_connection<S>(
     auth_state: &Arc<AuthState>,
     metrics: &Arc<dyn crate::metrics::MetricsHooks>,
     events: &Option<Arc<EventsService>>,
+    media2: &Option<Arc<Media2Service>>,
 ) -> Result<(), OnvifError>
 where
     // Plain TcpStream without the `tls` feature, a TLS session with it.
@@ -677,10 +735,11 @@ where
     }
 
     // --- Dispatch ---
-    // Events pull-point paths are routed by URL (parity with onvif-go's
-    // mux: the service endpoint + the per-subscription subtree); every
-    // other path keeps the historical action-map dispatch unchanged.
-    let route = classify_request_route(&path, events.as_ref());
+    // Events pull-point paths and the Media2 endpoint are routed by URL
+    // (parity with onvif-go's mux: the service endpoints + the
+    // per-subscription subtree); every other path keeps the historical
+    // action-map dispatch unchanged.
+    let route = classify_request_route(&path, events.as_ref(), media2.as_ref());
     if route == RequestRoute::NotFound {
         // No route serves this path — parity with onvif-go's ServeMux 404
         // for the events subtree when the service is disabled.
@@ -695,7 +754,13 @@ where
         // Create/Go) protected, reads open — for the events actions that
         // means CreatePullPointSubscription needs credentials, the rest
         // stay open.
-        _ => EventsService::action_requires_auth(&parsed.action),
+        RequestRoute::EventsService | RequestRoute::EventsSubscription => {
+            EventsService::action_requires_auth(&parsed.action)
+        }
+        // The same write-prefix policy on the Media2 endpoint
+        // (SetSynchronizationPoint / SetVideoEncoderConfiguration).
+        RequestRoute::Media2Service => Media2Service::action_requires_auth(&parsed.action),
+        RequestRoute::NotFound => false, // unreachable: handled above
     };
 
     match route {
@@ -786,6 +851,38 @@ where
             };
             dispatch_handler(stream, metrics, &parsed.action, future).await?;
         }
+        RequestRoute::Media2Service => {
+            let media2 = match media2 {
+                Some(m) => Arc::clone(m),
+                // classify_request_route only returns the media2 route
+                // with the service enabled; defensive otherwise.
+                None => return Err(OnvifError::Internal("media2 service unavailable".into())),
+            };
+            if !Media2Service::is_service_action(&parsed.action) {
+                let fault = serialize_soap_fault(
+                    "soap:Sender",
+                    &format!("unsupported action: {}", parsed.action),
+                );
+                write_http_response(stream, 400, &fault).await?;
+                return Ok(());
+            }
+            if route_requires_auth && !auth_disabled && !auth_result.authenticated {
+                let fault = serialize_soap_fault(
+                    "soap:Sender",
+                    &format!("authentication required for action: {}", parsed.action),
+                );
+                write_http_response(stream, 401, &fault).await?;
+                return Ok(());
+            }
+            // Same panic containment as every other route (issue #15).
+            dispatch_handler(
+                stream,
+                metrics,
+                &parsed.action,
+                media2.handle_action(&parsed.action, &parsed.body_xml, server_ip),
+            )
+            .await?;
+        }
         RequestRoute::NotFound => unreachable!("handled above"),
     }
 
@@ -835,18 +932,25 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestRoute {
     /// Historical action-map dispatch — every path outside the events
-    /// subtree, byte-identical to the pre-events router.
+    /// subtree and the Media2 endpoint, byte-identical to the
+    /// pre-events router.
     Default,
     /// `/onvif/events_service` with the events service enabled.
     EventsService,
     /// Under `/onvif/events_service/sub/` with the events service enabled.
     EventsSubscription,
-    /// An events-service path with no route serving it (the service is
+    /// `/onvif/media2_service` with the Media2 service enabled.
+    Media2Service,
+    /// A service path with no route serving it (the owning service is
     /// disabled) — onvif-go's mux would 404.
     NotFound,
 }
 
-fn classify_request_route(path: &str, events: Option<&Arc<EventsService>>) -> RequestRoute {
+fn classify_request_route(
+    path: &str,
+    events: Option<&Arc<EventsService>>,
+    media2: Option<&Arc<Media2Service>>,
+) -> RequestRoute {
     if path == EVENTS_SERVICE_PATH {
         match events {
             Some(_) => RequestRoute::EventsService,
@@ -855,6 +959,11 @@ fn classify_request_route(path: &str, events: Option<&Arc<EventsService>>) -> Re
     } else if path.starts_with(SUBSCRIPTION_PATH_PREFIX) {
         match events {
             Some(_) => RequestRoute::EventsSubscription,
+            None => RequestRoute::NotFound,
+        }
+    } else if path == MEDIA2_SERVICE_PATH {
+        match media2 {
+            Some(_) => RequestRoute::Media2Service,
             None => RequestRoute::NotFound,
         }
     } else {
