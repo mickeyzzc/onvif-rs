@@ -9,7 +9,19 @@ Releases are capability packages: merges accumulate on `main` silently
 and ship with the next tag (merge ≠ release). Only urgent security fixes
 are released out of band.
 
+## [0.8.0] — 2026-09-29
+
+The service-completion capability package (issues #47–#54 + the
+cross-library interop fixes #64/#65): Device/Media/PTZ/Imaging/Events
+fuller surfaces, the Media2 (tr2) Profile-T entry path, WS-Subscribe
+push notifications, HTTP Digest + IP filter + AccessPolicy, and WSDL
+shape fixes for GetServices/GetScopes. Consumed same-day by the
+mibee-eye products (v0.5.0 train).
+
 ## [Unreleased]
+
+Nothing yet.
+
 
 - `fix(device)` **GetServices/GetScopes WSDL shape** (issues #64/#65,
   caught live by cross-library interop — the onvif-go client parses zero
