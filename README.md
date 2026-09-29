@@ -13,7 +13,7 @@ ONVIF **Device (server)** library for Rust — expose a camera or media source t
 
 ## Features
 
-- **SOAP HTTP server** with per-action handler registration — Device, Media, Imaging, and (virtual) PTZ services; the Device service answers **SystemReboot** (protocol-level answer only — hooking an actual reboot is the host's decision)
+- **SOAP HTTP server** with per-action handler registration — Device, Media, Imaging, and (virtual) PTZ services; the Device service answers **SystemReboot** (protocol-level answer only — hooking an actual reboot is the host's decision); GetServices/GetCapabilities enumerate exactly what the host serves — Media/PTZ/Imaging behind `with_media_support`/`with_ptz_support`/`with_imaging_support` flags (default on), Events behind `with_events_support`
 - **WS-Discovery responder** — UDP multicast 239.255.255.250:3702 Probe/ProbeMatches with per-request XAddr echo; scopes and EndpointReference UUID are host-configurable; announces itself with **Hello on start and Bye on stop** (same envelope family as ProbeMatches)
 - **WS-Security** — UsernameToken verification, PasswordText and PasswordDigest (SHA-1), constant-time comparison, **fail-closed** empty-password handling
 - **TLS listener** (optional `tls` cargo feature, off by default) — serve ONVIF over HTTPS (Profile T's transport baseline) by pointing `tls_cert_file`/`tls_key_file` at PEM files; both-or-neither, no silent plain-HTTP fallback
