@@ -13,7 +13,7 @@
 
 ## 功能
 
-- **SOAP HTTP 服务端** —— 按动作注册处理器，覆盖 Device、Media、Imaging 与（虚拟）PTZ 服务；Device 服务含 **SystemReboot** 应答（仅协议层答复，是否真的重启由宿主决定）；GetServices/GetCapabilities 只枚举宿主真正提供的服务 —— Media/PTZ/Imaging 由 `with_media_support`/`with_ptz_support`/`with_imaging_support` 开关控制（默认开），Events 由 `with_events_support` 控制
+- **SOAP HTTP 服务端** —— 按动作注册处理器，覆盖 Device、Media、Imaging 与（虚拟）PTZ 服务；Device 服务补齐 devicemgmt 读写全表面：**SetSystemDateAndTime**、可变 **scopes**（Add/Remove/Set —— 写前 GetScopes 保持历史字节不变）、**Get/SetHostname**、**Get/SetDiscoveryMode**、**用户目录**（Get/Create/Delete/SetUser —— 仅目录，认证真源仍是 WS-Security 层；经 `with_users` 播种）、诚实的网络静态应答（GetDNS/GetNTP/GetNetworkInterfaces/GetNetworkDefaultGateway/GetNetworkProtocols）、GetServiceCapabilities/GetWsdlUrl/GetEndpointReference、**GetSystemLog/GetSystemSupportInformation**，以及"仅协议答复"家族（**SystemReboot**、SetSystemFactoryDefault、UpgradeSystemFirmware、StartSystemRestore）——真实副作用归宿主，经 `DeviceHooks` 接缝（`with_hooks`）注入；Set* 网络族、证书与 802.1X 刻意未实现；GetServices/GetCapabilities 只枚举宿主真正提供的服务 —— Media/PTZ/Imaging 由 `with_media_support`/`with_ptz_support`/`with_imaging_support` 开关控制（默认开），Events 由 `with_events_support` 控制
 - **WS-Discovery 应答器** —— UDP 组播 239.255.255.250:3702 Probe/ProbeMatches，按请求回显 XAddr；scopes 与 EndpointReference UUID 均可由宿主配置；**启动即发 Hello、停机即发 Bye** 主动通告（与 ProbeMatches 同族信封）
 - **WS-Security** —— UsernameToken 校验，PasswordText 与 PasswordDigest（SHA-1），常数时间比较，空密码 **fail-closed** 处理
 - **TLS 监听**（可选 `tls` feature，默认关闭）—— 配置证书/私钥 PEM 路径后以 HTTPS 提供 ONVIF 服务（Profile T 传输基线）；两者必须同时设置（both-or-neither）

@@ -70,6 +70,7 @@ pub mod server;
 pub mod types;
 
 pub use config::DeviceConfig;
+pub use device::DeviceHooks;
 pub use discovery::DiscoveryServer;
 pub use events::{Event, EventsService, SimpleItem};
 pub use imaging::ImagingParams;
