@@ -1,16 +1,56 @@
-//! ONVIF Events service — pull-point subscriptions (WS-BaseNotification).
+//! ONVIF Events service — pull-point and basic-notification subscriptions
+//! (WS-BaseNotification).
 //!
-//! Mirrors onvif-go's `server/events.go` (the golden wire source): with the
-//! service enabled the SOAP server routes `{base}/events_service`
-//! (GetServiceCapabilities / GetEventProperties / CreatePullPointSubscription)
+//! Mirrors onvif-go's `server/events.go` (the golden wire source) for the
+//! pull-point half: with the service enabled the SOAP server routes
+//! `{base}/events_service` (GetServiceCapabilities / GetEventProperties /
+//! CreatePullPointSubscription / Subscribe / SetSynchronizationPoint)
 //! and the per-subscription `{base}/events_service/sub/<id>` subtree
 //! (PullMessages / Renew / Unsubscribe) to this module on the listener the
-//! server already owns.
+//! server already owns. The basic-notification half (wsnt:Subscribe + push
+//! Notify, issue #50) goes beyond the Go twin.
 //!
 //! Notifications use the canonical WS-BaseNotification + ONVIF double-layer
 //! shape: outer `wsnt:NotificationMessage` > `wsnt:Topic` +
 //! `wsnt:Message` > inner `tt:Message` with PropertyOperation/UtcTime
 //! attributes and Source/Key/Data `tt:SimpleItem` groups.
+//!
+//! ## Basic notification interface (wsnt:Subscribe)
+//!
+//! `Subscribe` registers a *push* subscription: the host
+//! [`EventsService::publish_event`] seam fans out exactly as for pull
+//! points (same per-subscription topic filter, same lossy bounded queue),
+//! and one dedicated sender task per subscription POSTs each queued
+//! notification as a `wsnt:Notify` SOAP document to the consumer's
+//! ConsumerReference address — Topic + inner message bytes come from the
+//! same writers the pull-point response uses, so push and pull payloads
+//! stay consistent. Delivery is best-effort fire-and-forget over a
+//! hand-rolled HTTP/1.1 POST (the library carries no HTTP-client
+//! dependency): `https://` consumers are unsupported and refused at
+//! Subscribe time; after three consecutive delivery failures the
+//! subscription is auto-unsubscribed (spec-permissible housekeeping).
+//! Renew and Unsubscribe operate on the returned SubscriptionReference
+//! like any pull point; PullMessages on a push subscription is a Sender
+//! fault (it is not a pull point).
+//!
+//! ## Decisions (issue #50)
+//!
+//! - **Pull-point cap**: [`DEFAULT_MAX_PULL_POINTS`] = 10 is shared between
+//!   pull and basic subscriptions — the spec allows a device-defined
+//!   limit, and 10 covers realistic NVR fan-out.
+//! - **GetEventInstances**: deliberately NOT implemented (ONVIF 17.06+,
+//!   zero demand) — the unknown-action fault answers it.
+//! - **SetSynchronizationPoint**: served on the events endpoint only
+//!   (dispatch is route-based, so the action name shared with the media
+//!   service cannot collide); ack-only, because host-injected events
+//!   carry no device-stored state to re-send.
+//! - **TopicExpressionDialect**: GetEventProperties already advertises
+//!   both mandatory dialects (Concrete + ConcreteSet), and both are
+//!   honored — no byte change was needed for dialect completeness.
+//! - **Capabilities bytes**: GetServiceCapabilities keeps its
+//!   pull-point-shaped advertisement (`WSPullPointSupport`) — adding a
+//!   `WSSubscriptionPolicySupport` attribute would change pinned response
+//!   bytes, which this crate treats as a contract.
 //!
 //! ## Host seam
 //!
@@ -25,6 +65,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event as XmlEvent};
 use quick_xml::{Reader, Writer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::namespaces::{EVENTS_SERVICE, SCHEMAS, WS_ADDRESSING, WS_NOTIFICATION, WS_TOPICS};
@@ -46,8 +87,19 @@ pub const MAX_TERMINATION: Duration = Duration::from_secs(24 * 60 * 60);
 /// pin connections.
 pub const MAX_PULL_WAIT: Duration = Duration::from_secs(60);
 /// Per-subscription notification queue bound; queues are lossy at the head
-/// (newest wins) like real device notification buffers.
+/// (newest wins) like real device notification buffers. The same bound
+/// backs pull points and basic-notification push queues.
 pub const MAX_EVENT_QUEUE: usize = 100;
+/// Consecutive Notify-delivery failures before a basic-notification
+/// subscription is auto-unsubscribed (spec-permissible housekeeping: a
+/// dead consumer must not pin queue and task forever).
+const MAX_PUSH_FAILURES: u32 = 3;
+/// Connect timeout for one Notify POST (fire-and-forget delivery must
+/// not pin the sender task on an unreachable consumer).
+const NOTIFY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Write/read timeout for one Notify POST (Connection: close exchange —
+/// consumers that never close read down to this bound).
+const NOTIFY_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// HTTP path of the events service endpoint on the SOAP server's listener
 /// (the crate's base path is `/onvif`, parity with onvif-go's BasePath).
@@ -287,7 +339,10 @@ struct QueuedMessage {
     data: Vec<SimpleItem>,
 }
 
-/// One live pull-point subscription.
+/// One live subscription. `consumer: None` → a classic pull point (the
+/// client PullMessages); `Some(address)` → a basic-notification (push)
+/// subscription whose Notify messages are POSTed to the consumer address
+/// by a dedicated sender task sharing this same queue.
 struct PullPoint {
     /// Termination instant — precise expiry comparisons (the Go twin keeps
     /// nanosecond `time.Time`; `termination_unix` below is only the
@@ -299,6 +354,99 @@ struct PullPoint {
     notify: Arc<Notify>,
     /// `None` → every topic is delivered.
     filter: Option<TopicFilter>,
+    /// The ConsumerReference address when this is a basic-notification
+    /// (push) subscription; `None` for a pull point.
+    consumer: Option<String>,
+}
+
+/// The push target of one basic-notification subscription, parsed off the
+/// ConsumerReference address — `http://` only (the library carries no TLS
+/// client dependency; https consumers are a documented non-goal).
+#[derive(Debug, Clone)]
+struct HttpTarget {
+    /// Host or IPv6 literal, brackets stripped.
+    host: String,
+    port: u16,
+    /// Request path, including any query string.
+    path: String,
+}
+
+impl HttpTarget {
+    /// Host as it appears in the Host header and URLs (bracketed IPv6).
+    fn host_header(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        }
+    }
+}
+
+impl std::fmt::Display for HttpTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "http://{}:{}{}",
+            self.host_header(),
+            self.port,
+            self.path
+        )
+    }
+}
+
+/// Parse a ConsumerReference address into an [`HttpTarget`]. Non-http
+/// schemes and https are Sender faults (no HTTP-client or TLS dependency
+/// is carried for Notify delivery).
+fn parse_http_url(url: &str) -> Result<HttpTarget, OnvifError> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        OnvifError::SenderFault(format!(
+            "Unsupported ConsumerReference address: got {url:?}, device supports \
+             http:// consumers only"
+        ))
+    })?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = split_host_port(authority)?;
+    if host.is_empty() {
+        return Err(OnvifError::SenderFault(format!(
+            "Invalid ConsumerReference address: no host in {url:?}"
+        )));
+    }
+    Ok(HttpTarget { host, port, path })
+}
+
+/// Split a URL authority (`host`, `host:port`, `[v6]`, `[v6]:port`) into
+/// the host (brackets stripped) and port (defaulting to 80).
+fn split_host_port(authority: &str) -> Result<(String, u16), OnvifError> {
+    let invalid = || {
+        OnvifError::SenderFault(format!(
+            "Invalid ConsumerReference address: cannot read host and port from {authority:?}"
+        ))
+    };
+    if let Some(rest) = authority.strip_prefix('[') {
+        // RFC 3986: IPv6 literals are bracketed.
+        let Some((host, tail)) = rest.split_once(']') else {
+            return Err(invalid());
+        };
+        let port = if tail.is_empty() {
+            80
+        } else {
+            tail.strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .ok_or_else(invalid)?
+        };
+        Ok((host.to_string(), port))
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => Ok((
+                host.to_string(),
+                port.parse::<u16>().map_err(|_| invalid())?,
+            )),
+            None => Ok((authority.to_string(), 80)),
+        }
+    }
 }
 
 /// Address book for building SubscriptionReference / ProducerReference
@@ -326,11 +474,12 @@ impl ServiceEndpoint {
     }
 }
 
-/// The events pull-point service: the subscription registry plus the host
-/// publish seam. Shared between the SOAP server (routing) and the host
-/// ([`EventsService::publish_event`]) via `Arc`.
+/// The events service: the subscription registry plus the host publish
+/// seam. Shared between the SOAP server (routing), the host
+/// ([`EventsService::publish_event`]), and the per-subscription push
+/// sender tasks via `Arc`.
 pub struct EventsService {
-    subs: Mutex<HashMap<String, PullPoint>>,
+    subs: Arc<Mutex<HashMap<String, PullPoint>>>,
 }
 
 impl Default for EventsService {
@@ -344,15 +493,17 @@ impl EventsService {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            subs: Mutex::new(HashMap::new()),
+            subs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Fan an event out to every live pull-point subscription (the host
-    /// seam, parity with onvif-go's `Server.PublishEvent`). With no
-    /// subscribers it is a safe no-op. Queues are lossy at the head: a slow
-    /// subscriber beyond [`MAX_EVENT_QUEUE`] pending messages loses the
-    /// oldest first.
+    /// Fan an event out to every live subscription, pull points and
+    /// basic-notification (push) subscriptions alike (the host seam,
+    /// parity with onvif-go's `Server.PublishEvent`). With no subscribers
+    /// it is a safe no-op. Queues are lossy at the head: a slow subscriber
+    /// beyond [`MAX_EVENT_QUEUE`] pending messages loses the oldest first.
+    /// Push delivery itself never blocks here — the sender tasks own the
+    /// network side.
     pub fn publish_event(&self, ev: Event) {
         let operation = if ev.property_operation.is_empty() {
             "Changed".to_string()
@@ -392,7 +543,11 @@ impl EventsService {
     pub(crate) fn is_service_action(action: &str) -> bool {
         matches!(
             action,
-            "GetServiceCapabilities" | "GetEventProperties" | "CreatePullPointSubscription"
+            "GetServiceCapabilities"
+                | "GetEventProperties"
+                | "CreatePullPointSubscription"
+                | "Subscribe"
+                | "SetSynchronizationPoint"
         )
     }
 
@@ -405,9 +560,11 @@ impl EventsService {
     /// Auth policy for events actions, mirroring onvif-go's
     /// `DefaultAuthPolicy` (write-style prefixes `Set`/`Remove`/`Create`/
     /// `Go` are protected, reads stay open):
-    /// `CreatePullPointSubscription` requires WS-Security credentials;
+    /// `CreatePullPointSubscription` and `SetSynchronizationPoint` (Set*
+    /// prefix) require WS-Security credentials;
     /// GetServiceCapabilities/GetEventProperties/PullMessages/Renew/
-    /// Unsubscribe stay open.
+    /// Unsubscribe/Subscribe stay open — Subscribe is deliberately open
+    /// for prefix-policy parity with the Go twin.
     #[must_use]
     pub(crate) fn action_requires_auth(action: &str) -> bool {
         ["Set", "Remove", "Create", "Go"]
@@ -431,6 +588,19 @@ impl EventsService {
                 .create_subscription(body, endpoint)
                 .await
                 .map(|fragment| serialize_soap_response(&fragment)),
+            // Basic notification interface (issue #50): a push
+            // subscription whose Notify messages the sender task POSTs to
+            // the consumer address.
+            "Subscribe" => self
+                .subscribe(body, endpoint)
+                .await
+                .map(|fragment| serialize_soap_response(&fragment)),
+            // Shared action name with the media service — route-based
+            // dispatch means the events endpoint answers it independently
+            // (no collision); ack-only (see the builder's doc).
+            "SetSynchronizationPoint" => Ok(serialize_soap_response(
+                &build_set_synchronization_point_response(),
+            )),
             _ => Err(OnvifError::ActionNotSupported(format!(
                 "unsupported action: {action}"
             ))),
@@ -506,6 +676,7 @@ impl EventsService {
                     queue: VecDeque::new(),
                     notify: Arc::new(Notify::new()),
                     filter,
+                    consumer: None,
                 },
             );
         }
@@ -515,6 +686,98 @@ impl EventsService {
             now,
             now + termination.as_secs(),
         ))
+    }
+
+    /// wsnt:Subscribe (basic notification interface, issue #50): register
+    /// a push subscription. The registry entry is the same shape a pull
+    /// point uses — same topic filter, same queue, same termination
+    /// semantics — plus the consumer address; a dedicated sender task
+    /// (see [`spawn_push_sender`]) drains the queue and POSTs each
+    /// notification to the consumer. Renew/Unsubscribe work on the
+    /// returned SubscriptionReference address; PullMessages does not.
+    /// SubscriptionPolicy is ignored when present; only `http://`
+    /// consumers are supported.
+    async fn subscribe(
+        &self,
+        body: &str,
+        endpoint: &ServiceEndpoint,
+    ) -> Result<String, OnvifError> {
+        let req = parse_subscribe_request(body)?;
+        let consumer = req
+            .consumer_address
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| {
+                OnvifError::SenderFault(
+                    "Invalid Subscribe: a ConsumerReference/Address is required".to_string(),
+                )
+            })?;
+        let target = parse_http_url(&consumer)?;
+        let filter = parse_topic_filter(req.topic_expression.as_ref())?;
+
+        // Same termination semantics as CreatePullPointSubscription: an
+        // absent or empty TerminationTime grants the default window;
+        // anything else must parse positive and is clamped to
+        // MAX_TERMINATION (no lower clamp).
+        let mut termination = DEFAULT_TERMINATION;
+        match req.termination_time.as_deref() {
+            None | Some("") => {}
+            Some(raw) => {
+                let parsed = parse_iso8601_duration(raw)
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| {
+                        OnvifError::SenderFault(format!(
+                            "Invalid TerminationTime: got {raw:?}, want a positive ISO 8601 \
+                             duration"
+                        ))
+                    })?;
+                termination = parsed.min(MAX_TERMINATION);
+            }
+        }
+
+        let id = random_subscription_id();
+        let now = unix_now();
+        let notify = Arc::new(Notify::new());
+        let term_instant = Instant::now() + termination;
+
+        {
+            let mut subs = lock_subs(&self.subs);
+            prune_expired(&mut subs);
+            if subs.len() >= DEFAULT_MAX_PULL_POINTS {
+                return Err(OnvifError::SenderFault(format!(
+                    "Too many active subscriptions: device supports at most \
+                     {DEFAULT_MAX_PULL_POINTS} concurrent subscriptions (pull points and basic \
+                     notification share the cap)"
+                )));
+            }
+            subs.insert(
+                id.clone(),
+                PullPoint {
+                    termination: term_instant,
+                    termination_unix: now + termination.as_secs(),
+                    queue: VecDeque::new(),
+                    notify: Arc::clone(&notify),
+                    filter,
+                    consumer: Some(consumer),
+                },
+            );
+        }
+
+        let address = endpoint.subscription_address(&id);
+        spawn_push_sender(
+            Arc::clone(&self.subs),
+            id,
+            address.clone(),
+            target,
+            term_instant,
+            notify,
+        );
+
+        Ok(serialize_soap_response(&build_subscribe_response(
+            &address,
+            now,
+            now + termination.as_secs(),
+        )))
     }
 
     /// PullMessages: long-poll the subscription addressed by `path`; answer
@@ -553,6 +816,13 @@ impl EventsService {
             let (notify, drained, termination) = {
                 let mut subs = lock_subs(&self.subs);
                 let pp = live_pull_point(&mut subs, path)?;
+                if pp.consumer.is_some() {
+                    return Err(OnvifError::SenderFault(format!(
+                        "PullMessages is a pull-point operation, and the subscription at {path} \
+                         is not a pull point (basic notification subscriptions serve Renew \
+                         and Unsubscribe only)"
+                    )));
+                }
                 let notify = Arc::clone(&pp.notify);
                 let count = limit.min(pp.queue.len());
                 let drained: Vec<QueuedNotification> = pp.queue.drain(..count).collect();
@@ -616,6 +886,131 @@ impl EventsService {
         }
         Ok(serialize_soap_response(&build_unsubscribe_response()))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Basic notification push delivery
+// ---------------------------------------------------------------------------
+
+/// One basic-notification sender task: wakes on the subscription's
+/// notifier, drains the shared queue, and POSTs each notification as a
+/// wsnt:Notify to the consumer address. Delivery is fire-and-forget — the
+/// publish path only queues; this task owns the network, so the host seam
+/// never blocks and the queue bounds memory (lossy at the head like every
+/// other subscription queue). The task exits when the subscription is
+/// unsubscribed or pruned elsewhere, at its termination deadline, or —
+/// spec-permissible housekeeping — after [`MAX_PUSH_FAILURES`]
+/// consecutive delivery failures, removing the subscription so a dead
+/// consumer cannot pin resources forever.
+fn spawn_push_sender(
+    subs: Arc<Mutex<HashMap<String, PullPoint>>>,
+    id: String,
+    subscription_address: String,
+    target: HttpTarget,
+    termination: Instant,
+    notify: Arc<Notify>,
+) {
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::from_std(termination);
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            // Register the wakeup BEFORE draining (see pull_messages).
+            let notified = notify.notified();
+            tokio::select! {
+                () = notified => {}
+                () = tokio::time::sleep_until(deadline) => break,
+            }
+
+            let drained: Vec<QueuedNotification> = {
+                let mut guard = lock_subs(&subs);
+                match guard.get_mut(&id) {
+                    // Unsubscribed or pruned elsewhere — nothing left to do.
+                    None => break,
+                    Some(pp) => pp.queue.drain(..).collect(),
+                }
+            };
+
+            for qn in drained {
+                let envelope = build_notify_envelope(&subscription_address, &qn);
+                if let Err(e) = post_notify(&target, &envelope).await {
+                    consecutive_failures += 1;
+                    log::warn!(
+                        "onvif events: Notify delivery to consumer {target} failed ({e}); \
+                         consecutive failures: {consecutive_failures}"
+                    );
+                    if consecutive_failures >= MAX_PUSH_FAILURES {
+                        lock_subs(&subs).remove(&id);
+                        log::warn!(
+                            "onvif events: auto-unsubscribed basic notification subscription \
+                             {id} after {MAX_PUSH_FAILURES} consecutive delivery failures"
+                        );
+                        return;
+                    }
+                } else {
+                    consecutive_failures = 0;
+                }
+            }
+        }
+    });
+}
+
+/// Fire-and-forget HTTP/1.1 POST of one Notify envelope
+/// (application/soap+xml) to the consumer — hand-rolled over `TcpStream`
+/// because the library carries no HTTP-client dependency. Redirects,
+/// keep-alive, and chunked responses are out of scope (Connection: close,
+/// single request per connection). The write half is shut down after
+/// sending so even a close-delimited consumer can answer. `Ok(())` means
+/// the consumer answered 2xx.
+async fn post_notify(target: &HttpTarget, envelope: &str) -> Result<(), String> {
+    let connect = tokio::net::TcpStream::connect((target.host.as_str(), target.port));
+    let mut stream = tokio::time::timeout(NOTIFY_CONNECT_TIMEOUT, connect)
+        .await
+        .map_err(|_| format!("connect timeout after {NOTIFY_CONNECT_TIMEOUT:?}"))?
+        .map_err(|e| format!("connect: {e}"))?;
+
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\n\
+         Content-Type: application/soap+xml; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{envelope}",
+        target.path,
+        target.host_header(),
+        target.port,
+        envelope.len()
+    );
+    tokio::time::timeout(NOTIFY_IO_TIMEOUT, stream.write_all(request.as_bytes()))
+        .await
+        .map_err(|_| "write timeout".to_string())?
+        .map_err(|e| format!("write: {e}"))?;
+    // Half-close the write side: the request is Content-Length delimited,
+    // so compliant servers already have it, and naive close-delimited
+    // consumers see request end without us dropping the response.
+    let _ = stream.shutdown().await;
+
+    let mut response = Vec::new();
+    tokio::time::timeout(NOTIFY_IO_TIMEOUT, stream.read_to_end(&mut response))
+        .await
+        .map_err(|_| "read timeout".to_string())?
+        .map_err(|e| format!("read: {e}"))?;
+
+    let status = http_status(&response)?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(format!("consumer answered HTTP {status}"))
+    }
+}
+
+/// The numeric status off a raw HTTP response, or an error when the
+/// consumer answered something that is not an HTTP status line.
+fn http_status(response: &[u8]) -> Result<u16, String> {
+    let head = std::str::from_utf8(response).map_err(|_| "non-UTF-8 response".to_string())?;
+    head.lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| "malformed HTTP status line".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -759,6 +1154,116 @@ fn parse_create_request(body: &str) -> Result<CreateRequest, OnvifError> {
                             st.in_initial_termination_time = false;
                             if let Some(itt) = result.initial_termination_time.as_mut() {
                                 *itt = text.clone().unwrap_or_default();
+                            }
+                        }
+                        _ => {}
+                    },
+                    Ok(XmlEvent::Eof) => break,
+                    Err(e) => return Err(OnvifError::InvalidXml(format!("XML parse error: {e}"))),
+                    _ => {}
+                }
+            }
+        }
+        buf.clear();
+    }
+    Ok(result)
+}
+
+/// Parsed wsnt:Subscribe body (basic notification interface).
+#[derive(Debug, Default)]
+struct SubscribeRequest {
+    /// ConsumerReference/Address — the URL Notify messages are POSTed to.
+    consumer_address: Option<String>,
+    /// TerminationTime (absent → the default window).
+    termination_time: Option<String>,
+    /// Filter/TopicExpression — the same shape CreatePullPointSubscription
+    /// carries, validated by the same `parse_topic_filter`.
+    topic_expression: Option<TopicExpressionRequest>,
+}
+
+/// Parse a wsnt:Subscribe body: ConsumerReference/Address, Filter/
+/// TopicExpression (same shape as the pull-point create), TerminationTime.
+/// SubscriptionPolicy content is deliberately ignored when present.
+fn parse_subscribe_request(body: &str) -> Result<SubscribeRequest, OnvifError> {
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut result = SubscribeRequest::default();
+    #[derive(Default)]
+    struct State {
+        in_filter: bool,
+        in_topic_expression: bool,
+        in_consumer: bool,
+        in_address: bool,
+        in_termination_time: bool,
+    }
+    let mut st = State::default();
+    let mut text_acc = crate::types::TextAccumulator::new();
+
+    loop {
+        let event = reader.read_event_into(&mut buf);
+        match event {
+            Ok(XmlEvent::Text(e)) => {
+                let _ = text_acc.push_text(&e);
+            }
+            Ok(XmlEvent::GeneralRef(e)) => {
+                let _ = text_acc.push_ref(&e);
+            }
+            other => {
+                let text = text_acc.flush();
+                match other {
+                    Ok(XmlEvent::Start(e)) => match local_name(e.name().as_ref()) {
+                        "Filter" => st.in_filter = true,
+                        "ConsumerReference" => st.in_consumer = true,
+                        "Address" if st.in_consumer => {
+                            st.in_address = true;
+                            result.consumer_address = Some(String::new());
+                        }
+                        "TopicExpression" if st.in_filter => {
+                            st.in_topic_expression = true;
+                            result.topic_expression = Some(TopicExpressionRequest {
+                                dialect: attribute_by_local_name(&e, "Dialect"),
+                                value: String::new(),
+                            });
+                        }
+                        "TerminationTime" => {
+                            st.in_termination_time = true;
+                            result.termination_time = Some(String::new());
+                        }
+                        _ => {}
+                    },
+                    Ok(XmlEvent::Empty(e)) => match local_name(e.name().as_ref()) {
+                        "TopicExpression" if st.in_filter => {
+                            result.topic_expression = Some(TopicExpressionRequest {
+                                dialect: attribute_by_local_name(&e, "Dialect"),
+                                value: String::new(),
+                            });
+                        }
+                        "TerminationTime" => {
+                            result.termination_time = Some(String::new());
+                        }
+                        _ => {}
+                    },
+                    Ok(XmlEvent::End(e)) => match local_name(e.name().as_ref()) {
+                        "Filter" => st.in_filter = false,
+                        "ConsumerReference" => st.in_consumer = false,
+                        "Address" if st.in_address => {
+                            st.in_address = false;
+                            if let Some(addr) = result.consumer_address.as_mut() {
+                                *addr = text.clone().unwrap_or_default();
+                            }
+                        }
+                        "TopicExpression" if st.in_topic_expression => {
+                            st.in_topic_expression = false;
+                            if let Some(expr) = result.topic_expression.as_mut() {
+                                expr.value = text.clone().unwrap_or_default();
+                            }
+                        }
+                        "TerminationTime" if st.in_termination_time => {
+                            st.in_termination_time = false;
+                            if let Some(tt) = result.termination_time.as_mut() {
+                                *tt = text.clone().unwrap_or_default();
                             }
                         }
                         _ => {}
@@ -1035,25 +1540,11 @@ fn build_pull_messages_response(
     for qn in drained {
         w.write_event(XmlEvent::Start(BytesStart::new("wsnt:NotificationMessage")))
             .unwrap_or_default();
-        write_text(&mut w, "wsnt:Topic", &qn.topic);
+        write_notification_topic(&mut w, qn);
         open_close(&mut w, "wsnt:ProducerReference", |w| {
             write_text(w, "wsa:Address", &endpoint.device_service_address());
         });
-        open_close(&mut w, "wsnt:Message", |w| {
-            let mut msg = BytesStart::new("tt:Message");
-            msg.push_attribute(("PropertyOperation", qn.message.property_operation.as_str()));
-            msg.push_attribute(("UtcTime", qn.message.utc_time.as_str()));
-            w.write_event(XmlEvent::Start(msg)).unwrap_or_default();
-
-            // Source/Key/Data groups are always present (possibly empty) —
-            // the twin's struct-marshal shape.
-            write_simple_items(w, "tt:Source", &qn.message.source);
-            write_simple_items(w, "tt:Key", &qn.message.key);
-            write_simple_items(w, "tt:Data", &qn.message.data);
-
-            w.write_event(XmlEvent::End(BytesEnd::new("tt:Message")))
-                .unwrap_or_default();
-        });
+        write_notification_message(&mut w, qn);
         w.write_event(XmlEvent::End(BytesEnd::new("wsnt:NotificationMessage")))
             .unwrap_or_default();
     }
@@ -1062,6 +1553,34 @@ fn build_pull_messages_response(
         .unwrap_or_default();
 
     String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+/// `wsnt:Topic` of one notification — the shared payload writer behind
+/// both PullMessages responses and push Notify bodies (issue #50: push
+/// and pull bytes stay consistent by construction).
+fn write_notification_topic(w: &mut Writer<Vec<u8>>, qn: &QueuedNotification) {
+    write_text(w, "wsnt:Topic", &qn.topic);
+}
+
+/// `wsnt:Message` wrapping the inner `tt:Message` payload — the shared
+/// payload writer behind both PullMessages responses and push Notify
+/// bodies.
+fn write_notification_message(w: &mut Writer<Vec<u8>>, qn: &QueuedNotification) {
+    open_close(w, "wsnt:Message", |w| {
+        let mut msg = BytesStart::new("tt:Message");
+        msg.push_attribute(("PropertyOperation", qn.message.property_operation.as_str()));
+        msg.push_attribute(("UtcTime", qn.message.utc_time.as_str()));
+        w.write_event(XmlEvent::Start(msg)).unwrap_or_default();
+
+        // Source/Key/Data groups are always present (possibly empty) —
+        // the twin's struct-marshal shape.
+        write_simple_items(w, "tt:Source", &qn.message.source);
+        write_simple_items(w, "tt:Key", &qn.message.key);
+        write_simple_items(w, "tt:Data", &qn.message.data);
+
+        w.write_event(XmlEvent::End(BytesEnd::new("tt:Message")))
+            .unwrap_or_default();
+    });
 }
 
 /// One `tt:Source`/`tt:Key`/`tt:Data` SimpleItem group (always emitted,
@@ -1107,6 +1626,81 @@ fn build_unsubscribe_response() -> String {
     let mut root = BytesStart::new("wsnt:UnsubscribeResponse");
     root.push_attribute(("xmlns:wsnt", WS_NOTIFICATION));
     w.write_event(XmlEvent::Empty(root)).unwrap_or_default();
+    String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+/// `<wsnt:SubscribeResponse>` — the basic-notification ack: the
+/// SubscriptionReference (a pull-style address, so Renew/Unsubscribe
+/// operate on it through the shared registry) plus the granted termination
+/// window. Same shape as the create-pull-point response under the `wsnt`
+/// root — Subscribe is a WS-BaseNotification action, not a tev one.
+fn build_subscribe_response(address: &str, current: u64, termination: u64) -> String {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("wsnt:SubscribeResponse");
+    root.push_attribute(("xmlns:wsnt", WS_NOTIFICATION));
+    root.push_attribute(("xmlns:wsa", WS_ADDRESSING));
+    w.write_event(XmlEvent::Start(root)).unwrap_or_default();
+
+    open_close(&mut w, "wsnt:SubscriptionReference", |w| {
+        write_text(w, "wsa:Address", address);
+    });
+    write_text(&mut w, "wsnt:CurrentTime", &rfc3339(current));
+    write_text(&mut w, "wsnt:TerminationTime", &rfc3339(termination));
+
+    w.write_event(XmlEvent::End(BytesEnd::new("wsnt:SubscribeResponse")))
+        .unwrap_or_default();
+
+    String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+/// `<tev:SetSynchronizationPointResponse>` — empty acknowledgment. A sync
+/// point asks the device to re-send current property states to its
+/// subscribers; this device's events are host-injected stateless
+/// notifications, so there is no device-stored state to replay and the
+/// ack is the honest answer. (The action name is shared with the media
+/// service — dispatch is route-based, no collision.)
+fn build_set_synchronization_point_response() -> String {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut root = BytesStart::new("tev:SetSynchronizationPointResponse");
+    root.push_attribute(("xmlns:tev", EVENTS_SERVICE));
+    w.write_event(XmlEvent::Empty(root)).unwrap_or_default();
+    String::from_utf8(w.into_inner()).unwrap_or_default()
+}
+
+/// The complete SOAP document POSTed to a basic-notification consumer:
+/// the crate's standard response envelope (same declaration, prefixes,
+/// and spacing as every other emitted body) wrapping one wsnt:Notify.
+fn build_notify_envelope(subscription_address: &str, qn: &QueuedNotification) -> String {
+    serialize_soap_response(&build_notify_fragment(subscription_address, qn))
+}
+
+/// The `wsnt:Notify` fragment: one NotificationMessage naming this
+/// subscription (`SubscriptionReference` — `ProducerReference` is
+/// omitted, WS-BaseNotification makes it optional) and carrying the same
+/// Topic + inner-message payload writers the pull-point response uses.
+fn build_notify_fragment(subscription_address: &str, qn: &QueuedNotification) -> String {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+
+    let mut root = BytesStart::new("wsnt:Notify");
+    root.push_attribute(("xmlns:wsnt", WS_NOTIFICATION));
+    root.push_attribute(("xmlns:wsa", WS_ADDRESSING));
+    root.push_attribute(("xmlns:tt", SCHEMAS));
+    w.write_event(XmlEvent::Start(root)).unwrap_or_default();
+
+    w.write_event(XmlEvent::Start(BytesStart::new("wsnt:NotificationMessage")))
+        .unwrap_or_default();
+    open_close(&mut w, "wsnt:SubscriptionReference", |w| {
+        write_text(w, "wsa:Address", subscription_address);
+    });
+    write_notification_topic(&mut w, qn);
+    write_notification_message(&mut w, qn);
+    w.write_event(XmlEvent::End(BytesEnd::new("wsnt:NotificationMessage")))
+        .unwrap_or_default();
+
+    w.write_event(XmlEvent::End(BytesEnd::new("wsnt:Notify")))
+        .unwrap_or_default();
+
     String::from_utf8(w.into_inner()).unwrap_or_default()
 }
 
@@ -1861,6 +2455,400 @@ mod tests {
             let stamped_secs = parse_rfc3339_to_unix(stamped);
             assert!(stamped_secs >= before);
         });
+    }
+
+    // ------------------------------------------------------------------
+    // Basic notification interface — wsnt:Subscribe + push Notify
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn golden_subscribe_response() {
+        let address =
+            "http://192.0.2.10:8080/onvif/events_service/sub/0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            build_subscribe_response(address, T0, T1),
+            "<wsnt:SubscribeResponse xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\" xmlns:wsa=\"http://www.w3.org/2005/08/addressing\">\n  \
+             <wsnt:SubscriptionReference>\n    \
+             <wsa:Address>http://192.0.2.10:8080/onvif/events_service/sub/0123456789abcdef0123456789abcdef</wsa:Address>\n  \
+             </wsnt:SubscriptionReference>\n  \
+             <wsnt:CurrentTime>2026-09-19T12:00:00Z</wsnt:CurrentTime>\n  \
+             <wsnt:TerminationTime>2026-09-19T13:00:00Z</wsnt:TerminationTime>\n\
+             </wsnt:SubscribeResponse>"
+        );
+    }
+
+    #[test]
+    fn golden_set_synchronization_point_response() {
+        assert_eq!(
+            build_set_synchronization_point_response(),
+            "<tev:SetSynchronizationPointResponse xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\"/>"
+        );
+    }
+
+    #[test]
+    fn golden_notify_fragment() {
+        let address =
+            "http://192.0.2.10:8080/onvif/events_service/sub/0123456789abcdef0123456789abcdef";
+        let qn = QueuedNotification {
+            topic: "tns1:VideoSource/MotionAlarm".to_string(),
+            message: QueuedMessage {
+                property_operation: "Changed".to_string(),
+                utc_time: "2026-09-19T12:00:00Z".to_string(),
+                source: vec![SimpleItem::new("Source", "CSI")],
+                key: vec![],
+                data: vec![SimpleItem::new("State", "true")],
+            },
+        };
+        assert_eq!(
+            build_notify_fragment(address, &qn),
+            "<wsnt:Notify xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\" xmlns:wsa=\"http://www.w3.org/2005/08/addressing\" xmlns:tt=\"http://www.onvif.org/ver10/schema\">\n  \
+             <wsnt:NotificationMessage>\n    \
+             <wsnt:SubscriptionReference>\n      \
+             <wsa:Address>http://192.0.2.10:8080/onvif/events_service/sub/0123456789abcdef0123456789abcdef</wsa:Address>\n    \
+             </wsnt:SubscriptionReference>\n    \
+             <wsnt:Topic>tns1:VideoSource/MotionAlarm</wsnt:Topic>\n    \
+             <wsnt:Message>\n      \
+             <tt:Message PropertyOperation=\"Changed\" UtcTime=\"2026-09-19T12:00:00Z\">\n        \
+             <tt:Source>\n          \
+             <tt:SimpleItem Name=\"Source\" Value=\"CSI\"/>\n        \
+             </tt:Source>\n        \
+             <tt:Key></tt:Key>\n        \
+             <tt:Data>\n          \
+             <tt:SimpleItem Name=\"State\" Value=\"true\"/>\n        \
+             </tt:Data>\n      \
+             </tt:Message>\n    \
+             </wsnt:Message>\n  \
+             </wsnt:NotificationMessage>\n\
+             </wsnt:Notify>"
+        );
+    }
+
+    #[test]
+    fn notify_envelope_reuses_the_standard_response_envelope() {
+        let address = "http://192.0.2.10:8080/onvif/events_service/sub/abc";
+        let qn = QueuedNotification {
+            topic: "tns1:VideoSource/MotionAlarm".to_string(),
+            message: QueuedMessage {
+                property_operation: "Changed".to_string(),
+                utc_time: "2026-09-19T12:00:00Z".to_string(),
+                source: vec![],
+                key: vec![],
+                data: vec![],
+            },
+        };
+        let envelope = build_notify_envelope(address, &qn);
+        assert!(
+            envelope.starts_with("<?xml version=\"1.0\" encoding=\"utf-8\"?>"),
+            "Notify is a standalone SOAP document: {envelope}"
+        );
+        assert!(envelope.contains("<soap:Envelope"));
+        assert!(
+            envelope.contains(&build_notify_fragment(address, &qn)),
+            "body must embed the Notify fragment verbatim"
+        );
+        // Push Notify carries the subscription reference, never a
+        // producer reference (WS-BaseNotification makes it optional).
+        assert!(!envelope.contains("ProducerReference"));
+        assert_eq!(envelope.matches("<wsnt:NotificationMessage>").count(), 1);
+    }
+
+    #[test]
+    fn parse_subscribe_request_fields() {
+        let body = r#"<Subscribe xmlns="http://docs.oasis-open.org/wsn/b-2">
+            <ConsumerReference><wsa:Address xmlns:wsa="http://www.w3.org/2005/08/addressing">http://127.0.0.1:9999/notify</wsa:Address></ConsumerReference>
+            <Filter><wsnt:TopicExpression xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" Dialect="http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet">tns1:VideoSource/*</wsnt:TopicExpression></Filter>
+            <TerminationTime>PT5M</TerminationTime>
+            <SubscriptionPolicy><Anything>ignored</Anything></SubscriptionPolicy>
+        </Subscribe>"#;
+        let req = parse_subscribe_request(body).unwrap();
+        assert_eq!(
+            req.consumer_address.as_deref(),
+            Some("http://127.0.0.1:9999/notify")
+        );
+        assert_eq!(req.termination_time.as_deref(), Some("PT5M"));
+        let expr = req.topic_expression.expect("topic expression");
+        assert_eq!(expr.dialect, DIALECT_CONCRETE_SET);
+        assert_eq!(expr.value, "tns1:VideoSource/*");
+    }
+
+    #[test]
+    fn parse_subscribe_request_defaults() {
+        let req =
+            parse_subscribe_request(r#"<Subscribe xmlns="http://docs.oasis-open.org/wsn/b-2"/>"#)
+                .unwrap();
+        assert!(req.consumer_address.is_none());
+        assert!(req.termination_time.is_none());
+        assert!(req.topic_expression.is_none());
+    }
+
+    #[test]
+    fn parse_http_url_rules() {
+        let t = parse_http_url("http://127.0.0.1:9999/notify").unwrap();
+        assert_eq!(
+            (t.host.as_str(), t.port, t.path.as_str()),
+            ("127.0.0.1", 9999, "/notify")
+        );
+
+        let t = parse_http_url("http://consumer.example").unwrap();
+        assert_eq!(
+            (t.host.as_str(), t.port, t.path.as_str()),
+            ("consumer.example", 80, "/")
+        );
+
+        let t = parse_http_url("http://consumer.example/a/b?x=1").unwrap();
+        assert_eq!(t.path, "/a/b?x=1");
+
+        // IPv6 literals keep their bracketed display form.
+        let t = parse_http_url("http://[::1]:9000/n").unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("::1", 9000));
+        assert_eq!(t.host_header(), "[::1]");
+        assert_eq!(t.to_string(), "http://[::1]:9000/n");
+
+        for bad in [
+            "https://consumer.example/notify",
+            "ftp://consumer.example",
+            "consumer.example",
+            "http://",
+            "http://host:notaport/",
+            "http://:8080/",
+        ] {
+            match parse_http_url(bad) {
+                Err(OnvifError::SenderFault(m)) => {
+                    assert!(m.contains("ConsumerReference"), "{bad}: {m}")
+                }
+                other => panic!("url {bad:?}: want SenderFault, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn subscribe_response_and_registry_entry() {
+        let rt = tokio_rt();
+        rt.block_on(async {
+            let svc = EventsService::new();
+            let ep = endpoint();
+
+            let fragment = svc
+                .subscribe(
+                    r#"<Subscribe xmlns="http://docs.oasis-open.org/wsn/b-2"><ConsumerReference><wsa:Address xmlns:wsa="http://www.w3.org/2005/08/addressing">http://127.0.0.1:59999/notify</wsa:Address></ConsumerReference><TerminationTime>PT5M</TerminationTime></Subscribe>"#,
+                    &ep,
+                )
+                .await
+                .unwrap();
+            assert!(fragment.contains("SubscribeResponse"));
+            let address = fragment
+                .split("<wsa:Address>")
+                .nth(1)
+                .and_then(|rest| rest.split('<').next())
+                .unwrap_or_default();
+            assert!(address.starts_with("http://192.0.2.10:8080/onvif/events_service/sub/"));
+
+            // The registry entry is a basic-notification (push) subscription.
+            let id = address.rsplit('/').next().unwrap_or_default();
+            let subs = lock_subs(&svc.subs);
+            let pp = subs.get(id).expect("registry entry");
+            assert_eq!(
+                pp.consumer.as_deref(),
+                Some("http://127.0.0.1:59999/notify")
+            );
+        });
+    }
+
+    #[test]
+    fn subscribe_validation_faults() {
+        let rt = tokio_rt();
+        rt.block_on(async {
+            let svc = EventsService::new();
+            let ep = endpoint();
+
+            // Missing ConsumerReference/Address.
+            match svc
+                .subscribe(
+                    r#"<Subscribe xmlns="http://docs.oasis-open.org/wsn/b-2"><TerminationTime>PT5M</TerminationTime></Subscribe>"#,
+                    &ep,
+                )
+                .await
+            {
+                Err(OnvifError::SenderFault(m)) => {
+                    assert!(m.contains("ConsumerReference"), "{m}")
+                }
+                other => panic!("want SenderFault, got {other:?}"),
+            }
+
+            // https consumers are documented-unsupported.
+            match svc
+                .subscribe(
+                    r#"<Subscribe xmlns="http://docs.oasis-open.org/wsn/b-2"><ConsumerReference><wsa:Address>https://consumer.example/n</wsa:Address></ConsumerReference></Subscribe>"#,
+                    &ep,
+                )
+                .await
+            {
+                Err(OnvifError::SenderFault(m)) => {
+                    assert!(m.contains("http://"), "{m}")
+                }
+                other => panic!("want SenderFault, got {other:?}"),
+            }
+
+            // Unparseable TerminationTime mirrors the pull-point rules.
+            match svc
+                .subscribe(
+                    r#"<Subscribe xmlns="http://docs.oasis-open.org/wsn/b-2"><ConsumerReference><wsa:Address>http://127.0.0.1:59999/notify</wsa:Address></ConsumerReference><TerminationTime>whenever</TerminationTime></Subscribe>"#,
+                    &ep,
+                )
+                .await
+            {
+                Err(OnvifError::SenderFault(m)) => {
+                    assert!(m.contains("Invalid TerminationTime"), "{m}")
+                }
+                other => panic!("want SenderFault, got {other:?}"),
+            }
+
+            // PT0S is not a positive lifetime.
+            match svc
+                .subscribe(
+                    r#"<Subscribe xmlns="http://docs.oasis-open.org/wsn/b-2"><ConsumerReference><wsa:Address>http://127.0.0.1:59999/notify</wsa:Address></ConsumerReference><TerminationTime>PT0S</TerminationTime></Subscribe>"#,
+                    &ep,
+                )
+                .await
+            {
+                Err(OnvifError::SenderFault(m)) => {
+                    assert!(m.contains("Invalid TerminationTime"), "{m}")
+                }
+                other => panic!("want SenderFault, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn subscribe_termination_window_rules() {
+        let rt = tokio_rt();
+        rt.block_on(async {
+            let svc = EventsService::new();
+            let ep = endpoint();
+            let consumer = r#"<ConsumerReference><wsa:Address>http://127.0.0.1:59999/notify</wsa:Address></ConsumerReference>"#;
+
+            // Absent TerminationTime grants the 1 h default.
+            let fragment = svc
+                .subscribe(
+                    &format!(r#"<Subscribe xmlns="http://docs.oasis-open.org/wsn/b-2">{consumer}</Subscribe>"#),
+                    &ep,
+                )
+                .await
+                .unwrap();
+            let before = unix_now();
+            let term = fragment
+                .split("<wsnt:TerminationTime>")
+                .nth(1)
+                .and_then(|rest| rest.split('<').next())
+                .unwrap_or_default()
+                .to_string();
+            let remaining = parse_rfc3339_to_unix(&term).saturating_sub(before);
+            assert!(
+                (3540..=3600).contains(&remaining),
+                "default termination remaining {remaining}s"
+            );
+
+            // Requested windows are clamped to MAX_TERMINATION (24 h).
+            let fragment = svc
+                .subscribe(
+                    &format!(r#"<Subscribe xmlns="http://docs.oasis-open.org/wsn/b-2">{consumer}<TerminationTime>PT1000H</TerminationTime></Subscribe>"#),
+                    &ep,
+                )
+                .await
+                .unwrap();
+            let term = fragment
+                .split("<wsnt:TerminationTime>")
+                .nth(1)
+                .and_then(|rest| rest.split('<').next())
+                .unwrap_or_default()
+                .to_string();
+            let remaining = parse_rfc3339_to_unix(&term).saturating_sub(before);
+            assert!(
+                remaining <= MAX_TERMINATION.as_secs() + 60,
+                "PT1000H must clamp to 24 h, remaining {remaining}s"
+            );
+        });
+    }
+
+    #[test]
+    fn basic_subscriptions_share_the_pull_point_cap() {
+        let rt = tokio_rt();
+        rt.block_on(async {
+            let svc = EventsService::new();
+            let ep = endpoint();
+            for _ in 0..DEFAULT_MAX_PULL_POINTS {
+                create(&svc, &ep, "PT10M").await;
+            }
+            match svc
+                .subscribe(
+                    r#"<Subscribe xmlns="http://docs.oasis-open.org/wsn/b-2"><ConsumerReference><wsa:Address>http://127.0.0.1:59999/notify</wsa:Address></ConsumerReference></Subscribe>"#,
+                    &ep,
+                )
+                .await
+            {
+                Err(OnvifError::SenderFault(m)) => {
+                    assert!(m.contains("Too many active subscriptions"), "{m}")
+                }
+                other => panic!("want SenderFault, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn pull_messages_on_basic_subscription_faults() {
+        let rt = tokio_rt();
+        rt.block_on(async {
+            let svc = EventsService::new();
+            let ep = endpoint();
+            let sub_path = subscribe_path(&svc, &ep, "PT10M").await;
+
+            match pull(&svc, &sub_path, "PT0S", 5).await {
+                Err(OnvifError::SenderFault(m)) => {
+                    assert!(m.contains("not a pull point"), "{m}")
+                }
+                other => panic!("want SenderFault, got {other:?}"),
+            }
+
+            // Renew and Unsubscribe still work on the basic subscription.
+            let fragment = svc
+                .renew(
+                    &sub_path,
+                    r#"<Renew xmlns="http://docs.oasis-open.org/wsn/b-2"><TerminationTime>PT10M</TerminationTime></Renew>"#,
+                )
+                .await
+                .unwrap();
+            assert!(fragment.contains("RenewResponse"));
+            svc.unsubscribe(&sub_path).await.unwrap();
+            assert!(matches!(
+                svc.renew(
+                    &sub_path,
+                    r#"<Renew xmlns="http://docs.oasis-open.org/wsn/b-2"><TerminationTime>PT10M</TerminationTime></Renew>"#,
+                )
+                .await,
+                Err(OnvifError::SenderFault(_))
+            ));
+        });
+    }
+
+    /// Subscribe over the handler seam and return the subscription path.
+    async fn subscribe_path(
+        svc: &EventsService,
+        ep: &ServiceEndpoint,
+        termination: &str,
+    ) -> String {
+        let body = format!(
+            r#"<Subscribe xmlns="http://docs.oasis-open.org/wsn/b-2"><ConsumerReference><wsa:Address>http://127.0.0.1:59999/notify</wsa:Address></ConsumerReference><TerminationTime>{termination}</TerminationTime></Subscribe>"#
+        );
+        let fragment = svc.subscribe(&body, ep).await.unwrap();
+        let address = fragment
+            .split("<wsa:Address>")
+            .nth(1)
+            .and_then(|rest| rest.split('<').next())
+            .unwrap_or_default();
+        format!(
+            "{SUBSCRIPTION_PATH_PREFIX}{}",
+            address.rsplit('/').next().unwrap_or("")
+        )
     }
 
     // -- shared test helpers ------------------------------------------------
