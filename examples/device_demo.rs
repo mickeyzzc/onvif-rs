@@ -201,6 +201,27 @@ async fn main() -> Result<()> {
         ..Default::default()
     });
 
+    // Host-side effects for the Device write operations (issue #49): the
+    // demo only logs them — a real host re-clocks, reboots, wipes, …
+    struct DemoHooks;
+    impl onvif_device_rs::device::DeviceHooks for DemoHooks {
+        fn set_date_time(&self, utc: (i32, i32, i32, i32, i32, i32), tz: &str) {
+            println!("device service: SetSystemDateAndTime {utc:?} tz={tz}");
+        }
+        fn reboot(&self) {
+            println!("device service: SystemReboot confirmed by host");
+        }
+        fn factory_default(&self, hard: bool) {
+            println!("device service: SetSystemFactoryDefault hard={hard}");
+        }
+        fn system_log(&self) -> String {
+            "demo system log".into()
+        }
+        fn support_info(&self) -> String {
+            "demo support information".into()
+        }
+    }
+
     let device = Arc::new(
         DeviceServiceHandlers::new(
             DeviceConfig {
@@ -214,14 +235,43 @@ async fn main() -> Result<()> {
             port,
             device_ip.clone(),
         )
-        .expect("device identity must be configured explicitly (issue #20)"),
+        .expect("device identity must be configured explicitly (issue #20)")
+        .with_hooks(std::sync::Arc::new(DemoHooks)),
     );
+    // The full Device service action surface (issue #49). Everything not
+    // in the anonymous set below stays behind WS-Security authentication.
     for action in [
         "GetSystemDateAndTime",
+        "SetSystemDateAndTime",
         "GetDeviceInformation",
         "GetCapabilities",
         "GetServices",
+        "GetServiceCapabilities",
         "GetScopes",
+        "AddScopes",
+        "RemoveScopes",
+        "SetScopes",
+        "GetHostname",
+        "SetHostname",
+        "GetDNS",
+        "GetNTP",
+        "GetNetworkInterfaces",
+        "GetNetworkDefaultGateway",
+        "GetNetworkProtocols",
+        "GetDiscoveryMode",
+        "SetDiscoveryMode",
+        "GetUsers",
+        "CreateUsers",
+        "DeleteUsers",
+        "SetUser",
+        "GetWsdlUrl",
+        "GetEndpointReference",
+        "GetSystemLog",
+        "GetSystemSupportInformation",
+        "SetSystemFactoryDefault",
+        "UpgradeSystemFirmware",
+        "StartSystemRestore",
+        "SystemReboot",
     ] {
         soap.register_handler(action, Box::new(DeviceHandler(Arc::clone(&device))));
     }

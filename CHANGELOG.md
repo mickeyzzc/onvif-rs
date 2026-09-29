@@ -31,6 +31,36 @@ are released out of band.
   are advertised off. The standalone handler structs keep their
   immutable `Arc<OnvifMediaConfig>` API; existing responses are
   byte-stable.
+
+- `feat(device)` **Device service completion** (issue #49): the
+  devicemgmt action set beyond the historical reads — SetSystemDateAndTime
+  (parse + `DeviceHooks::set_date_time`, UTC fields required), mutable
+  scopes (AddScopes/RemoveScopes/SetScopes on a store seeded with the
+  three historical items, so pre-write GetScopes bytes are unchanged;
+  texts escaped on output), GetHostname/SetHostname (default name = the
+  startup device IP), Get/SetDiscoveryMode, a user directory
+  (GetUsers/CreateUsers/DeleteUsers/SetUser — level validation,
+  all-or-nothing semantics, passwords never stored or echoed; the
+  WS-Security layer stays the authentication source; seed via
+  `with_users`), honest network statics (GetDNS, GetNTP,
+  GetNetworkInterfaces — empty, GetNetworkDefaultGateway,
+  GetNetworkProtocols — the HTTP port actually served),
+  GetServiceCapabilities (minimal DeviceServiceCapabilities),
+  GetWsdlUrl, GetEndpointReference (documented placeholder zero UUID),
+  GetSystemLog/GetSystemSupportInformation (text via
+  `DeviceHooks::system_log`/`support_info`), and the protocol-answer-only
+  family SetSystemFactoryDefault (fires `DeviceHooks::factory_default`),
+  UpgradeSystemFirmware, StartSystemRestore, plus SystemReboot now firing
+  `DeviceHooks::reboot` (response bytes unchanged). New
+  `DeviceServiceHandlers::with_hooks` installs the host-side effects.
+  Deliberately excluded (unknown action → ActionNotSupported): the Set*
+  network variants (SetDNS/SetNTP/SetNetworkInterfaces/
+  SetNetworkProtocols/SetNetworkDefaultGateway — a library server does
+  not mutate the host network stack), the certificate family
+  (LoadCertificates/GetCertificates/…), and 802.1X — deferred to future
+  Profile T / TLS-server work. Dispatch keeps full-token substring
+  matching with writes-before-reads ordering within each family; an
+  exhaustive routing test pins every action.
 - `feat(ptz)` **PTZ completion** (issue #51): GetConfigurationOptions
   (six coordinate spaces + PTZTimeout), SetConfiguration (stored and
   reflected by GetConfigurations; default bytes unchanged),
