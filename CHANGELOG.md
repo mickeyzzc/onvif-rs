@@ -11,6 +11,26 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(media)` **Media service completion** (issue #48): new
+  `register_media_actions(server, Arc<RwLock<OnvifMediaConfig>>,
+  keyframe_hook)` registers the whole service — the four historical
+  actions (now reading through the shared store, bytes unchanged) plus
+  GetVideoEncoderConfigurations / GetVideoEncoderConfiguration (Sender
+  fault on unknown/missing token), GetVideoEncoderConfigurationOptions
+  (H264 codec block from the advertised geometry; quality range only
+  for H265 — ver10 has no element for it),
+  SetVideoEncoderConfiguration (partial updates land in the shared
+  store every reader reflects; JPEG and encoding intervals other than 1
+  fault as unsupported rather than being silently ignored),
+  GetGuaranteedNumberOfVideoEncoderInstances (`TotalNumber` per the
+  WSDL), SetSynchronizationPoint (fires the optional host keyframe
+  hook), the media GetServiceCapabilities (element names per the ver10
+  WSDL; SnapshotUri follows `snapshot_port`), and the empty audio/OSD
+  sets (no audio hardware, no OSD engine — honest empty answers).
+  StartMulticastStreaming/StopMulticastStreaming stay unimplemented and
+  are advertised off. The standalone handler structs keep their
+  immutable `Arc<OnvifMediaConfig>` API; existing responses are
+  byte-stable.
 - `feat(ptz)` **PTZ completion** (issue #51): GetConfigurationOptions
   (six coordinate spaces + PTZTimeout), SetConfiguration (stored and
   reflected by GetConfigurations; default bytes unchanged),
