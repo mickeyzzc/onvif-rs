@@ -21,6 +21,7 @@
 - **成像对焦控制** —— Move（经 `ImagingParams::focus_move` 接缝的绝对/相对/连续对焦）、Stop、GetMoveOptions、GetStatus、GetServiceCapabilities；共享动作名（`GetStatus`/`Stop`/`GetServiceCapabilities`）按请求形状路由，未命中回落先前注册的 handler（PTZ）
 - **命名空间无关的请求解析**（客户端可用任意 XML 前缀）与显式前缀序列化（`tds:`/`trt:`/`timg:`/`tt:`），所有插值均做 XML 转义
 - **多媒体 Profile**（主码流 + 子码流）—— `OnvifMediaConfig::extra_profiles` 在 GetProfiles 中追加 `MediaProfileConfig` 条目（如 640×360 省流子码流），恒排在主 Profile 之后；GetStreamUri 按请求的 `ProfileToken` 匹配并返回对应 RTSP 路径，未知/缺失 token 一律回落主流——单 Profile 客户端行为不变
+- **Media 服务补全** —— `register_media_actions(server, Arc<RwLock<OnvifMediaConfig>>, keyframe_hook)` 一次注册整个服务：视频编码器配置族（GetVideoEncoderConfigurations / GetVideoEncoderConfiguration / GetVideoEncoderConfigurationOptions / **SetVideoEncoderConfiguration**——写入落入共享存储，GetProfiles 等全部读取方立即可见）、GetGuaranteedNumberOfVideoEncoderInstances、**SetSynchronizationPoint**（触发宿主的关键帧/IDR 钩子）、Media GetServiceCapabilities（SnapshotUri 跟随 `snapshot_port`）、以及音频/OSD 空集应答（无音频硬件、无 OSD 引擎——诚实的空答复而非Fault）；组播流媒体刻意不实现并在能力中如实关闭（`RTPMulticast="false"`）
 - **虚拟 PTZ** —— 纯状态机（`ptz_state`）支撑无云台设备的 PTZ 服务：转动、预置位、**Home 位**（Set/Goto）、配置存储（**SetConfiguration** 由 GetConfigurations 反射）、**GetConfigurationOptions**（坐标空间 + 超时）、**SendAuxiliaryCommand**（应答 + 回显）、**GetPTZServiceCapabilities**
 - **优雅停机** —— SOAP 服务端与 discovery 应答器均支持
 
