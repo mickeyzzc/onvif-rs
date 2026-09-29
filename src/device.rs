@@ -88,6 +88,12 @@ pub struct DeviceServiceHandlers {
     /// host must also serve the routes — `OnvifServer::enable_events` on the
     /// SOAP side; parity with onvif-go's SupportEvents flagging both).
     support_events: bool,
+    /// Advertise the Media2 service (ver20/media) in GetServices only —
+    /// the legacy GetCapabilities enumeration has no Media2 slot. Set
+    /// together with `OnvifServer::enable_media2` so the advertisement
+    /// and the served `/onvif/media2_service` route agree. Default
+    /// `false` — the pre-Media2 GetServices bytes are unchanged.
+    support_media2: bool,
     /// Host-side effects for write operations (issue #49); `None` = every
     /// hook is a no-op.
     host: Option<Arc<dyn DeviceHooks>>,
@@ -136,6 +142,7 @@ impl DeviceServiceHandlers {
             support_ptz: true,
             support_imaging: true,
             support_events: false,
+            support_media2: false,
             host: None,
             scopes: RwLock::new(scopes),
             hostname: RwLock::new(None),
@@ -178,6 +185,18 @@ impl DeviceServiceHandlers {
     #[must_use]
     pub fn with_events_support(mut self, support: bool) -> Self {
         self.support_events = support;
+        self
+    }
+
+    /// Advertise the Media2 service (ver20/media) in GetServices — the
+    /// entry a Media2-discovering client probes for (GetCapabilities has
+    /// no Media2 slot in the legacy enumeration, so this flag touches
+    /// GetServices only). Set together with `OnvifServer::enable_media2`
+    /// so the advertisement and the served `/onvif/media2_service` route
+    /// agree. Default `false` — existing deployments' bytes unchanged.
+    #[must_use]
+    pub fn with_media2_support(mut self, support: bool) -> Self {
+        self.support_media2 = support;
         self
     }
 
@@ -456,6 +475,13 @@ impl DeviceServiceHandlers {
         }
         if self.support_events {
             services.push((EVENTS_SERVICE, "/events_service"));
+        }
+        // Media2 (ver20/media): GetServices-only advertisement — the
+        // legacy GetCapabilities enumeration has no slot for it. The
+        // entry rides the same writer loop as every other service, so
+        // the Version block matches the existing entries' shape.
+        if self.support_media2 {
+            services.push((crate::media2::MEDIA2_SERVICE, "/media2_service"));
         }
 
         let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);

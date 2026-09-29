@@ -1,9 +1,9 @@
 //! ONVIF Device (server) library for Rust.
 //!
 //! Hand-written SOAP implementation of the ONVIF Device role: Device, Media,
-//! Imaging, (virtual) PTZ, and Events pull-point services over HTTP, plus a
-//! WS-Discovery UDP responder and WS-Security UsernameToken verification
-//! (PasswordText and PasswordDigest).
+//! Media2 (ver20/media), Imaging, (virtual) PTZ, and Events pull-point
+//! services over HTTP, plus a WS-Discovery UDP responder and WS-Security
+//! UsernameToken verification (PasswordText and PasswordDigest).
 //!
 //! Extracted verbatim from the production implementation in
 //! `mibee-eye-raspi-rs`, whose response XML is byte-stable against the
@@ -62,6 +62,7 @@ pub mod discovery;
 pub mod events;
 pub mod imaging;
 pub mod media;
+pub mod media2;
 pub mod metrics;
 pub mod namespaces;
 pub mod ptz;

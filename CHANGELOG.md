@@ -11,6 +11,37 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(media2)` **Media2 service** (ver20/media, `tr2` — the Profile-T
+  entry path, issue #53): `OnvifServer::enable_media2(store,
+  keyframe_hook)` routes `/onvif/media2_service` with its own action
+  dispatch on the listener the server already owns — the Media2 action
+  local names (`GetProfiles`, `GetStreamUri`,
+  `SetSynchronizationPoint`, …) collide with Media1 in the shared action
+  map, so the URL decides which face answers (the events-service routing
+  pattern). Served actions: GetProfiles (optional `Token` filter;
+  `tr2:Profiles`/`tr2:Configurations` wrappers with `tt:` configuration
+  bodies — the namespace split onvif-go's ns-strict decoder test pins),
+  GetStreamUri / GetSnapshotUri (plain `tr2:Uri`; stream tokens resolve
+  per extra-profile with fail-open to the primary; `snapshot_port` = 0
+  faults), GetVideoEncoderConfigurations (optional ConfigurationToken
+  filter) / GetVideoEncoderConfiguration / GetVideoEncoderConfiguration
+  Options / **SetVideoEncoderConfiguration** (Media1 partial-update
+  semantics on the same `SharedMediaConfig` store — visible to both
+  faces; JPEG and unknown encodings fault), GetVideoEncoderInstances
+  (`tr2:Info{tr2:Codec[]{tr2:Encoding,tr2:Number}, tr2:Total}`),
+  SetSynchronizationPoint (fires the same keyframe hook type
+  `register_media_actions` takes), and the Media2 GetServiceCapabilities
+  (SnapshotUri follows `snapshot_port`, MaximumNumberOfProfiles =
+  advertised count, `RTSPStreaming="true"`). Unknown actions on the path
+  are Sender faults; the path 404s while disabled. Auth: write-style
+  prefixes (Set*) behind WS-Security, reads open. Advertisement:
+  `DeviceServiceHandlers::with_media2_support` (default `false`) appends
+  the ver20/media entry to GetServices only — the legacy GetCapabilities
+  has no Media2 slot; default-off keeps every existing byte identical.
+  Deliberately unimplemented: profile mutation (Create/Add/Remove/
+  DeleteProfile — the profile set is host-owned) and multicast streaming
+  (advertised off).
+
 - `feat(media)` **Media service completion** (issue #48): new
   `register_media_actions(server, Arc<RwLock<OnvifMediaConfig>>,
   keyframe_hook)` registers the whole service — the four historical
