@@ -27,9 +27,18 @@ pub struct DeviceServiceHandlers {
     device_config: DeviceConfig,
     onvif_port: u16,
     device_ip: String,
+    /// Advertise the Media service in GetCapabilities/GetServices. Default
+    /// `true` (the historical advertisement); hosts that do not register the
+    /// media handlers turn it off so the advertisement matches the routes
+    /// actually served (issue #47).
+    support_media: bool,
+    /// Advertise the PTZ service (see [`Self::with_media_support`]).
+    support_ptz: bool,
+    /// Advertise the Imaging service (see [`Self::with_media_support`]).
+    support_imaging: bool,
     /// Advertise the Events service in GetCapabilities/GetServices (the
-    /// host must also serve the routes — `OnvifServer::enable_events` on
-    /// the SOAP side; parity with onvif-go's SupportEvents flagging both).
+    /// host must also serve the routes — `OnvifServer::enable_events` on the
+    /// SOAP side; parity with onvif-go's SupportEvents flagging both).
     support_events: bool,
 }
 
@@ -49,8 +58,37 @@ impl DeviceServiceHandlers {
             device_config,
             onvif_port,
             device_ip,
+            support_media: true,
+            support_ptz: true,
+            support_imaging: true,
             support_events: false,
         })
+    }
+
+    /// Advertise (or omit) the Media service in GetCapabilities /
+    /// GetServices. Set to `false` when the host does not register the
+    /// media action handlers, so clients discover only what is really
+    /// served. Default `true` — the historical advertisement.
+    #[must_use]
+    pub fn with_media_support(mut self, support: bool) -> Self {
+        self.support_media = support;
+        self
+    }
+
+    /// Advertise (or omit) the PTZ service — see
+    /// [`Self::with_media_support`]. Default `true`.
+    #[must_use]
+    pub fn with_ptz_support(mut self, support: bool) -> Self {
+        self.support_ptz = support;
+        self
+    }
+
+    /// Advertise (or omit) the Imaging service — see
+    /// [`Self::with_media_support`]. Default `true`.
+    #[must_use]
+    pub fn with_imaging_support(mut self, support: bool) -> Self {
+        self.support_imaging = support;
+        self
     }
 
     /// Advertise (or omit) the Events service in GetCapabilities /
@@ -188,9 +226,15 @@ impl DeviceServiceHandlers {
         w.write_event(Event::Start(BytesStart::new("tds:Capabilities")))
             .unwrap_or_default();
         capability_xaddr(&mut w, "tt:Device", &base, "/device_service");
-        capability_xaddr(&mut w, "tt:Media", &base, "/media_service");
-        capability_xaddr(&mut w, "tt:PTZ", &base, "/ptz_service");
-        capability_xaddr(&mut w, "tt:Imaging", &base, "/device_service");
+        if self.support_media {
+            capability_xaddr(&mut w, "tt:Media", &base, "/media_service");
+        }
+        if self.support_ptz {
+            capability_xaddr(&mut w, "tt:PTZ", &base, "/ptz_service");
+        }
+        if self.support_imaging {
+            capability_xaddr(&mut w, "tt:Imaging", &base, "/device_service");
+        }
         if self.support_events {
             // WSPullPointSupport=true: the events service really serves
             // CreatePullPointSubscription/PullMessages/Renew/Unsubscribe on
@@ -215,14 +259,23 @@ impl DeviceServiceHandlers {
     }
 
     /// Build `<tds:GetServicesResponse>` body.
+    ///
+    /// Enumerates the services this host actually serves (issue #47):
+    /// Device always; Media/PTZ/Imaging per their support flags; Events
+    /// only after [`Self::with_events_support`]. XAddr paths match the
+    /// GetCapabilities advertisement.
     fn build_services(&self, server_ip: &str) -> String {
         let base = self.base_url(server_ip);
-        let mut services: Vec<(&str, &str)> = vec![
-            (DEVICE_SERVICE, "/device_service"),
-            (MEDIA_SERVICE, "/media_service"),
-            (PTZ_SERVICE, "/ptz_service"),
-            (IMAGING_SERVICE, "/device_service"),
-        ];
+        let mut services: Vec<(&str, &str)> = vec![(DEVICE_SERVICE, "/device_service")];
+        if self.support_media {
+            services.push((MEDIA_SERVICE, "/media_service"));
+        }
+        if self.support_ptz {
+            services.push((PTZ_SERVICE, "/ptz_service"));
+        }
+        if self.support_imaging {
+            services.push((IMAGING_SERVICE, "/device_service"));
+        }
         if self.support_events {
             services.push((EVENTS_SERVICE, "/events_service"));
         }
@@ -634,6 +687,73 @@ mod tests {
         let h = test_handlers();
         let xml = h.build_services("172.16.0.8");
         assert!(xml.contains("172.16.0.8"));
+    }
+
+    // --------------------------------------------------------------
+    // Per-service advertisement flags (issue #47) — GetServices and
+    // GetCapabilities must agree with what the host actually serves.
+    // --------------------------------------------------------------
+
+    #[test]
+    fn test_get_services_omits_disabled_services() {
+        let h = test_handlers()
+            .with_media_support(false)
+            .with_ptz_support(false)
+            .with_imaging_support(false)
+            .with_events_support(false);
+        let xml = h.build_services("10.0.0.5");
+
+        assert!(
+            xml.contains(DEVICE_SERVICE),
+            "Device is always advertised, got: {xml}"
+        );
+        assert!(!xml.contains(MEDIA_SERVICE), "media disabled: {xml}");
+        assert!(!xml.contains(PTZ_SERVICE), "ptz disabled: {xml}");
+        assert!(!xml.contains(IMAGING_SERVICE), "imaging disabled: {xml}");
+        assert!(!xml.contains(EVENTS_SERVICE), "events disabled: {xml}");
+        // Exactly one tds:Service entry.
+        assert_eq!(xml.matches("<tds:Service>").count(), 1, "{xml}");
+    }
+
+    #[test]
+    fn test_get_services_selectively_disables_services() {
+        let h = test_handlers().with_ptz_support(false);
+        let xml = h.build_services("10.0.0.5");
+        assert!(xml.contains(DEVICE_SERVICE));
+        assert!(xml.contains(MEDIA_SERVICE));
+        assert!(!xml.contains(PTZ_SERVICE));
+        assert!(xml.contains(IMAGING_SERVICE));
+        assert_eq!(xml.matches("<tds:Service>").count(), 3, "{xml}");
+    }
+
+    #[test]
+    fn test_get_capabilities_omits_disabled_services() {
+        let h = test_handlers()
+            .with_media_support(false)
+            .with_ptz_support(false)
+            .with_imaging_support(false);
+        let xml = h.build_capabilities("10.0.0.5");
+
+        assert!(xml.contains("tt:Device"), "device caps always present");
+        assert!(!xml.contains("tt:Media"), "media disabled: {xml}");
+        assert!(!xml.contains("tt:PTZ"), "ptz disabled: {xml}");
+        assert!(!xml.contains("tt:Imaging"), "imaging disabled: {xml}");
+        assert!(
+            !xml.contains("/media_service"),
+            "no media XAddr when disabled: {xml}"
+        );
+    }
+
+    #[test]
+    fn test_service_flags_default_advertises_everything() {
+        // Defaults keep the historical (pre-flag) advertisement: every
+        // service listed — existing hosts' wire bytes must not change.
+        let h = test_handlers();
+        let services = h.build_services("10.0.0.5");
+        for ns in [DEVICE_SERVICE, MEDIA_SERVICE, PTZ_SERVICE, IMAGING_SERVICE] {
+            assert!(services.contains(ns), "default must advertise {ns}");
+        }
+        assert_eq!(services.matches("<tds:Service>").count(), 4);
     }
 
     // --------------------------------------------------------------

@@ -11,6 +11,11 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(device)` **per-service advertisement flags** (issue #47):
+  `DeviceServiceHandlers` gained `with_media_support` /
+  `with_ptz_support` / `with_imaging_support` (default `true`); GetServices
+  and GetCapabilities enumerate exactly the services the host serves.
+  Defaults keep the historical advertisement byte-for-byte.
 - `feat(media)` **multiple media profiles (main + substreams)**: new
   `MediaProfileConfig` type; `OnvifMediaConfig::extra_profiles`
   (default empty) advertises additional profiles in GetProfiles after
