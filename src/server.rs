@@ -211,6 +211,15 @@ impl OnvifServer {
         self.handlers.insert(action.to_string(), handler);
     }
 
+    /// Take the currently registered handler for an action out of the
+    /// map (crate-internal): the imaging family uses this to take over
+    /// action names it shares with PTZ (`GetStatus`, `Stop`,
+    /// `GetServiceCapabilities`), routing by body shape and falling back
+    /// to the previous handler (issue #52).
+    pub(crate) fn take_handler(&mut self, action: &str) -> Option<Box<dyn OnvifActionHandler>> {
+        self.handlers.remove(action)
+    }
+
     /// Mark a SOAP action as accessible without authentication.
     ///
     /// Per the ONVIF spec, `GetSystemDateAndTime` must be reachable before a
