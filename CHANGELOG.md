@@ -11,6 +11,31 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(client)` **auth ladder + full service-domain sweep** — the client
+  half grows to real parity with the Go client's breadth:
+  - **Auth**: four modes (`AuthMode`: PasswordDigest default /
+    PasswordText / HttpBasic / None), a **sticky fallback ladder**
+    (`with_auth_fallback`) that walks the modes on auth-class failures
+    (HTTP 401/403 or NotAuthorized faults — the new
+    `ClientError::Unauthorized` class) and remembers the first one the
+    device accepts, **auto clock-skew** (`with_auto_clock_skew`) that
+    measures the device clock over the anonymous GetSystemDateAndTime and
+    retries once with a corrected `Created`, and **`diagnose_auth`**
+    triage (Ok / ClockSkew / BadCredentials with remediation detail).
+  - **Service domains** (ports of the Go packages, wire-compatible
+    envelopes, local-name tolerant decode): `device` (info/caps/
+    hostname/DNS/NTP/network/scopes/users-adjacent surface/storage/DP/
+    geo/system log/reboot…), `security` (users + certificates family),
+    `media` (profiles, stream URIs + options, snapshot, encoder/audio/OSD
+    reads, SelectMain/SelectSub helpers), `media2` (Profile-T family),
+    `metadata`, `ptz` (movement/status/presets/home/configs+options/
+    nodes/aux/capabilities), `imaging` (settings, focus moves, status,
+    presets 18.12), `events_pull` (pull-point client family reusing the
+    notify decode), `deviceio` (relays/inputs/serial/audio outputs), and
+    `discovery` active probing (multicast Probe sweep, directed HTTP
+    probe_endpoint with the GetDeviceInformation fallback, probe_serial
+    identity anchor, ParseScopes, FilterONVIF, bounded-concurrency
+    enrich_devices).
 - `feat(client)` **consumer half — the Go twin's v2.4.0 capability
   package** (client module + discovery listener): a minimal SOAP-over-HTTP
   caller (`SoapClient`: UsernameToken PasswordDigest — the same formula

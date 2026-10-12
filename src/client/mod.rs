@@ -45,6 +45,7 @@
 //! # }
 //! ```
 
+pub mod auth;
 pub mod device;
 pub mod deviceio;
 pub mod discovery;
@@ -60,11 +61,14 @@ pub mod push;
 pub mod security;
 pub mod time;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+pub use auth::{AuthDiagnosis, AuthMode, AuthStatus};
 
 /// Errors of the client half. SOAP faults arrive as [`ClientError::Fault`]
 /// regardless of the HTTP status (ONVIF devices frequently fault with
@@ -97,6 +101,10 @@ pub enum ClientError {
     /// fault: it does not accept push subscriptions. Fall back to
     /// pull-point.
     PushNotSupported { code: String, reason: String },
+    /// An authentication-shaped failure: HTTP 401/403 or a NotAuthorized
+    /// SOAP fault (the twin of the Go client's `ErrUnauthorized`). The
+    /// fallback ladder and auth triage key off this class.
+    Unauthorized(String),
 }
 
 impl std::fmt::Display for ClientError {
@@ -121,6 +129,7 @@ impl std::fmt::Display for ClientError {
             Self::PushNotSupported { code, reason } => {
                 write!(f, "push not supported [{code}]: {reason}")
             }
+            Self::Unauthorized(m) => write!(f, "unauthorized: {m}"),
         }
     }
 }
@@ -145,6 +154,13 @@ impl ClientError {
     #[must_use]
     pub fn is_push_not_supported(&self) -> bool {
         matches!(self, Self::PushNotSupported { .. })
+    }
+
+    /// Whether this is an authentication-shaped failure (HTTP 401/403 or
+    /// a NotAuthorized fault).
+    #[must_use]
+    pub fn is_unauthorized(&self) -> bool {
+        matches!(self, Self::Unauthorized(_))
     }
 }
 
@@ -314,6 +330,8 @@ pub struct SoapClient {
     password: Option<String>,
     clock_skew: Duration,
     timeout: Duration,
+    /// Auth-mode ladder / sticky / auto-skew state, shared across clones.
+    pub(crate) auth_state: Arc<auth::AuthState>,
 }
 
 impl SoapClient {
@@ -325,6 +343,7 @@ impl SoapClient {
             password: None,
             clock_skew: Duration::ZERO,
             timeout: Duration::from_secs(30),
+            auth_state: Arc::new(auth::AuthState::default()),
         })
     }
 
@@ -361,19 +380,100 @@ impl SoapClient {
     /// POST `body_xml` (the SOAP action element) wrapped in an envelope to
     /// `target` — a full URL; pass the subscription manager address for
     /// wsnt:Renew/Unsubscribe, the device endpoint otherwise. Returns the
-    /// response envelope; SOAP faults become [`ClientError::Fault`].
+    /// response envelope; SOAP faults become [`ClientError::Fault`],
+    /// auth-shaped failures become [`ClientError::Unauthorized`] (after
+    /// the fallback ladder and the auto-skew retry, when enabled).
     pub async fn soap_call(&self, target: &str, body_xml: &str) -> Result<String, ClientError> {
-        let target = parse_http_endpoint(target)?;
-        let envelope = self.build_envelope(body_xml);
+        let fallback = self.auth_state.fallback;
+        let initial = self.auth_state.initial_mode();
+        let ladder = auth::AuthMode::ladder(initial);
 
-        let request = format!(
-            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/soap+xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            target.path,
-            target.host,
-            target.port,
-            envelope.len(),
-            envelope
+        let mut last_auth_err: Option<ClientError> = None;
+        for (step, mode) in ladder.iter().enumerate() {
+            match self.soap_call_once(target, body_xml, *mode).await {
+                Ok(body) => {
+                    if fallback && step > 0 {
+                        *self
+                            .auth_state
+                            .sticky
+                            .lock()
+                            .unwrap_or_else(|g| g.into_inner()) = Some(*mode);
+                    }
+                    return Ok(body);
+                }
+                Err(e) if e.is_unauthorized() => {
+                    // Auto-skew: measure the device clock once and retry the
+                    // SAME mode with a corrected Created stamp.
+                    if self.auth_state.auto_skew
+                        && !*self
+                            .auth_state
+                            .skew_attempted
+                            .lock()
+                            .unwrap_or_else(|g| g.into_inner())
+                    {
+                        *self
+                            .auth_state
+                            .skew_attempted
+                            .lock()
+                            .unwrap_or_else(|g| g.into_inner()) = true;
+                        // Inline anonymous clock read (single
+                        // non-laddered exchange): going through
+                        // get_device_time would recurse through soap_call.
+                        if let Some(skew) = self.measure_clock_skew_secs().await {
+                            if skew > 0 {
+                                let skewed = SoapClient {
+                                    clock_skew: Duration::from_secs(skew as u64),
+                                    ..self.clone()
+                                };
+                                if let Ok(body) =
+                                    skewed.soap_call_once(target, body_xml, *mode).await
+                                {
+                                    if fallback {
+                                        *self
+                                            .auth_state
+                                            .sticky
+                                            .lock()
+                                            .unwrap_or_else(|g| g.into_inner()) = Some(*mode);
+                                    }
+                                    return Ok(body);
+                                }
+                            }
+                        }
+                    }
+                    last_auth_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_auth_err.unwrap_or_else(|| ClientError::Transport("no auth attempt made".into())))
+    }
+
+    /// One exchange under one explicit auth mode (a ladder step).
+    async fn soap_call_once(
+        &self,
+        target: &str,
+        body_xml: &str,
+        mode: auth::AuthMode,
+    ) -> Result<String, ClientError> {
+        let target = parse_http_endpoint(target)?;
+        let envelope = self.build_envelope_for_mode(body_xml, mode);
+
+        let mut request = format!(
+            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/soap+xml; charset=utf-8\r\n",
+            target.path, target.host, target.port,
         );
+        if mode == auth::AuthMode::HttpBasic {
+            if let Some((username, password)) = self.credentials() {
+                let token = BASE64.encode(format!("{username}:{password}"));
+                request.push_str(&format!("Authorization: Basic {token}\r\n"));
+            }
+        }
+        request.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{envelope}",
+            envelope.len()
+        ));
 
         let raw = tokio::time::timeout(self.timeout, async {
             let mut sock = tokio::net::TcpStream::connect((target.host.as_str(), target.port))
@@ -398,16 +498,60 @@ impl SoapClient {
             )));
         }
 
-        let body = split_http_body(&raw)?;
+        let (status, body) = split_http_status_body(&raw)?;
+
+        if status == 401 || status == 403 {
+            return Err(ClientError::Unauthorized(format!("HTTP {status}")));
+        }
+
         if body.trim().is_empty() {
             return Err(ClientError::Parse("empty response body".into()));
         }
 
         if let Some(fault) = find_soap_fault(&body) {
+            if let ClientError::Fault {
+                code,
+                subcode,
+                reason,
+            } = &fault
+            {
+                if auth::is_notauthorized_fault(code, subcode) {
+                    return Err(ClientError::Unauthorized(reason.clone()));
+                }
+            }
             return Err(fault);
         }
 
         Ok(body)
+    }
+
+    /// One anonymous GetSystemDateAndTime exchange against the configured
+    /// device endpoint, returning the device-minus-local offset in whole
+    /// seconds (None when the clock cannot be read). Single-shot and
+    /// ladder-free so the auto-skew retry cannot recurse.
+    async fn measure_clock_skew_secs(&self) -> Option<i64> {
+        let url = format!(
+            "http://{}:{}{}",
+            self.endpoint.host, self.endpoint.port, self.endpoint.path
+        );
+        let body = "<tds:GetSystemDateAndTime xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\"></tds:GetSystemDateAndTime>";
+        let resp = self
+            .soap_call_once(&url, body, auth::AuthMode::None)
+            .await
+            .ok()?;
+        let t = crate::client::time::parse_device_time(&resp).ok()?;
+        let local = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Some(t.utc.unix - local)
+    }
+
+    pub(crate) fn credentials(&self) -> Option<(String, String)> {
+        match (&self.username, &self.password) {
+            (Some(u), Some(p)) if !u.is_empty() => Some((u.clone(), p.clone())),
+            _ => None,
+        }
     }
 
     /// POST to the configured device endpoint.
@@ -419,9 +563,15 @@ impl SoapClient {
         self.soap_call(&url, body_xml).await
     }
 
-    fn build_envelope(&self, body_xml: &str) -> String {
-        let header = match (&self.username, &self.password) {
-            (Some(u), Some(p)) if !u.is_empty() => username_token_xml(u, p, self.clock_skew),
+    /// The envelope for one auth mode: UsernameToken (digest or cleartext)
+    /// in the SOAP header; nothing for HTTP Basic (the transport header
+    /// carries it) and None.
+    fn build_envelope_for_mode(&self, body_xml: &str, mode: auth::AuthMode) -> String {
+        let header = match (mode, self.credentials()) {
+            (auth::AuthMode::PasswordDigest, Some((u, p))) => {
+                username_token_digest_xml(&u, &p, self.clock_skew)
+            }
+            (auth::AuthMode::PasswordText, Some((u, p))) => username_token_text_xml(&u, &p),
             _ => String::new(),
         };
         format!("<Envelope xmlns=\"{SOAP_ENVELOPE}\">{header}<Body>{body_xml}</Body></Envelope>")
@@ -430,6 +580,26 @@ impl SoapClient {
     pub(crate) fn has_credentials(&self) -> bool {
         matches!(&self.username, Some(u) if !u.is_empty())
     }
+}
+
+/// Split an HTTP/1.1 response into (status, body), de-chunking when the
+/// server used `Transfer-Encoding: chunked`.
+pub(crate) fn split_http_status_body(raw: &[u8]) -> Result<(u16, String), ClientError> {
+    let head_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| ClientError::Parse("no HTTP body".into()))?;
+    let head = String::from_utf8_lossy(&raw[..head_end]);
+
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| ClientError::Parse("no HTTP status line".into()))?;
+
+    let body = split_http_body(raw)?;
+    Ok((status, body))
 }
 
 /// Split an HTTP/1.1 response into its body bytes, de-chunking when the
@@ -578,7 +748,11 @@ pub(crate) fn find_soap_fault(body: &str) -> Option<ClientError> {
 
 /// UsernameToken PasswordDigest header (the client side of the formula
 /// [`crate::auth::compute_password_digest`] verifies).
-fn username_token_xml(username: &str, password: &str, clock_skew: Duration) -> String {
+pub(crate) fn username_token_digest_xml(
+    username: &str,
+    password: &str,
+    clock_skew: Duration,
+) -> String {
     use rand::RngCore;
 
     let mut nonce = [0u8; 16];
@@ -603,6 +777,19 @@ fn username_token_xml(username: &str, password: &str, clock_skew: Duration) -> S
          </UsernameToken></Security></Header>"
     )
 }
+
+/// UsernameToken cleartext PasswordText header — the digest-rejecting
+/// firmware fallback.
+pub(crate) fn username_token_text_xml(username: &str, password: &str) -> String {
+    format!(
+        "<Header><Security xmlns=\"{WSSE_NS}\"><UsernameToken xmlns:wsu=\"{WSU_NS}\">\
+         <Username>{username}</Username>\
+         <Password Type=\"{PASSWORD_TEXT_TYPE}\">{password}</Password>\
+         </UsernameToken></Security></Header>"
+    )
+}
+
+const PASSWORD_TEXT_TYPE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText";
 
 #[cfg(test)]
 mod tests {
