@@ -45,9 +45,19 @@
 //! # }
 //! ```
 
+pub mod device;
+pub mod deviceio;
+pub mod discovery;
+pub mod events_pull;
+pub mod imaging;
+pub mod media;
+pub mod media2;
+pub mod metadata;
 pub mod motion;
 pub mod notify;
+pub mod ptz;
 pub mod push;
+pub mod security;
 pub mod time;
 
 use std::time::Duration;
