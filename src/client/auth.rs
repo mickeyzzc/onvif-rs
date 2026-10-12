@@ -30,6 +30,10 @@ pub enum AuthMode {
     PasswordText,
     /// HTTP Basic authorization header, no SOAP header.
     HttpBasic,
+    /// HTTP Digest transport auth (RFC 7616 subset the twin server
+    /// offers: MD5, qop="auth"): the call rides a 401 challenge →
+    /// `Authorization: Digest` response exchange, no SOAP header.
+    HttpDigest,
     /// No credentials on the wire (anonymous calls only).
     None,
 }
@@ -38,14 +42,15 @@ impl AuthMode {
     /// The ladder used by the fallback: the configured mode first, then
     /// the remaining ones in the Go twin's order.
     #[must_use]
-    pub fn ladder(configured: AuthMode) -> [AuthMode; 4] {
+    pub fn ladder(configured: AuthMode) -> [AuthMode; 5] {
         let all = [
             AuthMode::PasswordDigest,
             AuthMode::PasswordText,
             AuthMode::HttpBasic,
+            AuthMode::HttpDigest,
             AuthMode::None,
         ];
-        let mut ladder = [configured; 4];
+        let mut ladder = [configured; 5];
         let mut idx = 1;
         for mode in all {
             if mode != configured {
@@ -100,6 +105,9 @@ pub(crate) struct AuthState {
     pub(crate) auto_skew: bool,
     /// Set once the auto-skew measurement has been attempted.
     pub(crate) skew_attempted: Mutex<bool>,
+    /// HTTP Digest nonce-count bookkeeping (the Go twin's shared-counter
+    /// semantics: a server reusing nonces requires the count to advance).
+    pub(crate) digest_nc: Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl AuthState {
@@ -229,6 +237,128 @@ pub(crate) fn is_notauthorized_fault(code: &str, subcode: &str) -> bool {
         || joined.contains("unauthorized")
 }
 
+// ---------------------------------------------------------------------------
+// HTTP Digest challenge/response (RFC 7616 subset the twin server offers:
+// MD5, qop="auth" — the Go twin's transport default, mirrored as a ladder
+// mode).
+// ---------------------------------------------------------------------------
+
+/// Parameters of a server `WWW-Authenticate: Digest` challenge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DigestChallengeParams {
+    pub(crate) realm: String,
+    pub(crate) nonce: String,
+    /// `auth` or empty (the challenge did not offer qop).
+    pub(crate) qop: String,
+    pub(crate) opaque: String,
+}
+
+/// Parse a `WWW-Authenticate` header value; None when it is not a Digest
+/// challenge (scheme is case-insensitive; values may be quoted or bare).
+pub(crate) fn parse_digest_challenge(header: &str) -> Option<DigestChallengeParams> {
+    let trimmed = header.trim();
+    let (scheme, params) = trimmed.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Digest") {
+        return None;
+    }
+
+    Some(DigestChallengeParams {
+        realm: quoted_param(params, "realm")?,
+        nonce: quoted_param(params, "nonce")?,
+        qop: quoted_param(params, "qop").unwrap_or_default(),
+        opaque: quoted_param(params, "opaque").unwrap_or_default(),
+    })
+}
+
+/// Extract one `key=value` parameter of a challenge list. Keys match
+/// case-insensitively at a segment boundary (so `nonce=` never matches
+/// inside `cnonce=`); values are quoted or bare tokens.
+fn quoted_param(params: &str, key: &str) -> Option<String> {
+    let lower = params.to_ascii_lowercase();
+    let needle = format!("{key}=");
+    let mut search_from = 0;
+    loop {
+        let idx = lower[search_from..].find(&needle)? + search_from;
+        let boundary_ok = idx == 0
+            || lower[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c == ',' || c.is_whitespace());
+        if boundary_ok {
+            let value = &params[idx + needle.len()..];
+            if let Some(rest) = value.strip_prefix('"') {
+                let end = rest.find('"')?;
+                return Some(rest[..end].to_string());
+            }
+            let end = value.find(',').unwrap_or(value.len());
+            return Some(value[..end].trim().to_string());
+        }
+        search_from = idx + needle.len();
+    }
+}
+
+fn md5_hex(s: &str) -> String {
+    use md5::{Digest as Md5Digest, Md5};
+    let mut h = Md5::new();
+    h.update(s.as_bytes());
+    let out = h.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The MD5 `response` of the digest auth exchange (qop="auth" when the
+/// challenge offered it, the legacy RFC 2069 form otherwise).
+pub(crate) fn digest_response_md5(
+    username: &str,
+    password: &str,
+    method: &str,
+    uri: &str,
+    challenge: &DigestChallengeParams,
+    nc_hex: &str,
+    cnonce: &str,
+) -> String {
+    let ha1 = md5_hex(&format!("{username}:{}:{password}", challenge.realm));
+    let ha2 = md5_hex(&format!("{method}:{uri}"));
+    if challenge.qop.eq_ignore_ascii_case("auth") {
+        md5_hex(&format!(
+            "{ha1}:{}:{nc_hex}:{cnonce}:auth:{ha2}",
+            challenge.nonce
+        ))
+    } else {
+        md5_hex(&format!("{ha1}:{}:{ha2}", challenge.nonce))
+    }
+}
+
+/// The `Authorization: Digest ...` header value (the Go twin's field
+/// order; the opaque/qop/nc/cnonce tail rides only when qop was offered).
+pub(crate) fn build_digest_authorization(
+    username: &str,
+    challenge: &DigestChallengeParams,
+    uri: &str,
+    response: &str,
+    nc_hex: &str,
+    cnonce: &str,
+) -> String {
+    let mut header = format!(
+        "Digest username=\"{username}\", realm=\"{}\", nonce=\"{}\", uri=\"{uri}\", response=\"{response}\"",
+        challenge.realm, challenge.nonce
+    );
+    if challenge.qop.eq_ignore_ascii_case("auth") {
+        header.push_str(&format!(
+            ", opaque=\"{}\", qop=auth, nc={nc_hex}, cnonce=\"{cnonce}\"",
+            challenge.opaque
+        ));
+    }
+    header
+}
+
+/// A fresh random cnonce (hex, 8 bytes of entropy).
+pub(crate) fn random_digest_cnonce() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +373,7 @@ mod tests {
                 AuthMode::PasswordDigest,
                 AuthMode::PasswordText,
                 AuthMode::HttpBasic,
+                AuthMode::HttpDigest,
                 AuthMode::None
             ]
         );
@@ -256,10 +387,111 @@ mod tests {
             AuthMode::PasswordDigest,
             AuthMode::PasswordText,
             AuthMode::HttpBasic,
+            AuthMode::HttpDigest,
             AuthMode::None,
         ] {
             assert_eq!(ladder.iter().filter(|m| **m == mode).count(), 1);
         }
+    }
+
+    #[test]
+    fn digest_challenge_parsing() {
+        // The server twin's exact challenge format.
+        let challenge =
+            parse_digest_challenge("Digest realm=\"onvif\", nonce=\"n-1\", qop=\"auth\", algorithm=MD5, stale=FALSE, opaque=\"op-1\"")
+                .expect("digest challenge");
+        assert_eq!(challenge.realm, "onvif");
+        assert_eq!(challenge.nonce, "n-1");
+        assert_eq!(challenge.qop, "auth");
+        assert_eq!(challenge.opaque, "op-1");
+
+        // Case-insensitive scheme, unquoted params, no qop.
+        let legacy =
+            parse_digest_challenge("digest realm=cam, nonce=abc").expect("legacy challenge");
+        assert_eq!(
+            (legacy.realm.as_str(), legacy.nonce.as_str()),
+            ("cam", "abc")
+        );
+        assert_eq!(legacy.qop, "");
+
+        assert!(parse_digest_challenge("Basic realm=\"onvif\"").is_none());
+        // nonce= must not match inside cnonce=.
+        let cnonce_case =
+            parse_digest_challenge("Digest realm=\"r\", nonce=\"real\", cnonce=\"x\"")
+                .expect("boundary match");
+        assert_eq!(cnonce_case.nonce, "real");
+    }
+
+    #[test]
+    fn digest_response_rfc2617_vector() {
+        // The canonical RFC 2617 §3.5 example (MD5, qop=auth).
+        let rfc_challenge = DigestChallengeParams {
+            realm: "testrealm@host.com".into(),
+            nonce: "dcd98b7102dd2f0e8b11d0f600bfb0c093".into(),
+            qop: "auth".into(),
+            opaque: String::new(),
+        };
+        let response = digest_response_md5(
+            "Mufasa",
+            "Circle Of Life",
+            "GET",
+            "/dir/index.html",
+            &rfc_challenge,
+            "00000001",
+            "0a4f113b",
+        );
+        assert_eq!(response, "6629fae49393a05397450978507c4ef1");
+
+        // Legacy (no qop) form: response = MD5(HA1:nonce:HA2).
+        let legacy = digest_response_md5(
+            "Mufasa",
+            "Circle Of Life",
+            "GET",
+            "/dir/index.html",
+            &DigestChallengeParams {
+                qop: String::new(),
+                ..rfc_challenge.clone()
+            },
+            "00000001",
+            "0a4f113b",
+        );
+        assert_eq!(legacy, "670fd8c2df070c60b045671b8b24ff02");
+    }
+
+    #[test]
+    fn digest_authorization_shape() {
+        let challenge = DigestChallengeParams {
+            realm: "onvif".into(),
+            nonce: "n-1".into(),
+            qop: "auth".into(),
+            opaque: "op-1".into(),
+        };
+        let header = build_digest_authorization(
+            "admin",
+            &challenge,
+            "/onvif/device_service",
+            "deadbeef",
+            "00000001",
+            "c0ffee",
+        );
+        assert_eq!(
+            header,
+            "Digest username=\"admin\", realm=\"onvif\", nonce=\"n-1\", uri=\"/onvif/device_service\", response=\"deadbeef\", opaque=\"op-1\", qop=auth, nc=00000001, cnonce=\"c0ffee\""
+        );
+
+        let legacy_header = build_digest_authorization(
+            "admin",
+            &DigestChallengeParams {
+                realm: "onvif".into(),
+                nonce: "n-1".into(),
+                ..Default::default()
+            },
+            "/onvif/device_service",
+            "deadbeef",
+            "00000001",
+            "c0ffee",
+        );
+        assert!(!legacy_header.contains("qop="));
     }
 
     #[test]

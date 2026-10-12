@@ -303,3 +303,157 @@ async fn every_domain_round_trips() {
     }
     assert!(count >= 12, "expected ≥12 wire exchanges, saw {count}");
 }
+
+#[tokio::test]
+async fn analytics_domain_round_trips() {
+    let (port, mut rx) = fake_device(vec![
+        (
+            "tan:GetServiceCapabilities",
+            r#"<GetServiceCapabilitiesResponse><Capabilities RuleSupport="true" AnalyticsModuleSupport="true"/></GetServiceCapabilitiesResponse>"#,
+        ),
+        (
+            "tan:GetSupportedAnalyticsModules",
+            r#"<GetSupportedAnalyticsModulesResponse><SupportedAnalyticsModules>
+               <AnalyticsModuleContentSchemaLocation>http://x.xsd</AnalyticsModuleContentSchemaLocation>
+               <AnalyticsModuleDescription Name="tt:MyDetector"><Parameters>
+               <Item Name="Sensitivity" Type="xs:float"/></Parameters></AnalyticsModuleDescription>
+               </SupportedAnalyticsModules></GetSupportedAnalyticsModulesResponse>"#,
+        ),
+        (
+            "tan:GetSupportedRules",
+            r#"<GetSupportedRulesResponse><SupportedRules>
+               <RuleDescription Name="tt:LineDetector"><Parameters><Item Name="Direction" Type="xs:string"/></Parameters></RuleDescription>
+               </SupportedRules></GetSupportedRulesResponse>"#,
+        ),
+        (
+            "tan:GetAnalyticsModules",
+            r#"<GetAnalyticsModulesResponse><AnalyticsModule Name="Detector1" Type="tt:MyDetector">
+               <Parameters><SimpleItem Name="Sensitivity" Value="0.5"/></Parameters>
+               </AnalyticsModule></GetAnalyticsModulesResponse>"#,
+        ),
+        (
+            "tan:GetRules",
+            r#"<GetRulesResponse><Rule Name="Line1" Type="tt:LineDetector">
+               <Parameters><SimpleItem Name="Direction" Value="Both"/></Parameters>
+               </Rule></GetRulesResponse>"#,
+        ),
+        (
+            "tan:CreateAnalyticsModules",
+            "<CreateAnalyticsModulesResponse/>",
+        ),
+        (
+            "tan:ModifyAnalyticsModules",
+            "<ModifyAnalyticsModulesResponse/>",
+        ),
+        (
+            "tan:DeleteAnalyticsModules",
+            "<DeleteAnalyticsModulesResponse/>",
+        ),
+        ("tan:CreateRules", "<CreateRulesResponse/>"),
+        ("tan:ModifyRules", "<ModifyRulesResponse/>"),
+        ("tan:DeleteRules", "<DeleteRulesResponse/>"),
+        (
+            "tan:GetSupportedMetadata",
+            r#"<GetSupportedMetadataResponse><AnalyticsModule>
+               <SampleFrame UtcTime="2026-10-13T00:00:00Z"/>
+               </AnalyticsModule></GetSupportedMetadataResponse>"#,
+        ),
+        (
+            "tan:GetRuleOptions",
+            r#"<GetRuleOptionsResponse><RuleOptions RuleType="tt:LineDetector" Name="Sensitivity" Type="tt:FloatItem">
+               <tt:FloatItem><Min>0</Min><Max>1</Max></tt:FloatItem>
+               </RuleOptions></GetRuleOptionsResponse>"#,
+        ),
+        (
+            "tan:GetAnalyticsModuleOptions",
+            r#"<GetAnalyticsModuleOptionsResponse><Options AnalyticsModule="tt:MyDetector" Name="Sensitivity" Type="tt:FloatItem">
+               <tt:FloatItem Minimum="0" Maximum="1"/>
+               </Options></GetAnalyticsModuleOptionsResponse>"#,
+        ),
+    ])
+    .await;
+
+    let url = format!("http://127.0.0.1:{port}/onvif/device_service");
+    let client = SoapClient::new(&url).expect("client");
+
+    let caps = client
+        .analytics_get_service_capabilities()
+        .await
+        .expect("caps");
+    assert!(caps.rule_support && caps.analytics_module_support);
+
+    let supported = client
+        .analytics_get_supported_analytics_modules("vac-1")
+        .await
+        .expect("supported modules");
+    assert_eq!(supported.descriptions.len(), 1);
+    assert_eq!(supported.descriptions[0].name, "tt:MyDetector");
+
+    let rules_supported = client
+        .analytics_get_supported_rules("vac-1")
+        .await
+        .expect("supported rules");
+    assert_eq!(
+        rules_supported.descriptions[0].parameters[0].type_,
+        "xs:string"
+    );
+
+    let modules = client
+        .analytics_get_analytics_modules("vac-1")
+        .await
+        .expect("modules");
+    assert_eq!(modules[0].parameters[0].value, "0.5");
+
+    let rules = client.analytics_get_rules("vac-1").await.expect("rules");
+    assert_eq!(rules[0].name, "Line1");
+
+    client
+        .analytics_create_analytics_modules("vac-1", &modules)
+        .await
+        .expect("create modules");
+    client
+        .analytics_modify_analytics_modules("vac-1", &modules)
+        .await
+        .expect("modify modules");
+    client
+        .analytics_delete_analytics_modules("vac-1", &["Detector1"])
+        .await
+        .expect("delete modules");
+    client
+        .analytics_create_rules("vac-1", &rules)
+        .await
+        .expect("create rules");
+    client
+        .analytics_modify_rules("vac-1", &rules)
+        .await
+        .expect("modify rules");
+    client
+        .analytics_delete_rules("vac-1", &["Line1"])
+        .await
+        .expect("delete rules");
+
+    let metadata = client
+        .analytics_get_supported_metadata("tt:MyDetector")
+        .await
+        .expect("metadata");
+    assert!(metadata[0].sample_frame.is_some());
+
+    let rule_options = client
+        .analytics_get_rule_options("tt:LineDetector", "vac-1")
+        .await
+        .expect("rule options");
+    assert_eq!(rule_options.len(), 1);
+    assert!(rule_options[0].inner_xml.contains("FloatItem"));
+
+    let module_options = client
+        .analytics_get_analytics_module_options("tt:MyDetector", "vac-1")
+        .await
+        .expect("module options");
+    assert_eq!(module_options[0].analytics_module, "tt:MyDetector");
+
+    let mut count = 0;
+    while rx.try_recv().is_ok() {
+        count += 1;
+    }
+    assert_eq!(count, 14, "one wire exchange per analytics operation");
+}

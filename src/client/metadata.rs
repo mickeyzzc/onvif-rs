@@ -171,7 +171,7 @@ fn map_transformation(el: &XmlElem) -> Transformation {
     }
 }
 
-fn map_frame(el: &XmlElem) -> Frame {
+pub(crate) fn map_frame(el: &XmlElem) -> Frame {
     Frame {
         utc_time: el
             .attr("UtcTime")

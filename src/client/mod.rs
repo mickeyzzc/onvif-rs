@@ -45,6 +45,7 @@
 //! # }
 //! ```
 
+pub mod analytics;
 pub mod auth;
 pub mod device;
 pub mod deviceio;
@@ -460,42 +461,85 @@ impl SoapClient {
         let target = parse_http_endpoint(target)?;
         let envelope = self.build_envelope_for_mode(body_xml, mode);
 
-        let mut request = format!(
-            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/soap+xml; charset=utf-8\r\n",
-            target.path, target.host, target.port,
-        );
-        if mode == auth::AuthMode::HttpBasic {
-            if let Some((username, password)) = self.credentials() {
-                let token = BASE64.encode(format!("{username}:{password}"));
-                request.push_str(&format!("Authorization: Basic {token}\r\n"));
+        let build_request = |authz: Option<String>| {
+            let mut request = format!(
+                "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/soap+xml; charset=utf-8\r\n",
+                target.path, target.host, target.port,
+            );
+            match mode {
+                auth::AuthMode::HttpBasic => {
+                    if let Some((username, password)) = self.credentials() {
+                        let token = BASE64.encode(format!("{username}:{password}"));
+                        request.push_str(&format!("Authorization: Basic {token}\r\n"));
+                    }
+                }
+                auth::AuthMode::HttpDigest => {
+                    // The challenge-driven Authorization header rides only
+                    // on the retry (see below).
+                    if let Some(header) = authz {
+                        request.push_str(&format!("Authorization: {header}\r\n"));
+                    }
+                }
+                _ => {}
             }
-        }
-        request.push_str(&format!(
-            "Content-Length: {}\r\nConnection: close\r\n\r\n{envelope}",
-            envelope.len()
-        ));
+            request.push_str(&format!(
+                "Content-Length: {}\r\nConnection: close\r\n\r\n{envelope}",
+                envelope.len()
+            ));
+            request
+        };
 
-        let raw = tokio::time::timeout(self.timeout, async {
-            let mut sock = tokio::net::TcpStream::connect((target.host.as_str(), target.port))
-                .await
-                .map_err(|e| ClientError::Transport(format!("connect {}: {e}", target.host)))?;
-            sock.write_all(request.as_bytes())
-                .await
-                .map_err(|e| ClientError::Transport(format!("write: {e}")))?;
-            let mut buf = Vec::new();
-            sock.read_to_end(&mut buf)
-                .await
-                .map_err(|e| ClientError::Transport(format!("read: {e}")))?;
-            Ok::<_, ClientError>(buf)
-        })
-        .await
-        .map_err(|_| ClientError::Transport("exchange timed out".into()))??;
+        let mut raw = self.http_exchange(&target, &build_request(None)).await?;
 
         if raw.len() > MAX_RESPONSE_BYTES {
             return Err(ClientError::Parse(format!(
                 "response too large ({} bytes)",
                 raw.len()
             )));
+        }
+
+        if mode == auth::AuthMode::HttpDigest {
+            // Answer a Digest challenge (RFC 7616 MD5 subset) with one
+            // authenticated retry — no SOAP header on this leg.
+            let (status, headers) = split_http_status_headers(&raw)?;
+            if status == 401 {
+                if let Some(challenge) = header_value(&headers, "www-authenticate")
+                    .and_then(auth::parse_digest_challenge)
+                {
+                    if let Some((username, password)) = self.credentials() {
+                        let nc = self.next_digest_nc(&challenge.nonce);
+                        let nc_hex = format!("{nc:08x}");
+                        let cnonce = auth::random_digest_cnonce();
+                        let response = auth::digest_response_md5(
+                            &username,
+                            &password,
+                            "POST",
+                            &target.path,
+                            &challenge,
+                            &nc_hex,
+                            &cnonce,
+                        );
+                        let authz = auth::build_digest_authorization(
+                            &username,
+                            &challenge,
+                            &target.path,
+                            &response,
+                            &nc_hex,
+                            &cnonce,
+                        );
+                        raw = self
+                            .http_exchange(&target, &build_request(Some(authz)))
+                            .await?;
+
+                        if raw.len() > MAX_RESPONSE_BYTES {
+                            return Err(ClientError::Parse(format!(
+                                "response too large ({} bytes)",
+                                raw.len()
+                            )));
+                        }
+                    }
+                }
+            }
         }
 
         let (status, body) = split_http_status_body(&raw)?;
@@ -523,6 +567,48 @@ impl SoapClient {
         }
 
         Ok(body)
+    }
+
+    /// One HTTP/1.1 request/response exchange over a fresh connection
+    /// (`Connection: close` — the client's transport contract).
+    async fn http_exchange(
+        &self,
+        target: &HttpEndpoint,
+        request: &str,
+    ) -> Result<Vec<u8>, ClientError> {
+        tokio::time::timeout(self.timeout, async {
+            let mut sock = tokio::net::TcpStream::connect((target.host.as_str(), target.port))
+                .await
+                .map_err(|e| ClientError::Transport(format!("connect {}: {e}", target.host)))?;
+            sock.write_all(request.as_bytes())
+                .await
+                .map_err(|e| ClientError::Transport(format!("write: {e}")))?;
+            let mut buf = Vec::new();
+            sock.read_to_end(&mut buf)
+                .await
+                .map_err(|e| ClientError::Transport(format!("read: {e}")))?;
+            Ok::<_, ClientError>(buf)
+        })
+        .await
+        .map_err(|_| ClientError::Transport("exchange timed out".into()))?
+    }
+
+    /// Advance and return the nonce-count for an HTTP Digest nonce (the
+    /// Go twin's shared-counter semantics: a server reusing nonces
+    /// requires the count to advance). Bounded at 64 nonces — beyond that
+    /// the bookkeeping resets, which at worst costs one stale-nc retry.
+    fn next_digest_nc(&self, nonce: &str) -> u32 {
+        let mut map = self
+            .auth_state
+            .digest_nc
+            .lock()
+            .unwrap_or_else(|g| g.into_inner());
+        if map.len() >= 64 {
+            map.clear();
+        }
+        let entry = map.entry(nonce.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
     }
 
     /// One anonymous GetSystemDateAndTime exchange against the configured
@@ -600,6 +686,44 @@ pub(crate) fn split_http_status_body(raw: &[u8]) -> Result<(u16, String), Client
 
     let body = split_http_body(raw)?;
     Ok((status, body))
+}
+
+/// Split an HTTP/1.1 response into (status, header list) — the header
+/// names lower-cased for case-insensitive lookup. Used by the
+/// HTTP-Digest leg to read the `WWW-Authenticate` challenge.
+pub(crate) fn split_http_status_headers(
+    raw: &[u8],
+) -> Result<(u16, Vec<(String, String)>), ClientError> {
+    let head_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| ClientError::Parse("no HTTP body".into()))?;
+    let head = String::from_utf8_lossy(&raw[..head_end]);
+
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| ClientError::Parse("no HTTP status line".into()))?;
+
+    let headers = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+    Ok((status, headers))
+}
+
+/// Case-insensitive header lookup over [`split_http_status_headers`]
+/// output.
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let name = name.to_ascii_lowercase();
+    headers
+        .iter()
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.as_str())
 }
 
 /// Split an HTTP/1.1 response into its body bytes, de-chunking when the
