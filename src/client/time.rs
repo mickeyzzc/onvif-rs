@@ -196,7 +196,7 @@ impl SoapClient {
 
 /// Lift the SystemDateAndTime out of a GetSystemDateAndTime response
 /// (local-name walk — prefix dialects differ between firmwares).
-fn parse_device_time(resp: &str) -> Result<DeviceTime, ClientError> {
+pub(crate) fn parse_device_time(resp: &str) -> Result<DeviceTime, ClientError> {
     let mut reader = quick_xml::Reader::from_str(resp);
     reader.config_mut().trim_text(true);
 

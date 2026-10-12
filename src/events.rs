@@ -911,7 +911,10 @@ fn spawn_push_sender(
     notify: Arc<Notify>,
 ) {
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::from_std(termination);
+        // The deadline is re-read every wake so a Renew extends it (the
+        // Go twin's port of this loop fixed the same gap: a sender bound
+        // to the initial termination died on renewed subscriptions).
+        let mut deadline = tokio::time::Instant::from_std(termination);
         let mut consecutive_failures: u32 = 0;
         loop {
             // Register the wakeup BEFORE draining (see pull_messages).
@@ -919,6 +922,14 @@ fn spawn_push_sender(
             tokio::select! {
                 () = notified => {}
                 () = tokio::time::sleep_until(deadline) => break,
+            }
+
+            {
+                let guard = lock_subs(&subs);
+                match guard.get(&id) {
+                    None => break,
+                    Some(pp) => deadline = tokio::time::Instant::from_std(pp.termination),
+                }
             }
 
             let drained: Vec<QueuedNotification> = {
