@@ -1,9 +1,17 @@
-//! ONVIF Device (server) library for Rust.
+//! ONVIF library for Rust: the Device (server) role, plus the consumer
+//! (client) half.
 //!
 //! Hand-written SOAP implementation of the ONVIF Device role: Device, Media,
 //! Media2 (ver20/media), Imaging, (virtual) PTZ, and Events pull-point
 //! services over HTTP, plus a WS-Discovery UDP responder and WS-Security
 //! UsernameToken verification (PasswordText and PasswordDigest).
+//!
+//! Since 0.9.0 the crate also carries the consumer half ([`client`]):
+//! a minimal SOAP caller (UsernameToken PasswordDigest, clock-skew
+//! correction) with the Go twin's v2.4.0 capability package — typed
+//! device time sync, WS-BaseNotification push receiving, standard
+//! motion-topic parsing — and a passive WS-Discovery listener with the
+//! built-in ONVIF filter ([`discovery_listener`]).
 //!
 //! Extracted verbatim from the production implementation in
 //! `mibee-eye-raspi-rs`, whose response XML is byte-stable against the
@@ -56,9 +64,11 @@
 //! ```
 
 pub mod auth;
+pub mod client;
 pub mod config;
 pub mod device;
 pub mod discovery;
+pub mod discovery_listener;
 pub mod events;
 pub mod imaging;
 pub mod media;

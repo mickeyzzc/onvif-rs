@@ -9,6 +9,43 @@ Releases are capability packages: merges accumulate on `main` silently
 and ship with the next tag (merge ≠ release). Only urgent security fixes
 are released out of band.
 
+## [Unreleased]
+
+- `feat(client)` **consumer half — the Go twin's v2.4.0 capability
+  package** (client module + discovery listener): a minimal SOAP-over-HTTP
+  caller (`SoapClient`: UsernameToken PasswordDigest — the same formula
+  the server half verifies — clock-skew correction via `with_clock_skew`,
+  per-exchange timeout, SOAP-fault detection regardless of HTTP status)
+  with:
+  - **Typed device time sync**: `get_device_time` (unauthenticated clock
+    read — usable exactly when drifted clocks have broken digest auth;
+    pre-2000 clocks rejected), `set_device_time` (Manual write),
+    `set_ntp_server` (SetNTP + DateTimeType flip in one call; a flip
+    failure keeps the "server configured" state in the error); writes
+    fail fast with `ClientError::NoCredentials`.
+  - **WS-BaseNotification push receiving**: `push_subscribe` (probe;
+    sender faults map to `ClientError::PushNotSupported` for the
+    pull-point fallback), `push_renew`/`push_unsubscribe` on the
+    subscription's OWN manager endpoint, and the managed
+    `push_subscribe_managed` loop (half-TTL renewal, 2 s floor, done
+    signal, best-effort unsubscribe on drop).
+  - **Notify parsing + motion helpers**: `notify::parse_notify_events`
+    decodes device-POSTed wsnt:Notify bodies through the same two-layer
+    Message contract as the Go twin (envelope-wrapped and bare-Notify
+    root both accepted); `motion::parse_motion_alarm` /
+    `is_motion_topic` recognize the two standard motion topics
+    (MotionAlarm `State` / CellMotionDetector `IsMotion`) with the full
+    field-vector table from the Go twin.
+  - **Passive discovery listener** (`discovery_listener`): resident UDP
+    :3702 multicast listener for camera power-on Hellos and other
+    probes' ProbeMatches, with the built-in ONVIF signal gate (default
+    on — non-ONVIF WSD responders are dropped before the handler) and
+    configurable Types/Scopes constraints.
+  Integration-pinned against this crate's own server: the server
+  publishes a MotionAlarm, the client subscribes via wsnt:Subscribe,
+  parses the pushed Notify and recognizes it as motion.
+
+
 ## [0.8.0] — 2026-09-29
 
 The service-completion capability package (issues #47–#54 + the
@@ -17,11 +54,6 @@ fuller surfaces, the Media2 (tr2) Profile-T entry path, WS-Subscribe
 push notifications, HTTP Digest + IP filter + AccessPolicy, and WSDL
 shape fixes for GetServices/GetScopes. Consumed same-day by the
 mibee-eye products (v0.5.0 train).
-
-## [Unreleased]
-
-Nothing yet.
-
 
 - `fix(device)` **GetServices/GetScopes WSDL shape** (issues #64/#65,
   caught live by cross-library interop — the onvif-go client parses zero
