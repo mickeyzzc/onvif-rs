@@ -11,6 +11,26 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(client)` **analytics domain (tan) + HTTP Digest transport auth** —
+  the last two Go-client surfaces the sweep had left behind:
+  - **`client::analytics`**: the ver20 analytics service behind Profile M —
+    capabilities, supported module/rule types with parameter
+    descriptions, module/rule instance CRUD
+    (`analytics_{get,create,modify,delete}_{analytics_modules,rules}`),
+    sample-frame metadata (`analytics_get_supported_metadata`), and the
+    vendor parameter-range options (`analytics_get_rule_options` /
+    `analytics_get_analytics_module_options`) whose option trees are
+    preserved **byte-verbatim** in `inner_xml` (the Go twin's
+    `,innerxml` semantics, position-sliced from the response source).
+  - **`AuthMode::HttpDigest`** joins the ladder (after HttpBasic): the
+    401 `WWW-Authenticate: Digest` challenge is answered with one
+    authenticated retry — RFC 7616 MD5 subset (`qop="auth"` when
+    offered, legacy no-qop form otherwise), per-nonce nc bookkeeping
+    (a server reusing nonces sees the count advance), random cnonce.
+    Challenge parsing and the response hash are pinned by the RFC 2617
+    §3.5 vector; the wire exchange by an integration test against a
+    challenge-issuing fake device (hash re-verified from the header's
+    own fields, nc 00000001 → 00000002 on a reused nonce).
 - `feat(client)` **auth ladder + full service-domain sweep** — the client
   half grows to real parity with the Go client's breadth:
   - **Auth**: four modes (`AuthMode`: PasswordDigest default /

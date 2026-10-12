@@ -601,3 +601,131 @@ mod interop {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// HTTP Digest transport auth: a challenge-issuing fake device pins the
+// 401 → Authorization: Digest → 200 exchange, the response hash, and the
+// nonce-count bookkeeping when the server REUSES a nonce.
+// ---------------------------------------------------------------------------
+
+fn md5_hex(s: &str) -> String {
+    use md5::{Digest, Md5};
+    let mut h = Md5::new();
+    h.update(s.as_bytes());
+    let out = h.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn header_param<'a>(header: &'a str, key: &str) -> &'a str {
+    let needle = format!("{key}=");
+    let idx = header.find(&needle).expect("param in header") + needle.len();
+    let rest = &header[idx..];
+    let end = rest.find(',').unwrap_or(rest.len());
+    rest[..end].trim().trim_matches('"')
+}
+
+#[tokio::test]
+async fn http_digest_mode_answers_the_challenge() {
+    use std::sync::Mutex;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let sink = Arc::clone(&requests);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                let mut raw = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    match sock.read(&mut byte).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            raw.push(byte[0]);
+                            if raw.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let head = String::from_utf8_lossy(&raw).to_string();
+                let len: usize = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if len > 0 {
+                    let _ = sock.read_exact(&mut body).await;
+                }
+                let full = format!("{head}{}", String::from_utf8_lossy(&body));
+
+                // The twin server's exact challenge format; the nonce is
+                // deliberately REUSED so the nc bookkeeping is observable.
+                let response = if full.contains("Authorization: Digest") {
+                    let body = format!(
+                        "<Envelope xmlns=\"http://www.w3.org/2003/05/soap-envelope\"><Body>{CLOCK_RESP}</Body></Envelope>"
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"onvif\", nonce=\"n-1\", qop=\"auth\", algorithm=MD5, stale=FALSE, opaque=\"op-1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+
+                sink.lock().expect("sink").push(full);
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    let client = SoapClient::new(&format!("http://127.0.0.1:{port}/onvif/device_service"))
+        .expect("client")
+        .with_credentials("admin", "2022")
+        .with_auth_mode(onvif_device_rs::client::AuthMode::HttpDigest);
+
+    client.get_device_time().await.expect("digest exchange");
+
+    let captured = requests.lock().expect("sink").clone();
+    assert_eq!(captured.len(), 2, "anonymous probe + authenticated retry");
+    assert!(
+        !captured[0].contains("Authorization"),
+        "probe carries no credentials"
+    );
+    let authed_line = captured[1]
+        .lines()
+        .find(|l| l.starts_with("Authorization: Digest"))
+        .expect("digest header on retry");
+    let header = authed_line.trim_start_matches("Authorization: ");
+    assert_eq!(header_param(header, "username"), "admin");
+    assert_eq!(header_param(header, "realm"), "onvif");
+    assert_eq!(header_param(header, "nc"), "00000001");
+    let cnonce = header_param(header, "cnonce").to_string();
+    let response = header_param(header, "response").to_string();
+
+    // The response hash is verifiable from the header's own fields.
+    let ha1 = md5_hex("admin:onvif:2022");
+    let ha2 = md5_hex("POST:/onvif/device_service");
+    let expected = md5_hex(&format!("{ha1}:n-1:00000001:{cnonce}:auth:{ha2}"));
+    assert_eq!(response, expected, "RFC 7616 MD5 qop=auth response");
+
+    // A second call against the SAME reused nonce must advance nc.
+    client.get_device_time().await.expect("second exchange");
+    let captured = requests.lock().expect("sink").clone();
+    assert_eq!(captured.len(), 4);
+    let second = captured[3]
+        .lines()
+        .find(|l| l.starts_with("Authorization: Digest"))
+        .expect("second digest header");
+    assert_eq!(
+        header_param(second.trim_start_matches("Authorization: "), "nc"),
+        "00000002"
+    );
+}

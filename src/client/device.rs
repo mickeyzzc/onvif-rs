@@ -102,7 +102,7 @@ where
 }
 
 /// Collect an element's attributes as (local-name, unescaped value) pairs.
-fn collect_attrs(e: &quick_xml::events::BytesStart<'_>) -> Vec<(String, String)> {
+pub(crate) fn collect_attrs(e: &quick_xml::events::BytesStart<'_>) -> Vec<(String, String)> {
     e.attributes()
         .flatten()
         .filter_map(|a| {
