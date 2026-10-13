@@ -11,6 +11,15 @@ are released out of band.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-14
+
+The client half — parity with the Go client's breadth: the
+dependency-free SOAP-over-TCP client with the auth ladder (four
+modes, sticky fallback, auto clock skew), ten service domains, active
+and passive discovery, push-subscription management, and the
+analytics domain with HTTP Digest transport auth. The server half is
+unchanged (additions only).
+
 - `feat(client)` **analytics domain (tan) + HTTP Digest transport auth** —
   the last two Go-client surfaces the sweep had left behind:
   - **`client::analytics`**: the ver20 analytics service behind Profile M —
