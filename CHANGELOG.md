@@ -11,6 +11,14 @@ are released out of band.
 
 ## [Unreleased]
 
+- `feat(client)` **Profile audio visibility — audio-only profile parity
+  with the Go twin**: `media::Profile` gains `audio_source_configuration`
+  and `audio_encoder_configuration` (the types already existed for the
+  dedicated getters). A network microphone's audio-only profile — audio
+  configs present, no video — is now recognizable in `get_profiles`
+  answers (the ONVIF analog of gb28181-go #135). The media2 Profile
+  already carried audio configuration refs.
+
 ## [0.9.0] — 2026-10-14
 
 The client half — parity with the Go client's breadth: the
