@@ -203,6 +203,12 @@ pub struct Profile {
     pub video_source_configuration: Option<VideoSourceConfiguration>,
     /// Video encoder configuration, when the profile lists one.
     pub video_encoder_configuration: Option<VideoEncoderConfiguration>,
+    /// Audio source configuration, when the profile lists one — an
+    /// audio-only profile (network microphone) carries this and no video
+    /// configs (the Go twin's Profile parity).
+    pub audio_source_configuration: Option<AudioSourceConfiguration>,
+    /// Audio encoder configuration, when the profile lists one.
+    pub audio_encoder_configuration: Option<AudioEncoderConfiguration>,
     /// PTZ configuration, when the profile lists one.
     pub ptz_configuration: Option<PtzConfiguration>,
 }
@@ -733,6 +739,12 @@ fn map_profile(el: &XmlElem) -> Profile {
         video_encoder_configuration: el
             .find("VideoEncoderConfiguration")
             .map(map_video_encoder_configuration),
+        audio_source_configuration: el
+            .find("AudioSourceConfiguration")
+            .map(map_audio_source_configuration),
+        audio_encoder_configuration: el
+            .find("AudioEncoderConfiguration")
+            .map(map_audio_encoder_configuration),
         ptz_configuration: el.find("PTZConfiguration").map(map_ptz_configuration),
     }
 }
@@ -2130,6 +2142,42 @@ mod tests {
         </Profiles>
         <Profiles token="prof-2"><Name>Bare</Name></Profiles>
         </GetProfilesResponse>"#;
+
+    // An audio-only profile (network microphone): audio configs present,
+    // no video — the Profile parity with the Go twin makes the channel
+    // recognizable (gb28181-go #135's ONVIF analog).
+    const PROFILES_AUDIO_ONLY_RESP: &str = r#"<GetProfilesResponse>
+        <Profiles token="audio-1">
+            <Name>Mic</Name>
+            <AudioSourceConfiguration token="asc-1"><Name>MicSrc</Name><UseCount>1</UseCount><SourceToken>src-0</SourceToken></AudioSourceConfiguration>
+            <AudioEncoderConfiguration token="aec-1"><Name>G711</Name><UseCount>1</UseCount><Encoding>G711</Encoding><Bitrate>64</Bitrate><SampleRate>8000</SampleRate></AudioEncoderConfiguration>
+        </Profiles>
+        </GetProfilesResponse>"#;
+
+    #[test]
+    fn decodes_audio_only_profile() {
+        let profiles = parse_list(
+            &wrapped(PROFILES_AUDIO_ONLY_RESP),
+            "GetProfilesResponse",
+            "Profiles",
+            map_profile,
+        )
+        .unwrap();
+        assert_eq!(profiles.len(), 1);
+        let p = &profiles[0];
+        assert!(p.video_source_configuration.is_none());
+        assert!(p.video_encoder_configuration.is_none());
+        let asc = p.audio_source_configuration.as_ref().unwrap();
+        assert_eq!(
+            (asc.token.as_str(), asc.source_token.as_str()),
+            ("asc-1", "src-0")
+        );
+        let aec = p.audio_encoder_configuration.as_ref().unwrap();
+        assert_eq!(
+            (aec.encoding.as_str(), aec.bitrate, aec.sample_rate),
+            ("G711", 64, 8000)
+        );
+    }
 
     #[test]
     fn decodes_profiles_full_mapping() {
