@@ -11,6 +11,13 @@ are released out of band.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-16
+
+Profile audio visibility: `media::Profile` gains the audio source and
+encoder configurations (Go-twin parity) — audio-only profiles (network
+microphones) are recognizable in `get_profiles` answers. Struct-literal
+consumers gain two fields (0.x minor).
+
 - `feat(client)` **Profile audio visibility — audio-only profile parity
   with the Go twin**: `media::Profile` gains `audio_source_configuration`
   and `audio_encoder_configuration` (the types already existed for the
