@@ -209,12 +209,17 @@ async fn main() -> Result<()> {
         soap.register_handler(action, Box::new(PtzHandler(Arc::clone(&state))));
     }
     println!("[server] ONVIF SOAP + PTZ service on tcp/{port}");
-    tokio::spawn(soap.start());
+    // Hold the server handle: `start()` resolves once the accept loop is
+    // spawned, and dropping the handle stops the server — a bare
+    // `tokio::spawn(soap.start())` tears it down the moment the future
+    // resolves (silent since v0.3.0's handle semantics; examples don't
+    // run in CI).
+    let _server = soap.start().await.context("start ONVIF server")?;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // -- simulated motor: advance PtzState physics every 50 ms ---------------
     let ticker = Arc::clone(&state);
-    let motion = tokio::spawn(async move {
+    let _motion = tokio::spawn(async move {
         loop {
             ticker.tick(50);
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -354,8 +359,13 @@ async fn main() -> Result<()> {
 
     println!("\nonvif-device-rs PTZ demo: all checks passed");
     if serve {
-        println!("--serve: keeping server on tcp/{port} (Ctrl-C to quit)");
-        motion.abort();
+        println!(
+            "--serve: keeping server on tcp/{port} with the motion ticker \
+             live (Ctrl-C to quit); auth {USERNAME}/{PASSWORD}"
+        );
+        // Keep `motion` running: a serve-mode head without physics would
+        // answer ContinuousMove but never drift — useless as a stand-in
+        // head for consumers under test.
         loop {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
