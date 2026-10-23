@@ -102,6 +102,13 @@ pub enum ClientError {
     /// fault: it does not accept push subscriptions. Fall back to
     /// pull-point.
     PushNotSupported { code: String, reason: String },
+    /// The device answered HTTP 200 with an empty body — the twin of the
+    /// Go client's `ErrEmptyResponseBody`. Old firmwares (2016-era
+    /// devices that cannot process a WS-Security digest) do this instead
+    /// of answering 401 or a NotAuthorized fault. Not an auth failure by
+    /// classification, but the fallback ladder treats it as retryable:
+    /// the next auth mode often succeeds where the digest died.
+    EmptyBody,
     /// An authentication-shaped failure: HTTP 401/403 or a NotAuthorized
     /// SOAP fault (the twin of the Go client's `ErrUnauthorized`). The
     /// fallback ladder and auth triage key off this class.
@@ -130,6 +137,7 @@ impl std::fmt::Display for ClientError {
             Self::PushNotSupported { code, reason } => {
                 write!(f, "push not supported [{code}]: {reason}")
             }
+            Self::EmptyBody => write!(f, "received empty response body"),
             Self::Unauthorized(m) => write!(f, "unauthorized: {m}"),
         }
     }
@@ -162,6 +170,18 @@ impl ClientError {
     #[must_use]
     pub fn is_unauthorized(&self) -> bool {
         matches!(self, Self::Unauthorized(_))
+    }
+
+    /// Whether the auth fallback ladder should advance past this error:
+    /// an auth-class failure, or an empty 200 response body (old
+    /// firmwares answer a rejected digest with an empty body — no 401,
+    /// no fault; the next auth mode often succeeds where the digest
+    /// died). Empty bodies stay non-auth for classification — only the
+    /// ladder decision treats them as retryable (the Go twin's
+    /// `IsAuthLadderRetryable`, onvif-go #140).
+    #[must_use]
+    pub fn is_auth_ladder_retryable(&self) -> bool {
+        self.is_unauthorized() || matches!(self, Self::EmptyBody)
     }
 }
 
@@ -389,7 +409,7 @@ impl SoapClient {
         let initial = self.auth_state.initial_mode();
         let ladder = auth::AuthMode::ladder(initial);
 
-        let mut last_auth_err: Option<ClientError> = None;
+        let mut last_retryable_err: Option<ClientError> = None;
         for (step, mode) in ladder.iter().enumerate() {
             match self.soap_call_once(target, body_xml, *mode).await {
                 Ok(body) => {
@@ -402,10 +422,13 @@ impl SoapClient {
                     }
                     return Ok(body);
                 }
-                Err(e) if e.is_unauthorized() => {
+                Err(e) if e.is_auth_ladder_retryable() => {
                     // Auto-skew: measure the device clock once and retry the
-                    // SAME mode with a corrected Created stamp.
-                    if self.auth_state.auto_skew
+                    // SAME mode with a corrected Created stamp. Only an
+                    // auth-class failure can be a clock-skew trap; an empty
+                    // body means the device could not process the request.
+                    if e.is_unauthorized()
+                        && self.auth_state.auto_skew
                         && !*self
                             .auth_state
                             .skew_attempted
@@ -441,14 +464,19 @@ impl SoapClient {
                             }
                         }
                     }
-                    last_auth_err = Some(e);
+                    last_retryable_err = Some(e);
                     continue;
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        Err(last_auth_err.unwrap_or_else(|| ClientError::Transport("no auth attempt made".into())))
+        // Ladder exhausted: the last retryable error surfaces as-is —
+        // an auth-class failure stays `Unauthorized`, an empty-body
+        // failure stays `EmptyBody` (never misreported as a credentials
+        // problem; the Go twin's exhaustion rule, onvif-go #140).
+        Err(last_retryable_err
+            .unwrap_or_else(|| ClientError::Transport("no auth attempt made".into())))
     }
 
     /// One exchange under one explicit auth mode (a ladder step).
@@ -549,7 +577,7 @@ impl SoapClient {
         }
 
         if body.trim().is_empty() {
-            return Err(ClientError::Parse("empty response body".into()));
+            return Err(ClientError::EmptyBody);
         }
 
         if let Some(fault) = find_soap_fault(&body) {

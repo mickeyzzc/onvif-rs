@@ -362,6 +362,7 @@ pub(crate) fn random_digest_cnonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ClientError;
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -622,5 +623,138 @@ mod tests {
             .with_credentials("admin", "wrong");
         let diagnosis = client.diagnose_auth().await;
         assert_eq!(diagnosis.status, AuthStatus::BadCredentials);
+    }
+
+    /// Shared fake-device helper for the empty-body ladder tests: counts
+    /// exchanges and answers per the supplied decision closure
+    /// `(request_text) -> respond_empty`. Empty answers are HTTP 200 with
+    /// a zero-length body — the 2016-firmware shape (onvif-go #140).
+    async fn empty_body_fake(
+        respond_empty: fn(&str) -> bool,
+    ) -> (u16, Arc<std::sync::atomic::AtomicU32>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls2 = Arc::clone(&calls);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let text = read_request(&mut sock).await;
+                let body = if respond_empty(&text) {
+                    ""
+                } else {
+                    "<GetDeviceInformationResponse/>"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (port, calls)
+    }
+
+    #[tokio::test]
+    async fn empty_body_advances_ladder_and_settles_sticky() {
+        // Old firmware answers a digest request with 200 + empty body
+        // instead of a 401/fault (onvif-go #140); the ladder must still
+        // reach PasswordText and remember it.
+        let (port, calls) = empty_body_fake(|text| text.contains("#PasswordDigest")).await;
+        let client = SoapClient::new(&format!("http://127.0.0.1:{port}/onvif/device_service"))
+            .unwrap()
+            .with_credentials("admin", "secret")
+            .with_auth_fallback();
+
+        client
+            .soap_call(
+                &format!("http://127.0.0.1:{port}/onvif/device_service"),
+                "<x xmlns=\"y\"/>",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.effective_auth_mode(),
+            Some(AuthMode::PasswordText),
+            "sticky rung must be PasswordText"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one empty-bodied digest + one password-text"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_body_exhausted_keeps_original_error() {
+        // Every rung gets 200 + empty body: the exhausted ladder must
+        // surface the empty-body cause, not a misleading Unauthorized.
+        let (port, calls) = empty_body_fake(|_| true).await;
+        let client = SoapClient::new(&format!("http://127.0.0.1:{port}/onvif/device_service"))
+            .unwrap()
+            .with_credentials("admin", "secret")
+            .with_auth_fallback();
+
+        let err = client
+            .soap_call(
+                &format!("http://127.0.0.1:{port}/onvif/device_service"),
+                "<x xmlns=\"y\"/>",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ClientError::EmptyBody), "got: {err}");
+        assert!(!err.is_unauthorized(), "got: {err}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "one attempt per ladder rung"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_body_walks_without_fallback_but_never_sticks() {
+        // Without with_auth_fallback the walk still advances past the
+        // empty-bodied digest (the unconditional ladder), but nothing is
+        // remembered — the next call starts from the configured mode
+        // again and eats the empty body once more.
+        let (port, calls) = empty_body_fake(|text| text.contains("#PasswordDigest")).await;
+        let client = SoapClient::new(&format!("http://127.0.0.1:{port}/onvif/device_service"))
+            .unwrap()
+            .with_credentials("admin", "secret");
+
+        client
+            .soap_call(
+                &format!("http://127.0.0.1:{port}/onvif/device_service"),
+                "<x xmlns=\"y\"/>",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.effective_auth_mode(),
+            None,
+            "no sticky memory without with_auth_fallback"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "digest (empty) then password-text"
+        );
+
+        // Second call: starts at the configured PasswordDigest again.
+        client
+            .soap_call(
+                &format!("http://127.0.0.1:{port}/onvif/device_service"),
+                "<x xmlns=\"y\"/>",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "no sticky mode: every call re-walks from the configured rung"
+        );
     }
 }

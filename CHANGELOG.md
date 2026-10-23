@@ -13,6 +13,15 @@ are released out of band.
 
 ### Fixed
 
+- **Auth fallback ladder advances past empty 200 bodies (onvif-go #140
+  port).** Old firmwares answer a rejected WS-Security digest with
+  HTTP 200 and an empty body — no 401, no fault — which stranded the
+  ladder on the first rung and hung `Initialize`. Empty bodies now
+  advance the ladder like auth failures do; classification keeps them
+  non-auth, so an exhausted ladder surfaces the new
+  `ClientError::EmptyBody` (was `Parse("empty response body")`) rather
+  than a misleading `Unauthorized`. The auto-skew retry stays gated on
+  auth-class failures. 0.x minor: `ClientError` gains a variant.
 - **Connection-error log level for client-side protocol noise.** Empty
   connections (port probes), non-SOAP HTTP clients, and malformed
   headers surfaced as `error` in the accept loop; they are a `warn`
