@@ -11,6 +11,15 @@ are released out of band.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Connection-error log level for client-side protocol noise.** Empty
+  connections (port probes), non-SOAP HTTP clients, and malformed
+  headers surfaced as `error` in the accept loop; they are a `warn`
+  now. Genuine server faults keep the error level. (Reported as
+  mibee-eye-hub #2: 11 `Invalid XML: empty request` error lines in 44 h
+  were all probes.)
+
 ## [0.10.0] — 2026-10-16
 
 Profile audio visibility: `media::Profile` gains the audio source and

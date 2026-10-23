@@ -529,7 +529,16 @@ impl OnvifServer {
                     .await;
 
                     if let Err(e) = result {
-                        log::error!("onvif: connection error from {client_ip}: {e}");
+                        // Client-side protocol noise — empty connections
+                        // (port probes), non-SOAP HTTP clients, garbage
+                        // bytes — is not a server defect. Log it at warn
+                        // so journald keeps error for real failures
+                        // (mibee-eye-hub #2).
+                        let level = connection_error_level(&e);
+                        log::log!(
+                            level,
+                            "onvif: connection error from {client_ip}: {e}"
+                        );
                     }
                 });
             }
@@ -1087,6 +1096,16 @@ fn classify_request_route(
 // Minimal HTTP request reader
 // ---------------------------------------------------------------------------
 
+/// Log level for a per-connection failure. Malformed or empty requests
+/// are client-side noise (port probes, non-SOAP HTTP clients) — warn;
+/// everything else (internal errors, handler faults) stays error.
+fn connection_error_level(e: &OnvifError) -> log::Level {
+    match e {
+        OnvifError::InvalidXml(_) => log::Level::Warn,
+        _ => log::Level::Error,
+    }
+}
+
 /// Read one HTTP request: header section (capped at [`MAX_HEADER_BYTES`],
 /// may span multiple reads), then exactly `Content-Length` body bytes
 /// (capped at `cfg.max_body_bytes`). Returns
@@ -1581,6 +1600,34 @@ mod tests {
     use super::*;
     use crate::namespaces::SOAP_ENVELOPE;
     use crate::types::serialize_soap_response;
+
+    // ------------------------------------------------------------------
+    // Connection-error log classification (client noise vs real faults)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_connection_error_level_client_noise_is_warn() {
+        // Empty connections (port probes) and non-SOAP bytes are client
+        // noise — warn, never error (mibee-eye-hub #2).
+        for msg in ["empty request", "malformed HTTP headers", "garbage"] {
+            assert_eq!(
+                connection_error_level(&OnvifError::InvalidXml(msg.into())),
+                log::Level::Warn
+            );
+        }
+    }
+
+    #[test]
+    fn test_connection_error_level_server_faults_stay_error() {
+        assert_eq!(
+            connection_error_level(&OnvifError::Internal("read request: broken pipe".into())),
+            log::Level::Error
+        );
+        assert_eq!(
+            connection_error_level(&OnvifError::ActionNotSupported("tptz:Nope".into())),
+            log::Level::Error
+        );
+    }
 
     // ------------------------------------------------------------------
     // SOAP parsing
