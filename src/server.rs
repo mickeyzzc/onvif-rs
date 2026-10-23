@@ -535,10 +535,7 @@ impl OnvifServer {
                         // so journald keeps error for real failures
                         // (mibee-eye-hub #2).
                         let level = connection_error_level(&e);
-                        log::log!(
-                            level,
-                            "onvif: connection error from {client_ip}: {e}"
-                        );
+                        log::log!(level, "onvif: connection error from {client_ip}: {e}");
                     }
                 });
             }
