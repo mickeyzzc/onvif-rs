@@ -1,23 +1,31 @@
-# Documentation has moved
+# Documentation / 文档
 
-The topic manuals that previously lived under `docs/en/` and `docs/zh/`
-(configuration, the handler model, media, imaging, PTZ, discovery, security) now live in the MiBee documentation hub — the single source
-of truth for library manuals:
+All topic guides live **in this repository**, bilingual — this
+directory is the source of truth.
 
-> **https://www.mlsbs.top/docs/mibeelibs**
+**English (ONVIF Device server — Rust)**
 
-To change a manual, open a PR against the hub repo's `mibeelibs/`
-collection (review flow in its GOVERNANCE). This directory keeps only
-this redirect page.
+- [Configuration reference](en-US/onvif-rs-configuration.md)
+- [WS-Discovery: being findable](en-US/onvif-rs-discovery.md)
+- [Events (server side, pull-point)](en-US/onvif-rs-events.md)
+- [The action-handler model](en-US/onvif-rs-handlers.md)
+- [Imaging service: the ImagingParams seam](en-US/onvif-rs-imaging.md)
+- [Media service: profiles, stream URIs, snapshots](en-US/onvif-rs-media.md)
+- [PTZ service: the virtual PTZ state machine](en-US/onvif-rs-ptz.md)
+- [Quick start: a minimal ONVIF device](en-US/onvif-rs-quickstart.md)
+- [Authentication and hardening](en-US/onvif-rs-security.md)
 
----
+**中文**
 
-# 文档已迁移
+- [配置参考](zh-CN/onvif-rs-configuration.md)
+- [WS-Discovery：让设备可被发现](zh-CN/onvif-rs-discovery.md)
+- [事件（服务端，pull-point）](zh-CN/onvif-rs-events.md)
+- [动作 handler 模型](zh-CN/onvif-rs-handlers.md)
+- [成像服务：ImagingParams 接缝](zh-CN/onvif-rs-imaging.md)
+- [媒体服务：Profile、取流地址与快照](zh-CN/onvif-rs-media.md)
+- [PTZ 服务：虚拟云台状态机](zh-CN/onvif-rs-ptz.md)
+- [快速开始：最小 ONVIF 设备](zh-CN/onvif-rs-quickstart.md)
+- [认证与加固](zh-CN/onvif-rs-security.md)
 
-原 `docs/en/` 与 `docs/zh/` 下的分主题手册（配置、动作 handler、媒体服务、成像、虚拟云台、设备发现、安全）已迁移至
-MiBee 文档中心——库手册唯一真源：
-
-> **https://www.mlsbs.top/docs/mibeelibs**
-
-修改手册请向文档中心仓库的 `mibeelibs/` 集合提 PR（流程见该仓
-GOVERNANCE）。本目录仅保留此引导页。
+Cross-repository guide links point at the other repositories' own
+`docs/` directories on GitHub.
