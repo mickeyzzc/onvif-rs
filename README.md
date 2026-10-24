@@ -128,13 +128,11 @@ See [`examples/device_demo.rs`](examples/device_demo.rs) for the complete wiring
 
 ## Documentation
 
-Topic guides now live in the MiBee documentation hub — the single
-source of truth for library manuals, bilingual:
-
-> **https://www.mlsbs.top/docs/mibeelibs**
-
-Manual changes go there by PR (review flow in the hub repo's GOVERNANCE).
-[`docs/README.md`](docs/README.md) keeps the redirect.
+Topic guides live **in this repository**, bilingual:
+[`docs/README.md`](docs/README.md) is the index (`docs/en-US/` and
+`docs/zh-CN/` hold the pages — quickstart, architecture, protocol
+concepts, CLI manuals, testing). Fixes and new pages land
+here by PR.
 ## Library hygiene (v0.3.0 hardening)
 
 v0.3.0 made the crate safe to embed as a neutral foundation library. The regression tests in [`tests/library_hygiene.rs`](tests/library_hygiene.rs) and [`tests/server_lifecycle.rs`](tests/server_lifecycle.rs) pin each guarantee:

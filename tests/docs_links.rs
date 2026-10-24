@@ -127,25 +127,34 @@ fn readme_indexes_stay_single_language() {
     }
 }
 
-/// Pins the post-migration contract (mibee-docs#6): `docs/` is exactly one
-/// redirect page linking the documentation hub.
+/// Pins the self-contained-docs contract (2026-10-24 policy): `docs/`
+/// holds the bilingual manual set plus its index — the external-hub
+/// redirect is gone for good, and the dead docs-site domain must never
+/// reappear anywhere under `docs/`.
 #[test]
-fn docs_is_single_redirect_page() {
+fn docs_are_in_repo() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut entries: Vec<_> = fs::read_dir(root.join("docs"))
-        .expect("read docs/")
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    entries.sort();
-    assert_eq!(
-        entries,
-        vec!["README.md".to_string()],
-        "docs/ must contain only the redirect README.md"
-    );
-    let raw = fs::read_to_string(root.join("docs/README.md")).expect("read docs/README.md");
-    assert!(
-        raw.contains("https://www.mlsbs.top/docs/mibeelibs"),
-        "docs/README.md must link the documentation hub"
-    );
+    for lang in ["en-US", "zh-CN"] {
+        let pages: Vec<_> = fs::read_dir(root.join("docs").join(lang))
+            .unwrap_or_else(|_| panic!("docs/{lang} must exist"))
+            .flatten()
+            .collect();
+        assert!(!pages.is_empty(), "docs/{lang} must hold manual pages");
+    }
+    fn assert_no_dead_domain(dir: &Path) {
+        for entry in fs::read_dir(dir).expect("read docs dir").flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                assert_no_dead_domain(&p);
+                continue;
+            }
+            let raw = fs::read_to_string(&p).unwrap_or_default();
+            assert!(
+                !raw.contains("mlsbs.top"),
+                "{} references the dead docs-site domain",
+                p.display()
+            );
+        }
+    }
+    assert_no_dead_domain(&root.join("docs"));
 }
