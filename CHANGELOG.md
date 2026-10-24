@@ -11,6 +11,27 @@ are released out of band.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-10-24
+
+The auth-ladder parity package (onvif-go #140/#141 port) plus log-noise
+fixes.
+
+- `fix(client)` **auth fallback ladder advances past empty 200 bodies**
+  (onvif-go #140 port): old firmwares answer a rejected WS-Security
+  digest with HTTP 200 + empty body — no 401, no fault — which stranded
+  the ladder on the first rung. Empty bodies now advance the ladder;
+  classification keeps them non-auth, so an exhausted ladder surfaces
+  the new `ClientError::EmptyBody` (was `Parse("empty response body")`)
+  instead of a misleading `Unauthorized`. Auto-skew stays gated on
+  auth-class failures. 0.x minor: the enum gains a variant.
+- `fix(server)` **client-protocol noise logs at warn, not error**
+  (#75): port probes and non-SOAP bytes are warn; real faults stay
+  error (mibee-eye-hub #2).
+- `fix(examples)` **ptz_demo serve mode works again** (#76): hold the
+  server handle (v0.3.0 handle semantics dropped it instantly) and keep
+  the motion ticker live in serve mode — the example doubles as the
+  zero-procurement ONVIF PTZ head.
+
 ### Fixed
 
 - **Auth fallback ladder advances past empty 200 bodies (onvif-go #140
