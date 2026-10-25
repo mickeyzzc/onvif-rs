@@ -128,9 +128,10 @@ fn readme_indexes_stay_single_language() {
 }
 
 /// Pins the self-contained-docs contract (2026-10-24 policy): `docs/`
-/// holds the bilingual manual set plus its index — the external-hub
-/// redirect is gone for good, and the dead docs-site domain must never
-/// reappear anywhere under `docs/`.
+/// holds the bilingual manual set plus its index, and every URL under
+/// `docs/` must point at an allowlisted host — the project's own hosting
+/// and the standards bodies it cites; any external docs-site pointer
+/// fails the build, whatever domain it uses.
 #[test]
 fn docs_are_in_repo() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -141,20 +142,72 @@ fn docs_are_in_repo() {
             .collect();
         assert!(!pages.is_empty(), "docs/{lang} must hold manual pages");
     }
-    fn assert_no_dead_domain(dir: &Path) {
+    fn assert_links_self_contained(dir: &Path) {
         for entry in fs::read_dir(dir).expect("read docs dir").flatten() {
             let p = entry.path();
             if p.is_dir() {
-                assert_no_dead_domain(&p);
+                assert_links_self_contained(&p);
                 continue;
             }
             let raw = fs::read_to_string(&p).unwrap_or_default();
-            assert!(
-                !raw.contains("mlsbs.top"),
-                "{} references the dead docs-site domain",
-                p.display()
-            );
+            for host in url_hosts(&raw) {
+                assert!(
+                    docs_host_allowed(&host),
+                    "{} links to non-allowlisted host {host:?} — docs must be self-contained",
+                    p.display()
+                );
+            }
         }
     }
-    assert_no_dead_domain(&root.join("docs"));
+    assert_links_self_contained(&root.join("docs"));
+}
+
+/// Hosts documentation may link to (project hosting + standards bodies).
+const DOCS_ALLOWED_HOSTS: &[&str] = &[
+    "github.com",
+    "onvif.org",
+    "www.onvif.org",
+    "w3.org",
+    "www.w3.org",
+    "pkg.go.dev",
+];
+
+/// Admits the example endpoint placeholders that appear in usage snippets
+/// (LAN IPs, literal "host") — these are not real hosts.
+fn docs_host_allowed(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    DOCS_ALLOWED_HOSTS.contains(&h.as_str())
+        || h == "host"
+        || h == "localhost"
+        || h.starts_with("192.168.")
+}
+
+/// Extracts the host of every http(s) URL in the text. Other schemes
+/// (`rtsp://` and friends) are not documentation pointers.
+fn url_hosts(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while let Some(idx) = text[i..].find("://") {
+        let abs = i + idx;
+        let mut s = abs;
+        while s > 0 && bytes[s - 1].is_ascii_alphabetic() {
+            s -= 1;
+        }
+        let scheme = &text[s..abs];
+        if scheme == "http" || scheme == "https" {
+            let after = &text[abs + 3..];
+            let host: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+                .collect();
+            if !host.is_empty() {
+                out.push(host);
+            }
+            i = abs + 3;
+        } else {
+            i = abs + 1;
+        }
+    }
+    out
 }
