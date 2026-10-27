@@ -680,6 +680,13 @@ impl SoapClient {
     /// The envelope for one auth mode: UsernameToken (digest or cleartext)
     /// in the SOAP header; nothing for HTTP Basic (the transport header
     /// carries it) and None.
+    ///
+    /// Canonical compact wire form: `s:`-prefixed Envelope/Header/Body and
+    /// the operation element's namespace declarations hoisted onto
+    /// `s:Body`. The default-namespace form is semantically equivalent but
+    /// strict parsers in old camera firmware answer HTTP 200 with an empty
+    /// body (onvif-go #150 / MiBeeNvr#1074 has the packet-capture matrix:
+    /// compact + prefix + hoisting must all hold).
     fn build_envelope_for_mode(&self, body_xml: &str, mode: auth::AuthMode) -> String {
         let header = match (mode, self.credentials()) {
             (auth::AuthMode::PasswordDigest, Some((u, p))) => {
@@ -688,12 +695,66 @@ impl SoapClient {
             (auth::AuthMode::PasswordText, Some((u, p))) => username_token_text_xml(&u, &p),
             _ => String::new(),
         };
-        format!("<Envelope xmlns=\"{SOAP_ENVELOPE}\">{header}<Body>{body_xml}</Body></Envelope>")
+        let (inner, decls) = hoist_namespace_decls(body_xml);
+        let body_attrs = if decls.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", decls.join(" "))
+        };
+        format!(
+            "<s:Envelope xmlns:s=\"{SOAP_ENVELOPE}\">{header}\
+             <s:Body{body_attrs}>{inner}</s:Body></s:Envelope>"
+        )
     }
 
     pub(crate) fn has_credentials(&self) -> bool {
         matches!(&self.username, Some(u) if !u.is_empty())
     }
+}
+
+/// Strip the root element's `xmlns="…"` and `xmlns:p="…"` declarations from
+/// a body fragment and return them as complete attribute strings for
+/// re-declaration on an ancestor (`s:Body` — a prefixed element whose
+/// default namespace stays free, so un-prefixed children inherit it).
+/// Attribute values in these fragments are namespace URLs (never
+/// containing an unescaped quote), which makes scanning to the closing
+/// quote unambiguous; a non-namespace attribute or unexpected shape falls
+/// through and leaves the fragment untouched (still well-formed XML, just
+/// not hoisted).
+fn hoist_namespace_decls(fragment: &str) -> (String, Vec<String>) {
+    let end = fragment.find('>').unwrap_or(fragment.len());
+    let mut tag = fragment[..end].to_string();
+    let rest = &fragment[end..];
+    let mut decls = Vec::new();
+    let mut i = 0;
+    while i < tag.len() {
+        let Some(rel) = tag[i..].find(" xmlns") else {
+            break;
+        };
+        let start = i + rel + 1; // attribute name starts after the space
+        let Some(eq_rel) = tag[start..].find('=') else {
+            break;
+        };
+        let eq = start + eq_rel;
+        let name = &tag[start..eq];
+        if name == "xmlns" || name.starts_with("xmlns:") {
+            let open = eq + 1; // fragments are assembled as xmlns="…", no space
+            if tag.as_bytes().get(open) != Some(&b'"') {
+                break;
+            }
+            let Some(cl_rel) = tag[open + 1..].find('"') else {
+                break;
+            };
+            let close = open + 1 + cl_rel;
+            decls.push(tag[start..=close].to_string());
+            // Drop the declaration together with its preceding space.
+            tag.replace_range(start - 1..=close, "");
+            i = start - 1;
+        } else {
+            i = eq; // a different attribute; keep scanning after its name
+        }
+    }
+    (format!("{tag}{rest}"), decls)
 }
 
 /// Split an HTTP/1.1 response into (status, body), de-chunking when the
@@ -921,12 +982,13 @@ pub(crate) fn username_token_digest_xml(
     let digest = crate::auth::compute_password_digest(&nonce_b64, &created, password);
 
     format!(
-        "<Header><Security xmlns=\"{WSSE_NS}\"><UsernameToken xmlns:wsu=\"{WSU_NS}\">\
-         <Username>{username}</Username>\
-         <Password Type=\"{PASSWORD_DIGEST_TYPE}\">{digest}</Password>\
-         <Nonce EncodingType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary\">{nonce_b64}</Nonce>\
-         <Created xmlns=\"{WSU_NS}\">{created}</Created>\
-         </UsernameToken></Security></Header>"
+        "<s:Header><wsse:Security xmlns:wsse=\"{WSSE_NS}\" xmlns:wsu=\"{WSU_NS}\">\
+         <wsse:UsernameToken>\
+         <wsse:Username>{username}</wsse:Username>\
+         <wsse:Password Type=\"{PASSWORD_DIGEST_TYPE}\">{digest}</wsse:Password>\
+         <wsse:Nonce EncodingType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary\">{nonce_b64}</wsse:Nonce>\
+         <wsu:Created>{created}</wsu:Created>\
+         </wsse:UsernameToken></wsse:Security></s:Header>"
     )
 }
 
@@ -934,10 +996,11 @@ pub(crate) fn username_token_digest_xml(
 /// firmware fallback.
 pub(crate) fn username_token_text_xml(username: &str, password: &str) -> String {
     format!(
-        "<Header><Security xmlns=\"{WSSE_NS}\"><UsernameToken xmlns:wsu=\"{WSU_NS}\">\
-         <Username>{username}</Username>\
-         <Password Type=\"{PASSWORD_TEXT_TYPE}\">{password}</Password>\
-         </UsernameToken></Security></Header>"
+        "<s:Header><wsse:Security xmlns:wsse=\"{WSSE_NS}\" xmlns:wsu=\"{WSU_NS}\">\
+         <wsse:UsernameToken>\
+         <wsse:Username>{username}</wsse:Username>\
+         <wsse:Password Type=\"{PASSWORD_TEXT_TYPE}\">{password}</wsse:Password>\
+         </wsse:UsernameToken></wsse:Security></s:Header>"
     )
 }
 
@@ -946,6 +1009,67 @@ const PASSWORD_TEXT_TYPE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-2
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Canonical compact wire form (onvif-go #150 twin): s:-prefixed
+    /// envelope, wsse:/wsu: header, operation namespace hoisted onto s:Body,
+    /// no inter-element whitespace.
+    #[test]
+    fn envelope_wire_form_canonical() {
+        let c = SoapClient::new("http://192.168.62.1:80/onvif/device_service")
+            .expect("client")
+            .with_credentials("admin", "secret");
+        let body =
+            "<GetProfiles xmlns=\"http://www.onvif.org/ver10/media/wsdl\"><token/></GetProfiles>";
+        let env = c.build_envelope_for_mode(body, auth::AuthMode::PasswordText);
+        assert!(
+            env.starts_with(
+                "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\"><s:Header>"
+            ),
+            "{env}"
+        );
+        assert!(env.contains("<wsse:Security xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\" xmlns:wsu="), "{env}");
+        assert!(
+            env.contains("<wsse:Username>admin</wsse:Username>"),
+            "{env}"
+        );
+        // Namespace hoisted off the operation element onto s:Body.
+        assert!(
+            env.contains("<s:Body xmlns=\"http://www.onvif.org/ver10/media/wsdl\"><GetProfiles><token/></GetProfiles></s:Body>"),
+            "{env}"
+        );
+        assert!(env.ends_with("</s:Body></s:Envelope>"), "{env}");
+        assert!(!env.contains("\n"), "compact, no whitespace: {env}");
+    }
+
+    #[test]
+    fn hoist_namespace_decls_variants() {
+        // default ns hoisted
+        let (inner, d) = hoist_namespace_decls(
+            "<GetProfiles xmlns=\"http://www.onvif.org/ver10/media/wsdl\"><x/></GetProfiles>",
+        );
+        assert_eq!(
+            d,
+            vec!["xmlns=\"http://www.onvif.org/ver10/media/wsdl\"".to_string()]
+        );
+        assert_eq!(inner, "<GetProfiles><x/></GetProfiles>");
+        // prefixed ns hoisted, other attribute kept
+        let (inner, d) = hoist_namespace_decls(
+            "<tr2:GetProfiles xmlns:tr2=\"http://www.onvif.org/ver20/media/wsdl\" Token=\"1\"/>",
+        );
+        assert_eq!(
+            d,
+            vec!["xmlns:tr2=\"http://www.onvif.org/ver20/media/wsdl\"".to_string()]
+        );
+        assert_eq!(inner, "<tr2:GetProfiles Token=\"1\"/>");
+        // both forms together
+        let (inner, d) = hoist_namespace_decls("<a xmlns=\"urn:x\" xmlns:p=\"urn:p\"/>");
+        assert_eq!(d.len(), 2);
+        assert_eq!(inner, "<a/>");
+        // nothing to hoist stays verbatim
+        let (inner, d) = hoist_namespace_decls("<Plain/>");
+        assert_eq!(inner, "<Plain/>");
+        assert!(d.is_empty());
+    }
 
     #[test]
     fn xs_duration_matches_go_twin() {
