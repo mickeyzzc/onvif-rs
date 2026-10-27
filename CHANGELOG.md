@@ -11,6 +11,19 @@ are released out of band.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-27
+
+### Changed
+
+- **SOAP requests use the canonical compact wire form** (onvif-go #150
+  twin): `s:`-prefixed Envelope/Header/Body, compact output, operation
+  namespace declarations hoisted onto `s:Body`, and WS-Security
+  UsernameToken headers in the conventional `wsse:`/`wsu:` prefixes with
+  both declarations on `wsse:Security`. The previous default-namespace
+  form was semantically equivalent but is rejected by strict parsers in
+  old camera firmware, which answer HTTP 200 with an empty body
+  (MiBeeNvr#1074). Response parsing is local-name tolerant and unchanged.
+
 ## [0.11.0] — 2026-10-24
 
 The auth-ladder parity package (onvif-go #140/#141 port) plus log-noise
