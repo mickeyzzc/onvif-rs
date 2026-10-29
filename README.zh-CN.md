@@ -5,7 +5,7 @@
 [![CI](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
-![Tests](https://img.shields.io/badge/tests-188%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-672%20passing-brightgreen.svg)
 
 **ONVIF 设备端（服务端）Rust 库** —— 通过 SOAP + WS-Discovery 把摄像头或媒体源暴露给 ONVIF 消费方（NVR、视频管理平台）。
 
@@ -35,8 +35,8 @@
 
 ```toml
 [dependencies]
-onvif-device-rs = "0.3.0"
-# git 替代方式: onvif-device-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.3.0" }
+onvif-device-rs = "0.12"
+# git 替代方式: onvif-device-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.12.0" }
 ```
 
 ```rust,no_run
@@ -129,8 +129,10 @@ async fn main() -> anyhow::Result<()> {
 
 主题手册**就在本仓库内**，双语：
 [`docs/README.md`](docs/README.md) 是索引（`docs/en-US/` 与
-`docs/zh-CN/` 存放各页——快速开始、架构、协议概念、CLI 手册、测试）。
-修订与新页以 PR 落本仓。
+`docs/zh-CN/` 存放各页——快速开始、配置、发现、事件、媒体、PTZ、
+imaging、安全、处理器模型）。修订与新页以 PR 落本仓。本 crate 不附带
+CLI——运维/诊断命令用 [Go 孪生库](https://github.com/mickeyzzc/onvif-go)
+的 `onvif` CLI（discover/quick/diagnostics/server 四子命令，预编译多平台）。
 ## 库卫生（v0.3.0 加固）
 
 v0.3.0 把本 crate 打磨为可放心嵌入的中性基础库。[`tests/library_hygiene.rs`](tests/library_hygiene.rs) 与 [`tests/server_lifecycle.rs`](tests/server_lifecycle.rs) 中的回归测试逐条锁定以下保证：
@@ -175,7 +177,7 @@ MiBee NVR 这类消费方按本地元素名在原始字节流上匹配 SOAP 响�
 
 ## 开发
 
-本项目严格执行 **TDD**，见 [CONTRIBUTING.md](CONTRIBUTING.md)。CI 强制 `rustfmt`、`clippy -D warnings` 与全量测试（157 个，含 golden 响应串）；`main` 分支受保护（仅 PR 合入，CI 必过）。
+本项目严格执行 **TDD**，见 [CONTRIBUTING.md](CONTRIBUTING.md)。CI 强制 `rustfmt`、`clippy -D warnings` 与全量测试（672 个，含 golden 响应串）；`main` 分支受保护（仅 PR 合入，CI 必过）。
 
 ## 状态
 
