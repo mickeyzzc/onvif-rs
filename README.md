@@ -5,7 +5,7 @@
 [![CI](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/onvif-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
-![Tests](https://img.shields.io/badge/tests-188%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-672%20passing-brightgreen.svg)
 
 ONVIF **Device (server)** library for Rust — expose a camera or media source to ONVIF consumers (NVRs, video management systems) over SOAP + WS-Discovery.
 
@@ -35,8 +35,8 @@ Extracted from the production implementation in [mibee-eye-raspi-rs](https://git
 
 ```toml
 [dependencies]
-onvif-device-rs = "0.3.0"
-# git alternative: onvif-device-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.3.0" }
+onvif-device-rs = "0.12"
+# git alternative: onvif-device-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.12.0" }
 ```
 
 ```rust,no_run
@@ -130,9 +130,12 @@ See [`examples/device_demo.rs`](examples/device_demo.rs) for the complete wiring
 
 Topic guides live **in this repository**, bilingual:
 [`docs/README.md`](docs/README.md) is the index (`docs/en-US/` and
-`docs/zh-CN/` hold the pages — quickstart, architecture, protocol
-concepts, CLI manuals, testing). Fixes and new pages land
-here by PR.
+`docs/zh-CN/` hold the pages — quickstart, configuration, discovery,
+events, media, PTZ, imaging, security, the handlers model). Fixes and
+new pages land here by PR. This crate ships no CLI — for ops/diagnostic
+commands use the [Go twin's](https://github.com/mickeyzzc/onvif-go)
+`onvif` CLI (discover/quick/diagnostics/server subcommands, prebuilt for
+multiple platforms).
 ## Library hygiene (v0.3.0 hardening)
 
 v0.3.0 made the crate safe to embed as a neutral foundation library. The regression tests in [`tests/library_hygiene.rs`](tests/library_hygiene.rs) and [`tests/server_lifecycle.rs`](tests/server_lifecycle.rs) pin each guarantee:
