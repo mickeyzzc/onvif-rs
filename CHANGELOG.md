@@ -11,6 +11,22 @@ are released out of band.
 
 ## [Unreleased]
 
+### Added
+
+- **Thermal Service `RadiometryAlarm` parsing** (onvif-go #159 twin): the
+  `client::radiometry` module recognizes `tns1:Thermal/RadiometryAlarm`
+  plus RuleEngine-qualified vendor variants (case-insensitive,
+  namespace-prefix blind, exact path match) and lifts the
+  fire/over-temperature verdict — `parse_radiometry_alarm` /
+  `is_radiometry_topic`. The state is read from the Data slot only:
+  `Active` (spec shape) first, `State` accepted as vendor variance, when
+  both are present `Active` wins. The optional numeric `Temperature`
+  Data item (°C) surfaces on the struct; missing or unparseable reads as
+  0. Source follows the same rules as the motion topics. Consumers with
+  a Pull-Point subscription already receive radiometry notifications
+  today (the subscription is topic-agnostic); only the parsing was
+  missing.
+
 ## [0.12.0] — 2026-10-27
 
 ### Changed
