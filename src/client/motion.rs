@@ -35,7 +35,7 @@ fn motion_state_key(topic: &str) -> Option<&'static str> {
 
 /// Lower-case a topic path and drop every segment's namespace prefix, so
 /// `tns1:`, `tnsalias:` and vendor prefixes all compare equal.
-fn normalize_topic(topic: &str) -> String {
+pub(super) fn normalize_topic(topic: &str) -> String {
     topic
         .trim()
         .split('/')
@@ -92,7 +92,7 @@ pub fn parse_motion_alarm(msg: &NotificationMessage) -> Option<MotionAlarm> {
     })
 }
 
-fn item_value(items: &[super::notify::SimpleItem], name: &str) -> Option<String> {
+pub(super) fn item_value(items: &[super::notify::SimpleItem], name: &str) -> Option<String> {
     items
         .iter()
         .find(|i| i.name == name)

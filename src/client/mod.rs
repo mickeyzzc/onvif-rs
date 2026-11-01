@@ -59,6 +59,7 @@ pub mod motion;
 pub mod notify;
 pub mod ptz;
 pub mod push;
+pub mod radiometry;
 pub mod security;
 pub mod time;
 
