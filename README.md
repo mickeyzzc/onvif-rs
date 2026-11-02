@@ -36,7 +36,7 @@ Extracted from the production implementation in [mibee-eye-raspi-rs](https://git
 ```toml
 [dependencies]
 onvif-device-rs = "0.12"
-# git alternative: onvif-device-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.12.0" }
+# git alternative: onvif-device-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.12.1" }
 ```
 
 ```rust,no_run
