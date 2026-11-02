@@ -11,6 +11,20 @@ are released out of band.
 
 ## [Unreleased]
 
+### Added
+
+- **`GetMetadataUri` on both media faces** (onvif-go #162 twin): the
+  Media service answers `GetMetadataUri` with the deterministic
+  `rtsp://<ip>:<rtsp_port><metadata_path>` — a new
+  `OnvifMediaConfig::metadata_path` (default `/metadata`, documented
+  next to `stream_path`) — and the tr2 Media2 face (the Profile-T entry
+  path) dispatches it as a plain `tr2:GetMetadataUriResponse` URI. The
+  SOAP discovery half only: serving the RTP/XML metadata frames stays
+  the host's business (their own RTSP stack), the same split the events
+  service uses. Unblocks end-to-end metadata-stream (Profile T) tests —
+  e.g. thermal temperature readings (onvif-go #158 phase 3) — without
+  any physical device.
+
 ## [0.12.1] — 2026-11-02
 
 ### Added
