@@ -11,6 +11,8 @@ are released out of band.
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-11-02
+
 ### Added
 
 - **Thermal Service `RadiometryAlarm` parsing** (onvif-go #159 twin): the

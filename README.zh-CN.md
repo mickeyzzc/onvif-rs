@@ -36,7 +36,7 @@
 ```toml
 [dependencies]
 onvif-device-rs = "0.12"
-# git 替代方式: onvif-device-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.12.0" }
+# git 替代方式: onvif-device-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", tag = "v0.12.1" }
 ```
 
 ```rust,no_run
