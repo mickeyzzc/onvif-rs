@@ -155,6 +155,11 @@ pub struct OnvifMediaConfig {
     /// (e.g. notebook-cam's `/live/{camera_id}`) set this so the advertised
     /// URI actually resolves.
     pub stream_path: String,
+    /// RTSP URL path returned by GetMetadataUri (default `/metadata`) —
+    /// the Profile-T metadata-stream discovery half (onvif-go #162 twin).
+    /// Serving the RTP/XML frames stays the host's business; this only
+    /// advertises where their harness serves them.
+    pub metadata_path: String,
     /// HTTP port of the host's JPEG snapshot endpoint, advertised by
     /// GetSnapshotUri (parameterless form, mirroring onvif-go's
     /// `SnapshotURIParameterless`). `0` disables the feature — GetSnapshotUri
@@ -202,6 +207,7 @@ impl OnvifMediaConfig {
             rtsp_port,
             device_ip,
             stream_path: "/stream".to_string(),
+            metadata_path: "/metadata".to_string(),
             snapshot_port: 0,
             snapshot_path: "/snapshot.jpg".to_string(),
             profile_token: "main".to_string(),
@@ -560,6 +566,45 @@ impl OnvifActionHandler for GetSnapshotUriHandler {
 /// Build the GetSnapshotUri response for `config` — shared by the
 /// standalone [`GetSnapshotUriHandler`] and the store-backed
 /// registration path (byte-identical output, issue #48).
+/// GetMetadataUri (onvif-go #162 twin): the deterministic metadata URI —
+/// `rtsp://<server ip>:<rtsp_port><metadata_path>`. The profile token is
+/// parsed for wire tolerance; the metadata track is the camera's single
+/// primary path (extra profiles carry their own stream paths, not
+/// metadata paths).
+fn build_get_metadata_uri_response(
+    config: &OnvifMediaConfig,
+    body: &str,
+    request_info: &RequestInfo,
+) -> Result<String, OnvifError> {
+    let _ = parse_profile_token(body);
+    let ip = resolve_server_ip(&request_info.server_ip, &config.device_ip);
+    let uri = format!("rtsp://{}:{}{}", ip, config.rtsp_port, config.metadata_path);
+
+    let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+    writer
+        .write_event(Event::Start(BytesStart::new("GetMetadataUriResponse")))
+        .unwrap_or_default();
+
+    writer
+        .write_event(Event::Start(BytesStart::new("MediaUri")))
+        .unwrap_or_default();
+    write_text_element(&mut writer, "Uri", &uri);
+    write_text_element(&mut writer, "InvalidAfterConnect", "false");
+    write_text_element(&mut writer, "InvalidAfterReboot", "false");
+    write_text_element(&mut writer, "Timeout", "PT0S");
+    writer
+        .write_event(Event::End(BytesEnd::new("MediaUri")))
+        .unwrap_or_default();
+
+    writer
+        .write_event(Event::End(BytesEnd::new("GetMetadataUriResponse")))
+        .unwrap_or_default();
+
+    let body = String::from_utf8(writer.into_inner())
+        .map_err(|e| OnvifError::Internal(format!("non-UTF-8 output from XML writer: {e}")))?;
+    Ok(serialize_soap_response(&body))
+}
+
 fn build_get_snapshot_uri_response(
     config: &OnvifMediaConfig,
     request_info: &RequestInfo,
@@ -1275,6 +1320,10 @@ struct StoreGetStreamUriHandler {
     config: SharedMediaConfig,
 }
 
+struct StoreGetMetadataUriHandler {
+    config: SharedMediaConfig,
+}
+
 struct StoreGetSnapshotUriHandler {
     config: SharedMediaConfig,
 }
@@ -1294,6 +1343,13 @@ impl OnvifActionHandler for StoreGetProfilesHandler {
 impl OnvifActionHandler for StoreGetStreamUriHandler {
     async fn handle(&self, body: &str, request_info: &RequestInfo) -> Result<String, OnvifError> {
         build_get_stream_uri_response(&read_config(&self.config), body, request_info)
+    }
+}
+
+#[async_trait]
+impl OnvifActionHandler for StoreGetMetadataUriHandler {
+    async fn handle(&self, body: &str, request_info: &RequestInfo) -> Result<String, OnvifError> {
+        build_get_metadata_uri_response(&read_config(&self.config), body, request_info)
     }
 }
 
@@ -1350,6 +1406,12 @@ pub fn register_media_actions(
     server.register_handler(
         "GetStreamUri",
         Box::new(StoreGetStreamUriHandler {
+            config: Arc::clone(&config),
+        }),
+    );
+    server.register_handler(
+        "GetMetadataUri",
+        Box::new(StoreGetMetadataUriHandler {
             config: Arc::clone(&config),
         }),
     );
@@ -1425,6 +1487,7 @@ mod tests {
     fn test_config() -> Arc<OnvifMediaConfig> {
         Arc::new(OnvifMediaConfig {
             stream_path: "/stream".to_string(),
+            metadata_path: "/metadata".to_string(),
             snapshot_port: 0,
             snapshot_path: "/snapshot.jpg".to_string(),
             profile_token: "main".to_string(),
@@ -1530,6 +1593,7 @@ mod tests {
     async fn test_get_stream_uri_honors_custom_stream_path() {
         let config = Arc::new(OnvifMediaConfig {
             stream_path: "/live/cam-42".to_string(),
+            metadata_path: "/metadata".to_string(),
             snapshot_port: 0,
             snapshot_path: "/snapshot.jpg".to_string(),
             profile_token: "main".to_string(),
@@ -1550,6 +1614,39 @@ mod tests {
         assert!(
             result.contains("rtsp://192.168.1.10:8554/live/cam-42"),
             "custom stream path must be advertised, got: {result}"
+        );
+    }
+
+    /// GetMetadataUri (onvif-go #162 twin): default path, custom path, and
+    /// per-request IP — the discovery half of the Profile-T metadata stream.
+    #[tokio::test]
+    async fn test_get_metadata_uri_paths() {
+        let handler = StoreGetMetadataUriHandler {
+            config: Arc::new(std::sync::RwLock::new((*test_config()).clone())),
+        };
+        let result = handler
+            .handle(
+                "<GetMetadataUri><ProfileToken>main</ProfileToken></GetMetadataUri>",
+                &req_info("192.168.1.10"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.contains("rtsp://192.168.1.10:8554/metadata"),
+            "default metadata path must be advertised, got: {result}"
+        );
+        assert!(result.contains("GetMetadataUriResponse"), "{result}");
+        assert!(result.contains("<Uri>"), "{result}");
+
+        let mut base = (*test_config()).clone();
+        base.metadata_path = "/cameralab/meta".to_string();
+        let handler = StoreGetMetadataUriHandler {
+            config: Arc::new(std::sync::RwLock::new(base)),
+        };
+        let result = handler.handle("", &req_info("10.0.0.5")).await.unwrap();
+        assert!(
+            result.contains("rtsp://10.0.0.5:8554/cameralab/meta"),
+            "custom metadata path must be advertised, got: {result}"
         );
     }
 

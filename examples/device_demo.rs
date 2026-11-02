@@ -280,6 +280,7 @@ async fn main() -> Result<()> {
     }
 
     let media = Arc::new(OnvifMediaConfig {
+        metadata_path: "/metadata".to_string(),
         camera_width: 1280,
         camera_height: 720,
         camera_fps: 25,

@@ -645,6 +645,7 @@ impl Media2Service {
             "GetProfiles"
                 | "GetStreamUri"
                 | "GetSnapshotUri"
+                | "GetMetadataUri"
                 | "GetVideoEncoderConfigurations"
                 | "GetVideoEncoderConfiguration"
                 | "GetVideoEncoderConfigurationOptions"
@@ -700,6 +701,11 @@ impl Media2Service {
                 let config = read_config(&self.config);
                 let uri = snapshot_uri(&config, server_ip)?;
                 build_uri_response("tr2:GetSnapshotUriResponse", &uri)
+            }
+            "GetMetadataUri" => {
+                let config = read_config(&self.config);
+                let uri = metadata_uri(&config, server_ip);
+                build_uri_response("tr2:GetMetadataUriResponse", &uri)
             }
             "GetVideoEncoderConfigurations" => {
                 let config = read_config(&self.config);
@@ -830,6 +836,13 @@ fn stream_uri(config: &OnvifMediaConfig, body: &str, server_ip: &str) -> String 
         })
         .unwrap_or(&config.stream_path);
     format!("rtsp://{}:{}{}", ip, config.rtsp_port, stream_path)
+}
+
+/// The metadata-stream URI (onvif-go #162 twin): the camera's single
+/// primary metadata path on the RTSP listener.
+fn metadata_uri(config: &OnvifMediaConfig, server_ip: &str) -> String {
+    let ip = resolve_server_ip(server_ip, &config.device_ip);
+    format!("rtsp://{}:{}{}", ip, config.rtsp_port, config.metadata_path)
 }
 
 /// The HTTP snapshot URI, honoring `snapshot_port` (0 = the feature is
@@ -1122,6 +1135,22 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(xml.matches("<tr2:Profiles ").count(), 0);
         assert!(xml.contains("GetProfilesResponse"));
+    }
+
+    /// GetMetadataUri (onvif-go #162 twin) on the tr2 face.
+    #[tokio::test]
+    async fn get_metadata_uri_metadata_path() {
+        let svc = Media2Service::new(multi_store(), None);
+        let out = svc
+            .handle_action(
+                "GetMetadataUri",
+                "<GetMetadataUri></GetMetadataUri>",
+                &req_ip(),
+            )
+            .await;
+        let xml = out.unwrap_or_default();
+        assert!(xml.contains("tr2:GetMetadataUriResponse"), "{xml}");
+        assert!(xml.contains("<tr2:Uri>rtsp://"), "{xml}");
     }
 
     #[tokio::test]
