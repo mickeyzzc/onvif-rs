@@ -13,6 +13,17 @@ are released out of band.
 
 ### Added
 
+- **`client`: Radiometry/TemperatureAlarm topic family (#158 phase 1,
+  field-verified)**: `parse_radiometry_alarm`/`is_radiometry_topic`
+  additionally recognize `tns1:Radiometry/TemperatureAlarm` and the
+  RuleEngine-qualified form, whose boolean Data item is `AlarmActive` — the
+  shape a real dual-spectrum camera emits (Hikvision DS-2TB2617-6/QA, fw
+  V5.5.38: Source VideoSourceToken, Key RadiometryModuleID, Data
+  AlarmActive + TimeStamp, no Temperature item). Fixtures derive from the
+  device's fixed topic set.
+
+### Added
+
 - **`GetMetadataUri` on both media faces** (onvif-go #162 twin): the
   Media service answers `GetMetadataUri` with the deterministic
   `rtsp://<ip>:<rtsp_port><metadata_path>` — a new
