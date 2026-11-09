@@ -25,10 +25,20 @@ pub struct RadiometryAlarm {
 /// The Data items that may carry each recognized topic's boolean state, in
 /// preference order: the spec shape is `Active`; `State` is accepted as
 /// vendor variance (the same leniency the motion topics need in the field).
+/// The Data items that may carry each recognized topic's boolean state, in
+/// preference order: the spec shape is `Active`; `State` is accepted as
+/// vendor variance (the same leniency the motion topics need in the field).
+/// The `TemperatureAlarm` family is the shape a real dual-spectrum camera
+/// emits (Hikvision DS-2TB2617-6/QA, fw V5.5.38 — field-verified 2026-11-09):
+/// topic `tns1:RuleEngine/Radiometry/TemperatureAlarm`, boolean Data item
+/// `AlarmActive`, Key `RadiometryModuleID`; its fixed topic set declares no
+/// Temperature item.
 fn radiometry_state_keys(topic: &str) -> Option<&'static [&'static str]> {
     match normalize_topic(topic).as_str() {
         "thermal/radiometryalarm" => Some(&["Active", "State"]),
         "ruleengine/thermal/radiometryalarm" => Some(&["Active", "State"]),
+        "radiometry/temperaturealarm" => Some(&["AlarmActive"]),
+        "ruleengine/radiometry/temperaturealarm" => Some(&["AlarmActive"]),
         _ => None,
     }
 }
@@ -108,6 +118,46 @@ mod tests {
         assert!(a.active);
         assert_eq!(a.temperature, 87.5);
         assert_eq!(a.source, "ThermalSource_1");
+    }
+
+    /// Field-verified on a Hikvision DS-2TB2617-6/QA (fw V5.5.38, 2026-11-09):
+    /// topic tns1:RuleEngine/Radiometry/TemperatureAlarm, Source
+    /// VideoSourceToken, Key RadiometryModuleID, Data AlarmActive +
+    /// TimeStamp (+ ElementItem AlarmGeoLocation) — no Temperature item.
+    #[test]
+    fn hikvision_temperature_alarm_shape() {
+        let m = msg(
+            "tns1:RuleEngine/Radiometry/TemperatureAlarm",
+            &[("Source", "VideoSource_2")],
+            &[
+                ("AlarmActive", "true"),
+                ("TimeStamp", "2026-11-09T12:00:00Z"),
+            ],
+        );
+        let a = parse_radiometry_alarm(&m).unwrap();
+        assert!(a.active);
+        assert_eq!(a.temperature, 0.0);
+        assert_eq!(a.source, "VideoSource_2");
+    }
+
+    #[test]
+    fn temperature_alarm_unqualified_variant_false_state() {
+        let m = msg(
+            "tns1:Radiometry/TemperatureAlarm",
+            &[],
+            &[("AlarmActive", "false")],
+        );
+        assert!(!parse_radiometry_alarm(&m).unwrap().active);
+    }
+
+    #[test]
+    fn temperature_alarm_without_alarm_active_is_none() {
+        let m = msg(
+            "tns1:RuleEngine/Radiometry/TemperatureAlarm",
+            &[],
+            &[("Active", "true")],
+        );
+        assert!(parse_radiometry_alarm(&m).is_none());
     }
 
     #[test]
