@@ -625,5 +625,5 @@ async fn subscribe_rejects_over_long_consumer_address() {
     .await;
     assert_ne!(status, 200, "over-long consumer must fault: {body}");
     assert!(body.contains("2048"), "fault must name the cap: {body}");
-    handle.shutdown();
+    let _ = handle.shutdown().await;
 }
