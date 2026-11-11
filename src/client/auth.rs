@@ -251,6 +251,10 @@ pub(crate) struct DigestChallengeParams {
     /// `auth` or empty (the challenge did not offer qop).
     pub(crate) qop: String,
     pub(crate) opaque: String,
+    /// The challenge `algorithm` (empty when absent). `SHA-256` selects the
+    /// RFC 7616 SHA-256 response — Hikvision SHA-256-capable firmware
+    /// rejects the MD5 response outright; anything else answers MD5.
+    pub(crate) algorithm: String,
 }
 
 /// Parse a `WWW-Authenticate` header value; None when it is not a Digest
@@ -267,6 +271,7 @@ pub(crate) fn parse_digest_challenge(header: &str) -> Option<DigestChallengePara
         nonce: quoted_param(params, "nonce")?,
         qop: quoted_param(params, "qop").unwrap_or_default(),
         opaque: quoted_param(params, "opaque").unwrap_or_default(),
+        algorithm: quoted_param(params, "algorithm").unwrap_or_default(),
     })
 }
 
@@ -297,6 +302,25 @@ fn quoted_param(params: &str, key: &str) -> Option<String> {
     }
 }
 
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest as ShaDigest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    let out = h.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Hash per the challenge algorithm: SHA-256 when the algorithm string says
+/// so (SHA-256-sess included — answered with the plain-SHA-256 formula, the
+/// same leniency as the Go twin), MD5 otherwise.
+fn digest_hash_hex(algorithm: &str, s: &str) -> String {
+    if algorithm.to_ascii_lowercase().contains("sha-256") {
+        sha256_hex(s)
+    } else {
+        md5_hex(s)
+    }
+}
+
 fn md5_hex(s: &str) -> String {
     use md5::{Digest as Md5Digest, Md5};
     let mut h = Md5::new();
@@ -305,9 +329,11 @@ fn md5_hex(s: &str) -> String {
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The MD5 `response` of the digest auth exchange (qop="auth" when the
-/// challenge offered it, the legacy RFC 2069 form otherwise).
-pub(crate) fn digest_response_md5(
+/// The `response` of the digest auth exchange (qop="auth" when the
+/// challenge offered it, the legacy RFC 2069 form otherwise). The hash
+/// follows the challenge `algorithm` — SHA-256 when demanded (RFC 7616,
+/// twin of onvif-go #172), MD5 otherwise.
+pub(crate) fn digest_response(
     username: &str,
     password: &str,
     method: &str,
@@ -316,15 +342,16 @@ pub(crate) fn digest_response_md5(
     nc_hex: &str,
     cnonce: &str,
 ) -> String {
-    let ha1 = md5_hex(&format!("{username}:{}:{password}", challenge.realm));
-    let ha2 = md5_hex(&format!("{method}:{uri}"));
+    let alg = challenge.algorithm.as_str();
+    let ha1 = digest_hash_hex(alg, &format!("{username}:{}:{password}", challenge.realm));
+    let ha2 = digest_hash_hex(alg, &format!("{method}:{uri}"));
     if challenge.qop.eq_ignore_ascii_case("auth") {
-        md5_hex(&format!(
-            "{ha1}:{}:{nc_hex}:{cnonce}:auth:{ha2}",
-            challenge.nonce
-        ))
+        digest_hash_hex(
+            alg,
+            &format!("{ha1}:{}:{nc_hex}:{cnonce}:auth:{ha2}", challenge.nonce),
+        )
     } else {
-        md5_hex(&format!("{ha1}:{}:{ha2}", challenge.nonce))
+        digest_hash_hex(alg, &format!("{ha1}:{}:{ha2}", challenge.nonce))
     }
 }
 
@@ -342,6 +369,9 @@ pub(crate) fn build_digest_authorization(
         "Digest username=\"{username}\", realm=\"{}\", nonce=\"{}\", uri=\"{uri}\", response=\"{response}\"",
         challenge.realm, challenge.nonce
     );
+    if challenge.algorithm.to_ascii_lowercase().contains("sha-256") {
+        header.push_str(", algorithm=SHA-256");
+    }
     if challenge.qop.eq_ignore_ascii_case("auth") {
         header.push_str(&format!(
             ", opaque=\"{}\", qop=auth, nc={nc_hex}, cnonce=\"{cnonce}\"",
@@ -405,6 +435,7 @@ mod tests {
         assert_eq!(challenge.nonce, "n-1");
         assert_eq!(challenge.qop, "auth");
         assert_eq!(challenge.opaque, "op-1");
+        assert_eq!(challenge.algorithm, "MD5");
 
         // Case-insensitive scheme, unquoted params, no qop.
         let legacy =
@@ -431,8 +462,9 @@ mod tests {
             nonce: "dcd98b7102dd2f0e8b11d0f600bfb0c093".into(),
             qop: "auth".into(),
             opaque: String::new(),
+            algorithm: String::new(),
         };
-        let response = digest_response_md5(
+        let response = digest_response(
             "Mufasa",
             "Circle Of Life",
             "GET",
@@ -444,7 +476,7 @@ mod tests {
         assert_eq!(response, "6629fae49393a05397450978507c4ef1");
 
         // Legacy (no qop) form: response = MD5(HA1:nonce:HA2).
-        let legacy = digest_response_md5(
+        let legacy = digest_response(
             "Mufasa",
             "Circle Of Life",
             "GET",
@@ -459,6 +491,77 @@ mod tests {
         assert_eq!(legacy, "670fd8c2df070c60b045671b8b24ff02");
     }
 
+    /// RFC 7616 SHA-256: a challenge demanding algorithm=SHA-256 must hash
+    /// every leg with SHA-256 and declare the algorithm in the Authorization
+    /// header (twin of onvif-go #172 — Hikvision SHA-256-capable firmware
+    /// rejects the MD5 response outright). Vector computed independently
+    /// (python hashlib) with RFC 7616's example credentials.
+    #[test]
+    fn digest_response_sha256_vector() {
+        let challenge = DigestChallengeParams {
+            realm: "http-auth@example.org".into(),
+            nonce: "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v".into(),
+            qop: "auth".into(),
+            opaque: String::new(),
+            algorithm: "SHA-256".into(),
+        };
+        let response = digest_response(
+            "Mufasa",
+            "Circle Of Life",
+            "GET",
+            "/dir/index.html",
+            &challenge,
+            "00000001",
+            "f2/wE4q74E/OzAGUJyQnmzWcl1Xd5zTaP0JHDTdLGqc",
+        );
+        assert_eq!(
+            response,
+            "6860b04fd55703ede83da3c08ed8b2564188af1ed06369c52cac938722b3efe7"
+        );
+
+        // Legacy (no qop) SHA-256 form.
+        let legacy = digest_response(
+            "Mufasa",
+            "Circle Of Life",
+            "GET",
+            "/dir/index.html",
+            &DigestChallengeParams {
+                qop: String::new(),
+                ..challenge.clone()
+            },
+            "00000001",
+            "f2/wE4q74E/OzAGUJyQnmzWcl1Xd5zTaP0JHDTdLGqc",
+        );
+        assert_eq!(
+            legacy,
+            "6fb51d0febf2fc3470d629b6c819acecc928ee0c27e6b6d8aeffc93183d60192"
+        );
+
+        // The Authorization header declares the algorithm on the SHA-256 leg.
+        let authz = build_digest_authorization(
+            "Mufasa",
+            &challenge,
+            "/dir/index.html",
+            &response,
+            "00000001",
+            "f2/wE4q74E/OzAGUJyQnmzWcl1Xd5zTaP0JHDTdLGqc",
+        );
+        assert!(authz.contains("algorithm=SHA-256"), "{authz}");
+        // ...and does not on the MD5 default leg.
+        let md5_authz = build_digest_authorization(
+            "Mufasa",
+            &DigestChallengeParams {
+                algorithm: String::new(),
+                ..challenge
+            },
+            "/dir/index.html",
+            &response,
+            "00000001",
+            "f2/wE4q74E/OzAGUJyQnmzWcl1Xd5zTaP0JHDTdLGqc",
+        );
+        assert!(!md5_authz.contains("algorithm"), "{md5_authz}");
+    }
+
     #[test]
     fn digest_authorization_shape() {
         let challenge = DigestChallengeParams {
@@ -466,6 +569,7 @@ mod tests {
             nonce: "n-1".into(),
             qop: "auth".into(),
             opaque: "op-1".into(),
+            algorithm: String::new(),
         };
         let header = build_digest_authorization(
             "admin",
