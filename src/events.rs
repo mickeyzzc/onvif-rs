@@ -712,6 +712,18 @@ impl EventsService {
                     "Invalid Subscribe: a ConsumerReference/Address is required".to_string(),
                 )
             })?;
+        // Cap the consumer address length (twin of onvif-go #165): beyond
+        // ~2 KB no common intermediary can route the notification POST, and
+        // the failure was silent — notifications drop until the
+        // delivery-failure budget auto-unsubscribes. Fault at Subscribe
+        // time, with the cap named, so the subscriber learns immediately.
+        const MAX_CONSUMER_URL_BYTES: usize = 2048;
+        if consumer.len() > MAX_CONSUMER_URL_BYTES {
+            return Err(OnvifError::SenderFault(format!(
+                "Invalid Subscribe: consumer address exceeds {MAX_CONSUMER_URL_BYTES} bytes (got {}) — no intermediary can route it, notifications would silently drop",
+                consumer.len()
+            )));
+        }
         let target = parse_http_url(&consumer)?;
         let filter = parse_topic_filter(req.topic_expression.as_ref())?;
 

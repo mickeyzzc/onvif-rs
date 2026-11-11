@@ -607,3 +607,23 @@ async fn basic_subscriptions_share_the_cap_over_the_wire() {
 
     handle.shutdown().await.expect("shutdown");
 }
+
+/// A consumer address beyond the 2048-byte cap faults at Subscribe time
+/// with the cap named (twin of onvif-go #165): beyond ~2 KB no common
+/// intermediary can route the notification POST, and the failure was
+/// silent — notifications would drop until the failure budget
+/// auto-unsubscribed the session.
+#[tokio::test]
+async fn subscribe_rejects_over_long_consumer_address() {
+    let (port, _events, mut handle) = events_server().await;
+    let pad = "x".repeat(2100);
+    let (status, body, _) = basic_subscribe(
+        port,
+        &format!("http://127.0.0.1:1/notify?pad={pad}"),
+        "PT10M",
+    )
+    .await;
+    assert_ne!(status, 200, "over-long consumer must fault: {body}");
+    assert!(body.contains("2048"), "fault must name the cap: {body}");
+    handle.shutdown();
+}
