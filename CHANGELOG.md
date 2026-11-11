@@ -11,6 +11,24 @@ are released out of band.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`client`: abbreviated fault envelopes classify (twin of onvif-go #170)**:
+  fault shapes that hoist the code `Value` (and a bare `Text`) directly
+  under `Fault` — without the SOAP 1.2 `Code`/`Reason` wrappers — no longer
+  decode with an empty code/reason. The strict parent-pair capture keeps
+  whatever it finds (it already tolerated the `Subcode` grandparent); the
+  empty fields fall back to lenient local-name recovery (first `Value`
+  outside any `Subcode` = code, first inside = subcode, any `Text` =
+  reason), so a definitive `ter:NotAuthorized` rejection still classifies.
+- **`client`: RFC 7616 SHA-256 digest responses (twin of onvif-go #172)**:
+  the HTTP-digest ladder answers `algorithm=SHA-256` challenges with
+  SHA-256 legs (declared in the Authorization header) instead of
+  unconditionally hashing MD5 — Hikvision SHA-256-capable firmware rejects
+  the MD5 response outright. Multi-line challenges prefer the SHA-256
+  line; the MD5 default is unchanged (field-verified: the DS-2TB2617's own
+  challenge carries no algorithm line).
+
 ### Added
 
 - **`client`: Radiometry/TemperatureAlarm topic family (#158 phase 1,

@@ -528,29 +528,39 @@ impl SoapClient {
         }
 
         if mode == auth::AuthMode::HttpDigest {
-            // Answer a Digest challenge (RFC 7616 MD5 subset) with one
-            // authenticated retry — no SOAP header on this leg.
+            // Answer a Digest challenge (RFC 7616; MD5 default, SHA-256 when
+            // demanded) with one authenticated retry — no SOAP header on
+            // this leg. SHA-256-capable firmware (Hikvision) answers with
+            // BOTH an MD5 line and an algorithm="SHA-256" line — prefer
+            // SHA-256 when offered (twin of onvif-go #172/#175; the retry
+            // rebuilds the request, so the body always rides).
             let (status, headers) = split_http_status_headers(&raw)?;
             if status == 401 {
-                if let Some(challenge) = header_value(&headers, "www-authenticate")
-                    .and_then(auth::parse_digest_challenge)
-                {
+                let challenges: Vec<auth::DigestChallengeParams> =
+                    header_values(&headers, "www-authenticate")
+                        .filter_map(auth::parse_digest_challenge)
+                        .collect();
+                let challenge = challenges
+                    .iter()
+                    .find(|c| c.algorithm.to_ascii_lowercase().contains("sha-256"))
+                    .or_else(|| challenges.first());
+                if let Some(challenge) = challenge {
                     if let Some((username, password)) = self.credentials() {
                         let nc = self.next_digest_nc(&challenge.nonce);
                         let nc_hex = format!("{nc:08x}");
                         let cnonce = auth::random_digest_cnonce();
-                        let response = auth::digest_response_md5(
+                        let response = auth::digest_response(
                             &username,
                             &password,
                             "POST",
                             &target.path,
-                            &challenge,
+                            challenge,
                             &nc_hex,
                             &cnonce,
                         );
                         let authz = auth::build_digest_authorization(
                             &username,
-                            &challenge,
+                            challenge,
                             &target.path,
                             &response,
                             &nc_hex,
@@ -808,11 +818,14 @@ pub(crate) fn split_http_status_headers(
 
 /// Case-insensitive header lookup over [`split_http_status_headers`]
 /// output.
-fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+fn header_values<'a>(
+    headers: &'a [(String, String)],
+    name: &str,
+) -> impl Iterator<Item = &'a str> + 'a {
     let name = name.to_ascii_lowercase();
     headers
         .iter()
-        .find(|(k, _)| *k == name)
+        .filter(move |(k, _)| *k == name)
         .map(|(_, v)| v.as_str())
 }
 
@@ -901,6 +914,14 @@ pub(crate) fn find_soap_fault(body: &str) -> Option<ClientError> {
 
     let mut in_fault = false;
     let mut capture: Option<u8> = None; // 1=code 2=subcode 3=reason
+                                        // Lenient candidates (twin of onvif-go #170): abbreviated fault shapes
+                                        // hoist the code Value — and sometimes a Text — directly under Fault
+                                        // without the Code/Reason wrappers; the strict (parent, name) pairs
+                                        // above see none of them. Recorded only while `capture` is unset, so a
+                                        // strictly captured field never double-counts.
+    let mut lenient_values: Vec<(bool, String)> = Vec::new(); // (inside Subcode, text)
+    let mut lenient_reason = String::new();
+    let mut subcode_depth: usize = 0; // stack depth of an open Subcode, 0 = none
 
     loop {
         use quick_xml::events::Event as XmlEvent;
@@ -918,11 +939,22 @@ pub(crate) fn find_soap_fault(body: &str) -> Option<ClientError> {
                         _ => capture.take(),
                     };
                 }
-                stack.push(name);
+                stack.push(name.clone());
+                if in_fault && name == "Subcode" {
+                    subcode_depth = stack.len();
+                }
             }
             Ok(XmlEvent::Text(t)) => {
                 if in_fault {
                     let text = text_content(&t);
+                    if capture.is_none() {
+                        let cur = stack.last().map(String::as_str).unwrap_or("");
+                        if cur == "Value" {
+                            lenient_values.push((subcode_depth != 0, text.clone()));
+                        } else if cur == "Text" && lenient_reason.is_empty() {
+                            lenient_reason = text.clone();
+                        }
+                    }
                     match (
                         capture,
                         code.is_empty(),
@@ -937,6 +969,9 @@ pub(crate) fn find_soap_fault(body: &str) -> Option<ClientError> {
                 }
             }
             Ok(XmlEvent::End(_)) => {
+                if subcode_depth != 0 && stack.len() == subcode_depth {
+                    subcode_depth = 0;
+                }
                 stack.pop();
                 if in_fault && stack.is_empty() {
                     break;
@@ -951,6 +986,36 @@ pub(crate) fn find_soap_fault(body: &str) -> Option<ClientError> {
 
     if !in_fault {
         return None;
+    }
+
+    // Strict decode came up empty: fall back to the lenient candidates —
+    // the first Value outside any Subcode block is the code, the first
+    // Value inside one the subcode, any Text the reason. Keeps
+    // is_notauthorized_fault working for shapes like
+    // <Fault><Value>ter:Sender</Value><Subcode><Value>ter:NotAuthorized…
+    // (the go twin's #170 regression class: without recovery a definitive
+    // rejection classifies as an empty, ambiguous fault).
+    // Per-field recovery (a superset of the go twin's all-empty rule: the
+    // strict matcher here already tolerates the Subcode grandparent, so a
+    // partially strict decode must not block the empty fields' recovery —
+    // strictly captured values are never overwritten).
+    if code.is_empty() {
+        if let Some((_, c)) = lenient_values.iter().find(|(in_sub, _)| !*in_sub) {
+            code = c.clone();
+        }
+        if code.is_empty() && subcode.is_empty() {
+            if let Some((_, c)) = lenient_values.first() {
+                code = c.clone();
+            }
+        }
+    }
+    if subcode.is_empty() {
+        if let Some((_, s)) = lenient_values.iter().find(|(in_sub, _)| *in_sub) {
+            subcode = s.clone();
+        }
+    }
+    if reason.is_empty() {
+        reason = lenient_reason;
     }
 
     Some(ClientError::Fault {
@@ -1167,6 +1232,61 @@ mod tests {
             </Body></Envelope>"#;
         let err = find_soap_fault(body).unwrap();
         assert!(!err.is_sender_fault());
+    }
+
+    /// Abbreviated fault shapes real devices emit (twin of onvif-go #170):
+    /// the code Value — and a Subcode — hoisted directly under Fault
+    /// without the SOAP 1.2 Code wrapper. The strict (parent, name) pairs
+    /// capture the Subcode leg but lose the code and reason; the lenient
+    /// recovery lifts them so a definitive NotAuthorized rejection still
+    /// classifies.
+    #[test]
+    fn abbreviated_fault_code_hoisted_under_fault() {
+        let body = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>
+            <s:Fault><s:Value>s:Sender</s:Value><s:Subcode><s:Value>ter:NotAuthorized</s:Value></s:Subcode></s:Fault>
+            </s:Body></s:Envelope>"#;
+        let err = find_soap_fault(body).unwrap();
+        match err {
+            ClientError::Fault {
+                code,
+                subcode,
+                reason,
+            } => {
+                assert_eq!(code, "s:Sender");
+                assert_eq!(subcode, "ter:NotAuthorized");
+                let _ = reason;
+            }
+            other => panic!("expected fault, got {other:?}"),
+        }
+    }
+
+    /// The no-Subcode abbreviation: a lone Value under Fault carries the
+    /// code (here a bare NotAuthorized) — classification must hold.
+    #[test]
+    fn abbreviated_fault_lone_value_classifies() {
+        let body = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>
+            <s:Fault><s:Value>ter:NotAuthorized</s:Value><s:Text>Sender not Authorized</s:Text></s:Fault>
+            </s:Body></s:Envelope>"#;
+        let err = find_soap_fault(body).unwrap();
+        match &err {
+            ClientError::Fault {
+                code,
+                subcode,
+                reason,
+            } => {
+                assert_eq!(code, "ter:NotAuthorized");
+                assert_eq!(subcode, "");
+                assert_eq!(reason, "Sender not Authorized");
+            }
+            other => panic!("expected fault, got {other:?}"),
+        }
+        match &err {
+            ClientError::Fault { code, subcode, .. } => assert!(
+                crate::client::auth::is_notauthorized_fault(code, subcode),
+                "must classify as not-authorized: {code}|{subcode}"
+            ),
+            other => panic!("expected fault, got {other:?}"),
+        }
     }
 
     #[test]
