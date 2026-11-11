@@ -13,6 +13,11 @@ are released out of band.
 
 ### Fixed
 
+- **`events`: consumer-address length validated at Subscribe time (twin of
+  onvif-go #165)**: a `ConsumerReference/Address` beyond 2048 bytes faults
+  with the cap named — beyond ~2 KB no common intermediary can route the
+  notification POST, and the pre-cap failure was silent (notifications
+  dropped until the failure budget auto-unsubscribed).
 - **`client`: abbreviated fault envelopes classify (twin of onvif-go #170)**:
   fault shapes that hoist the code `Value` (and a bare `Text`) directly
   under `Fault` — without the SOAP 1.2 `Code`/`Reason` wrappers — no longer
